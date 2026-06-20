@@ -10,8 +10,8 @@ pub struct TrafficRecord {
     pub timestamp_ms: i64,   // unix milliseconds
     pub download_bps: f64,
     pub upload_bps: f64,
-    /// WAN interface name (None = aggregate)
-    pub wan_name: Option<String>,
+    /// WAN interface name (empty string = aggregate)
+    pub wan_name: String,
 }
 
 /// A user-assigned device override stored in SQLite.
@@ -43,12 +43,16 @@ impl TrafficDb {
         // Enable WAL mode for better concurrent read/write performance.
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
 
-        // Raw 5-second data
+        // Raw 5-second data — composite PK (ts, wan_name) so per-WAN
+        // and aggregate rows can coexist at the same timestamp.
+        // wan_name = '' means aggregate traffic.
         conn.execute(
             "CREATE TABLE IF NOT EXISTS traffic_points (
-                ts          INTEGER PRIMARY KEY,
+                ts          INTEGER NOT NULL,
                 download_bps REAL NOT NULL,
-                upload_bps   REAL NOT NULL
+                upload_bps   REAL NOT NULL,
+                wan_name     TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (ts, wan_name)
             )",
             [],
         )?;
@@ -56,12 +60,19 @@ impl TrafficDb {
         // 1-minute aggregated data for older records
         conn.execute(
             "CREATE TABLE IF NOT EXISTS traffic_1m (
-                bucket       INTEGER PRIMARY KEY,
+                bucket       INTEGER NOT NULL,
                 download_avg REAL NOT NULL,
-                upload_avg   REAL NOT NULL
+                upload_avg   REAL NOT NULL,
+                wan_name     TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (bucket, wan_name)
             )",
             [],
         )?;
+
+        // Migrate old schema: tables created before the composite-PK change
+        // may have wan_name as a nullable column with NULL for aggregate.
+        // Convert NULL → '' and rebuild the PK to include wan_name.
+        migrate_traffic_schema(&conn);
 
         // Simple key-value config store
         conn.execute(
@@ -83,22 +94,15 @@ impl TrafficDb {
             [],
         )?;
 
-        // Migrate: add wan_name column for multi-WAN support (idempotent)
-        conn.execute_batch(
-            "ALTER TABLE traffic_points ADD COLUMN wan_name TEXT DEFAULT NULL;"
-        ).ok();
-        conn.execute_batch(
-            "ALTER TABLE traffic_1m ADD COLUMN wan_name TEXT DEFAULT NULL;"
-        ).ok();
-
         info!("Traffic DB opened at {}", path.display());
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
-    /// Insert a single raw traffic point (idempotent on timestamp + wan_name).
-    pub fn insert(&self, ts_ms: i64, download_bps: f64, upload_bps: f64, wan_name: Option<&str>) {
+    /// Insert a single raw traffic point (idempotent on composite PK).
+    /// Pass `""` for aggregate traffic, or the WAN interface name.
+    pub fn insert(&self, ts_ms: i64, download_bps: f64, upload_bps: f64, wan_name: &str) {
         let conn = match self.conn.lock() {
             Ok(c) => c,
             Err(e) => {
@@ -132,12 +136,12 @@ impl TrafficDb {
 
         let mut records: Vec<TrafficRecord> = Vec::new();
 
-        // Query raw points
+        // Query raw points (aggregate only: wan_name = '')
         {
             let mut stmt = match conn.prepare(
                 "SELECT ts, download_bps, upload_bps, wan_name
                  FROM traffic_points
-                 WHERE ts >= ?1 AND ts < ?2
+                 WHERE ts >= ?1 AND ts < ?2 AND wan_name = ''
                  ORDER BY ts ASC
                  LIMIT 14400",
             ) {
@@ -171,7 +175,7 @@ impl TrafficDb {
             let mut stmt = match conn.prepare(
                 "SELECT bucket, download_avg, upload_avg, wan_name
                  FROM traffic_1m
-                 WHERE bucket >= ?1 AND bucket < ?2
+                 WHERE bucket >= ?1 AND bucket < ?2 AND wan_name = ''
                  ORDER BY bucket ASC
                  LIMIT 14400",
             ) {
@@ -317,7 +321,7 @@ impl TrafficDb {
         };
 
         // Aggregate raw points older than raw_cutoff into 1-minute buckets
-        let raw_rows: Vec<(i64, f64, f64, Option<String>)> = {
+        let raw_rows: Vec<(i64, f64, f64, String)> = {
             let mut stmt = match conn.prepare(
                 "SELECT ts, download_bps, upload_bps, wan_name
                  FROM traffic_points
@@ -335,7 +339,7 @@ impl TrafficDb {
                 Ok((row.get::<_, i64>(0)?,
                     row.get::<_, f64>(1)?,
                     row.get::<_, f64>(2)?,
-                    row.get::<_, Option<String>>(3)?))
+                    row.get::<_, String>(3)?))
             })
             .ok()
             .into_iter()
@@ -344,7 +348,7 @@ impl TrafficDb {
         };
 
         // Build 1-minute buckets keyed by (bucket, wan_name)
-        let mut bucket_sums: Vec<(i64, Option<String>, f64, f64, i64)> = Vec::new();
+        let mut bucket_sums: Vec<(i64, String, f64, f64, i64)> = Vec::new();
         for (ts, dl, ul, wan_name) in &raw_rows {
             let bucket = ts / 60000 * 60000;
             if let Some(last) = bucket_sums.last_mut() {
@@ -372,7 +376,7 @@ impl TrafficDb {
 
             for (bucket, wan_name, dl_sum, ul_sum, count) in &bucket_sums {
                 let c = *count as f64;
-                if let Err(e) = insert_stmt.execute(params![bucket, dl_sum / c, ul_sum / c, wan_name.as_deref()]) {
+                if let Err(e) = insert_stmt.execute(params![bucket, dl_sum / c, ul_sum / c, wan_name.as_str()]) {
                     warn!("TrafficDB aggregate insert failed: {e}");
                 }
             }
@@ -576,6 +580,92 @@ pub fn apply_device_overrides(wifi: &mut WifiInfo, db: &TrafficDb) {
                 device.custom_type = ov.custom_type.clone();
             }
         }
+    }
+}
+
+/// Migrate old traffic table schemas to the composite-PK layout.
+///
+/// Old tables used `ts INTEGER PRIMARY KEY` with an optional `wan_name`
+/// column added later via ALTER TABLE (NULL = aggregate).  The composite
+/// PK `(ts, wan_name)` allows aggregate and per-WAN rows to coexist at
+/// the same timestamp.  This function is idempotent — if the schema is
+/// already current it does nothing.
+fn migrate_traffic_schema(conn: &rusqlite::Connection) {
+    for (table, pk_col) in &[
+        ("traffic_points", "ts"),
+        ("traffic_1m", "bucket"),
+    ] {
+        // Detect old schema: single-column PK without wan_name in PK
+        let has_old_schema: bool = conn
+            .prepare(&format!(
+                "SELECT 1 FROM pragma_table_info('{table}') WHERE name = 'wan_name'"
+            ))
+            .and_then(|mut s| s.exists([]))
+            .unwrap_or(false);
+
+        // Check if wan_name is already part of a composite PK (v2 schema)
+        let is_composite_pk: bool = conn
+            .prepare(&format!(
+                "SELECT 1 FROM pragma_table_info('{table}')
+                 WHERE name = 'wan_name' AND pk > 0"
+            ))
+            .and_then(|mut s| s.exists([]))
+            .unwrap_or(false);
+
+        if !has_old_schema {
+            // Table was created with the new schema already — nothing to do
+            continue;
+        }
+
+        if is_composite_pk {
+            // Already migrated
+            continue;
+        }
+
+        // ── Perform migration ──────────────────────────────────
+        info!("Migrating {table} to composite-PK schema...");
+
+        // Rename old table
+        let _ = conn.execute_batch(&format!(
+            "ALTER TABLE {table} RENAME TO {table}_old;"
+        ));
+
+        // Create new table with composite PK
+        let create_sql = if *table == "traffic_points" {
+            format!(
+                "CREATE TABLE {table} (
+                    ts          INTEGER NOT NULL,
+                    download_bps REAL NOT NULL,
+                    upload_bps   REAL NOT NULL,
+                    wan_name     TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (ts, wan_name)
+                )"
+            )
+        } else {
+            format!(
+                "CREATE TABLE {table} (
+                    bucket       INTEGER NOT NULL,
+                    download_avg REAL NOT NULL,
+                    upload_avg   REAL NOT NULL,
+                    wan_name     TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (bucket, wan_name)
+                )"
+            )
+        };
+        let _ = conn.execute_batch(&create_sql);
+
+        // Copy data: NULL → '' for aggregate rows
+        let _ = conn.execute_batch(&format!(
+            "INSERT OR IGNORE INTO {table} ({pk_col}, download_{suffix}, upload_{suffix}, wan_name)
+             SELECT {pk_col}, download_{suffix}, upload_{suffix}, COALESCE(wan_name, '')
+             FROM {table}_old",
+            suffix = if *table == "traffic_points" { "bps" } else { "avg" },
+        ));
+
+        // Drop old table
+        let _ = conn.execute_batch(&format!("DROP TABLE {table}_old;"));
+
+        info!("{table} migration complete");
     }
 }
 

@@ -6,8 +6,8 @@ import type { EChartsOption } from 'echarts';
 
 export interface TrafficChartData {
   timestamp: string;
-  download_bps: number;
-  upload_bps: number;
+  download_bps: number | null;
+  upload_bps: number | null;
   wan_name?: string;
 }
 
@@ -40,6 +40,85 @@ export function timeRangeToMs(range: TimeRange): number {
 }
 
 /**
+ * Expected poll interval in ms for each time range (used for gap detection).
+ */
+function expectedIntervalMs(range: TimeRange): number {
+  switch (range) {
+    case '5M': return 3_000;
+    case '1H': return 3_000;
+    case '6H': return 3_000;
+    case '24H': return 60_000;
+    case '7D': return 60_000;
+    case '30D': return 60_000;
+  }
+}
+
+/**
+ * Insert gap markers into sorted traffic data.
+ *
+ * When two consecutive points are more than `gapThreshold` apart, a marker
+ * with `null` values is inserted to break the line, and the x-axis label
+ * shows a "···" gap indicator so users can see the recording was interrupted.
+ */
+function insertGapMarkers(
+  points: TrafficChartData[],
+  timeRange: TimeRange,
+): TrafficChartData[] {
+  if (points.length < 2) return points;
+
+  // Derive expected interval from the data itself (median gap between first few points).
+  // Falls back to the time-range default if insufficient data.
+  let medianGapMs = 3_000;
+  if (points.length >= 4) {
+    const gaps: number[] = [];
+    for (let i = 1; i < Math.min(points.length, 12); i++) {
+      gaps.push(
+        new Date(points[i].timestamp).getTime() -
+        new Date(points[i - 1].timestamp).getTime(),
+      );
+    }
+    gaps.sort((a, b) => a - b);
+    medianGapMs = gaps[Math.floor(gaps.length / 2)];
+  }
+  if (medianGapMs < 1) medianGapMs = expectedIntervalMs(timeRange);
+
+  // Break the line when gap exceeds 3× expected interval (or at least 15 s)
+  const gapThresholdMs = Math.max(medianGapMs * 3, 15_000);
+
+  const result: TrafficChartData[] = [];
+  for (let i = 0; i < points.length; i++) {
+    result.push(points[i]);
+
+    if (i < points.length - 1) {
+      const t0 = new Date(points[i].timestamp).getTime();
+      const t1 = new Date(points[i + 1].timestamp).getTime();
+      if (t1 - t0 > gapThresholdMs) {
+        // Insert a gap marker — null series values break the line
+        const midTime = new Date((t0 + t1) / 2).toISOString();
+        result.push({
+          timestamp: midTime,
+          download_bps: null,
+          upload_bps: null,
+          wan_name: points[i].wan_name,
+        });
+      }
+    }
+  }
+  return result;
+}
+
+/** Format a single data point's x-axis label. */
+function formatXLabel(ts: string, isLongRange: boolean): string {
+  const d = new Date(ts);
+  if (isLongRange) {
+    const datePart = d.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' });
+    const timePart = d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+    return `${datePart} ${timePart}`;
+  }
+  return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+}
+
+/**
  * Build an ECharts option for a smooth area traffic chart.
  */
 export function buildTrafficChartOption(
@@ -56,15 +135,13 @@ export function buildTrafficChartOption(
 
   const isLongRange = timeRange === '24H' || timeRange === '7D' || timeRange === '30D';
 
-  const xData = points.map(p => {
-    const d = new Date(p.timestamp);
-    if (isLongRange) {
-      // Show month-day hour:minute for longer ranges
-      const datePart = d.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' });
-      const timePart = d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
-      return `${datePart} ${timePart}`;
-    }
-    return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+  // Insert gap markers so the line breaks when the backend was stopped
+  const gapAware = insertGapMarkers(points, timeRange);
+
+  const xData = gapAware.map(p => {
+    // Gap marker: show ellipsis to indicate a break
+    if (p.download_bps === null) return '···';
+    return formatXLabel(p.timestamp, isLongRange);
   });
 
   let xInterval: number;
@@ -153,17 +230,20 @@ export function buildTrafficChartOption(
       formatter: (params: any) => {
         if (!Array.isArray(params)) return '';
         const time = params[0]?.axisValue || '—';
-        const dl = params.find((p: any) => p.seriesName === '下载')?.value ?? 0;
-        const ul = params.find((p: any) => p.seriesName === '上传')?.value ?? 0;
+        if (time === '···') return '<div style="color:#8b90a5;font-size:12px">⏸ 记录中断</div>';
+        const dl = params.find((p: any) => p.seriesName === '下载')?.value;
+        const ul = params.find((p: any) => p.seriesName === '上传')?.value;
+        const dlStr = dl != null ? formatBitrate(dl) : '—';
+        const ulStr = ul != null ? formatBitrate(ul) : '—';
         return `
           <div style="font-weight:600;margin-bottom:4px">${time}</div>
           <div style="display:flex;align-items:center;gap:6px">
             <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#4f8cff"></span>
-            下载 <b>${formatBitrate(dl)}</b>
+            下载 <b>${dlStr}</b>
           </div>
           <div style="display:flex;align-items:center;gap:6px;margin-top:2px">
             <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#22c55e"></span>
-            上传 <b>${formatBitrate(ul)}</b>
+            上传 <b>${ulStr}</b>
           </div>
         `;
       },
@@ -187,8 +267,9 @@ export function buildTrafficChartOption(
         itemStyle: {
           color: darkMode ? '#4f8cff' : '#2563eb',
         },
-        data: points.map(p => p.download_bps),
+        data: gapAware.map(p => p.download_bps),
         animation: false,
+        connectNulls: false,
       },
       {
         name: '上传',
@@ -208,7 +289,7 @@ export function buildTrafficChartOption(
         itemStyle: {
           color: darkMode ? '#22c55e' : '#16a34a',
         },
-        data: points.map(p => p.upload_bps),
+        data: gapAware.map(p => p.upload_bps),
         animation: false,
       },
     ],

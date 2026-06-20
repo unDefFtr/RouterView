@@ -80,7 +80,7 @@ pub async fn query_traffic(
             timestamp_ms: r.timestamp_ms,
             download_bps: r.download_bps,
             upload_bps: r.upload_bps,
-            wan_name: r.wan_name,
+            wan_name: if r.wan_name.is_empty() { None } else { Some(r.wan_name) },
         })
         .collect();
 

@@ -238,7 +238,7 @@ impl PollEngine {
                 if let Some(ref pt) = latest_pt {
                     // DB persist aggregate traffic
                     let ts_ms = timestamp_to_ms(&pt.timestamp);
-                    self.traffic_db.insert(ts_ms, pt.download_bps, pt.upload_bps, None);
+                    self.traffic_db.insert(ts_ms, pt.download_bps, pt.upload_bps, "");
 
                     self.traffic_history.push(pt.clone());
                     let cutoff = chrono::Utc::now() - chrono::Duration::hours(6);
@@ -258,7 +258,7 @@ impl PollEngine {
                             ts_ms,
                             wan_pt.download_bps,
                             wan_pt.upload_bps,
-                            Some(wan_name),
+                            wan_name,
                         );
 
                         let buffer = self
