@@ -421,6 +421,7 @@ impl PollEngine {
             leases_result,
             wireless_result,
             routes_result,
+            connections_result,
         ) = tokio::try_join!(
             client.system_resource(),
             client.system_identity(),
@@ -431,6 +432,7 @@ impl PollEngine {
             client.dhcp_leases(),
             client.wireless_registrations(),
             client.routes(),
+            client.firewall_connections(),
         )?;
 
         // ── Snapshot current byte counters for next tick's rate calculation ──
@@ -461,6 +463,7 @@ impl PollEngine {
             leases_result,
             wireless_result,
             routes_result,
+            connections_result,
             Some(&prev),
             Vec::new(),  // Will be filled in poll_tick
             IspStability {

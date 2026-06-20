@@ -3,11 +3,21 @@ import { computed, ref, watch, onUnmounted } from 'vue';
 import { useDashboardStore } from '@/stores/dashboard';
 import { storeToRefs } from 'pinia';
 import StatusBadge from '@/components/shared/StatusBadge.vue';
-import RateDisplay from '@/components/shared/RateDisplay.vue';
 import FeatherIcon from '@/components/shared/FeatherIcon.vue';
 
 const store = useDashboardStore();
 const { isp, latencyProbes, hasMultipleWans, wansIsp, selectedWan } = storeToRefs(store);
+
+const rate = {
+  formatValue(bps: number): string {
+    if (bps >= 1_000_000) return (bps / 1_000_000).toFixed(1);
+    return (bps / 1_000).toFixed(1);
+  },
+  formatUnit(bps: number): string {
+    if (bps >= 1_000_000) return 'Mbps';
+    return 'Kbps';
+  },
+};
 
 /// Current ISP display: selected WAN's ISP info, or primary fallback
 const currentIspName = computed(() => {
@@ -112,7 +122,21 @@ const goodProbes = computed(() => latencyProbes.value.filter(p => p.status === '
 
     <!-- Real-time rates -->
     <div class="isp-rates">
-      <RateDisplay :download-bps="isp.download_bps" :upload-bps="isp.upload_bps" />
+      <div class="rate-item download">
+        <FeatherIcon name="download" :size="14" :stroke-width="2.5" />
+        <span class="rate-value">{{ rate.formatValue(isp.download_bps) }}</span>
+        <span class="rate-unit">{{ rate.formatUnit(isp.download_bps) }}</span>
+      </div>
+      <div class="rate-item upload">
+        <FeatherIcon name="upload" :size="14" :stroke-width="2.5" />
+        <span class="rate-value">{{ rate.formatValue(isp.upload_bps) }}</span>
+        <span class="rate-unit">{{ rate.formatUnit(isp.upload_bps) }}</span>
+      </div>
+      <div class="rate-item connections">
+        <FeatherIcon name="link" :size="14" :stroke-width="2.5" />
+        <span class="rate-value">{{ (isp.connection_count || 0).toLocaleString() }}</span>
+        <span class="rate-unit">连接</span>
+      </div>
     </div>
 
     <!-- Latency Probes -->
@@ -227,11 +251,47 @@ const goodProbes = computed(() => latencyProbes.value.filter(p => p.status === '
 }
 
 .isp-rates {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-evenly;
+  gap: 8px 12px;
   padding: 10px 12px;
   background: var(--color-bg-input);
   border-radius: var(--border-radius-sm);
   border: 1px solid var(--color-border-light);
   flex-shrink: 0;
+}
+
+.rate-item {
+  display: flex;
+  align-items: baseline;
+  gap: 3px;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.rate-item.download {
+  color: var(--color-success);
+}
+
+.rate-item.upload {
+  color: var(--color-accent);
+}
+
+.rate-item.connections {
+  color: var(--color-text-secondary);
+}
+
+.rate-value {
+  font-weight: 600;
+  font-size: 1rem;
+}
+
+.rate-unit {
+  font-size: 0.7rem;
+  opacity: 0.7;
 }
 
 .probes-section {

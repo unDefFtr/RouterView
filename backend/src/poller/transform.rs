@@ -28,6 +28,7 @@ pub fn to_dashboard_snapshot(
     leases: Vec<DhcpLease>,
     wireless_regs: Vec<WirelessRegistration>,
     routes: Vec<Route>,
+    connections: Vec<ConnectionEntry>,
     prev_counters: Option<&HashMap<String, (u64, u64)>>, // (rx_bytes, tx_bytes) from last tick
     latency_results: Vec<LatencyProbe>,
     stability: IspStability,
@@ -53,7 +54,8 @@ pub fn to_dashboard_snapshot(
     let interface_summary = extract_interface_summary(&interfaces, &arp);
 
     // ── ISP Info (primary + per-WAN) ──────────────────────
-    let isp = extract_isp(&identity, &primary_wan, &all_wans, prev_counters, traffic_db, poll_interval_secs);
+    let connection_count = connections.len() as u32;
+    let isp = extract_isp(&identity, &primary_wan, &all_wans, prev_counters, traffic_db, poll_interval_secs, connection_count);
 
     // ── Traffic (aggregate + per-WAN points) ───────────────
     let traffic = extract_traffic(&all_wans, prev_counters, &now);
@@ -388,6 +390,7 @@ fn extract_isp(
     prev_counters: Option<&HashMap<String, (u64, u64)>>,
     traffic_db: &TrafficDb,
     poll_interval_secs: f64,
+    connection_count: u32,
 ) -> IspInfo {
     let isp_name = if identity.name.is_empty() {
         "Unknown ISP".to_string()
@@ -408,6 +411,7 @@ fn extract_isp(
         monthly_usage_gb: dl_gb + ul_gb,
         download_bps,
         upload_bps,
+        connection_count,
         wans: build_wan_isp_entries(all_wans, identity),
     }
 }

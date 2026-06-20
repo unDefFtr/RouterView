@@ -227,6 +227,23 @@ impl RouterOsClient {
             }
         }
     }
+
+    /// Fetch all tracked firewall connections: `/rest/ip/firewall/connection`
+    ///
+    /// Returns an empty Vec if the endpoint is unavailable (e.g., connection
+    /// tracking disabled or the endpoint not exposed in this RouterOS version).
+    pub async fn firewall_connections(&self) -> Result<Vec<ConnectionEntry>, AppError> {
+        match self
+            .get::<ConnectionEntry>("/ip/firewall/connection")
+            .await
+        {
+            Ok(conns) => Ok(conns),
+            Err(e) => {
+                debug!("Firewall connection tracking not available: {e}");
+                Ok(Vec::new())
+            }
+        }
+    }
 }
 
 // ── Auth Helpers ────────────────────────────────────────────────

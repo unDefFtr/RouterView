@@ -56,6 +56,7 @@ export interface IspInfo {
   monthly_usage_gb: number;
   download_bps: number;
   upload_bps: number;
+  connection_count: number;
   wans: WanIspInfo[];
 }
 
@@ -214,6 +215,7 @@ export const DEFAULT_ISP_INFO: IspInfo = {
   monthly_usage_gb: 0,
   download_bps: 0,
   upload_bps: 0,
+  connection_count: 0,
   wans: [],
 };
 

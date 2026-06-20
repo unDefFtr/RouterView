@@ -227,3 +227,12 @@ pub struct WirelessRegistration {
     #[serde(default, rename = "rx-ccq")]
     pub rx_ccq: String,
 }
+
+/// Raw response from `/rest/ip/firewall/connection`.
+///
+/// Minimal representation — we only count the entries for the dashboard.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConnectionEntry {
+    #[serde(rename = ".id")]
+    pub id: String,
+}

@@ -167,6 +167,9 @@ pub struct IspInfo {
     pub download_bps: f64,
     /// Current upload rate in bps (primary WAN)
     pub upload_bps: f64,
+    /// Number of active firewall connection tracking entries.
+    #[serde(default)]
+    pub connection_count: u32,
     /// Per-WAN ISP info (multi-WAN support)
     #[serde(default)]
     pub wans: Vec<WanIspInfo>,
