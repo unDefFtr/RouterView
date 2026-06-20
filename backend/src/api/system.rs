@@ -33,6 +33,17 @@ pub async fn config_info(State(state): State<Arc<AppState>>) -> (StatusCode, Jso
         // The PUT endpoint accepts a new password to overwrite it.
         "••••••••"
     };
+
+    // Check whether the welcome wizard has been completed.
+    // This is stored as a key in the config table, separate from
+    // the runtime MergedConfig struct.
+    let wizard_completed = state
+        .traffic_db
+        .get_all_config()
+        .get("wizard_completed")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
     let body = json!({
         "routeros_host": cfg.routeros_host,
         "routeros_port": cfg.routeros_port,
@@ -46,6 +57,7 @@ pub async fn config_info(State(state): State<Arc<AppState>>) -> (StatusCode, Jso
         "db_total_retention_days": cfg.db_total_retention_days,
         "theme": cfg.theme,
         "routeros_configured": cfg.has_connection_config(),
+        "wizard_completed": wizard_completed,
     });
     (StatusCode::OK, Json(body))
 }
@@ -81,6 +93,7 @@ pub async fn update_config(
         "db_raw_retention_days",
         "db_total_retention_days",
         "theme",
+        "wizard_completed",
     ];
 
     let requires_restart: &[&str] = &[

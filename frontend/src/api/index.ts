@@ -103,6 +103,7 @@ export interface FullConfig {
   db_total_retention_days: number;
   theme: string;
   routeros_configured: boolean;
+  wizard_completed: boolean;
 }
 
 export interface ConfigUpdateResult {
