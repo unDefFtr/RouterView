@@ -304,6 +304,13 @@ pub struct IspStability {
     pub online_rate: f64,
     /// Stability segments for the progress bar
     pub segments: Vec<StabilitySegment>,
+    /// Approximate window in minutes that the stability data covers
+    #[serde(default = "default_window_minutes")]
+    pub window_minutes: u32,
+}
+
+fn default_window_minutes() -> u32 {
+    30
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

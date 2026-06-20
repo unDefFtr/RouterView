@@ -38,7 +38,7 @@ function formatUnit(bps: number): string {
 <style scoped>
 .rate-display {
   display: flex;
-  gap: 16px;
+  justify-content: space-evenly;
 }
 
 .rate-item {

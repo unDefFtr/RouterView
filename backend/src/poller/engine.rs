@@ -12,6 +12,23 @@ use crate::error::AppError;
 use crate::routeros::client::RouterOsClient;
 use crate::ws::protocol::*;
 
+/// Per-round network quality assessment derived from all probe results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeQuality {
+    /// All or majority of targets reachable with acceptable latency.
+    Good,
+    /// A significant fraction of targets show poor latency or are unreachable,
+    /// but the network is still functional.
+    Degraded,
+    /// Majority of targets unreachable — likely a link-down or ISP outage.
+    Down,
+}
+
+/// Parameters for multi-ping probing.
+const PING_COUNT: usize = 3;
+const PING_GAP_MS: u64 = 200;
+const PING_TIMEOUT_SECS: u64 = 2;
+
 /// The poll engine runs on a configurable interval, fetches data from
 /// the RouterOS REST API, transforms it into dashboard structures,
 /// diffs against the previous snapshot, and broadcasts changes to
@@ -40,8 +57,8 @@ pub struct PollEngine {
     probe_targets: Vec<(String, String, String)>,
     /// Latency probe results from last probe cycle.
     last_probe_results: Vec<LatencyProbe>,
-    /// Stability tracking: rolling window of probe success/failure.
-    stability_history: Vec<bool>,
+    /// Stability tracking: rolling window of probe quality assessments.
+    stability_history: Vec<ProbeQuality>,
     /// SQLite traffic history database.
     traffic_db: Arc<TrafficDb>,
     /// Poll count for periodic DB maintenance.
@@ -110,7 +127,7 @@ impl PollEngine {
             wan_traffic_history: HashMap::new(),
             probe_targets,
             last_probe_results,
-            stability_history: Vec::with_capacity(30),
+            stability_history: Vec::with_capacity(60),
             traffic_db,
             poll_count: 0,
         }
@@ -224,7 +241,11 @@ impl PollEngine {
                 snapshot.latency_probes = self.last_probe_results.clone();
 
                 // Build ISP stability from history
-                snapshot.stability = self.build_stability();
+                let probe_interval = {
+                    let cfg = self.config.read().await;
+                    cfg.probe_interval_secs
+                };
+                snapshot.stability = self.build_stability(probe_interval);
 
                 // Apply user device overrides from the database
                 crate::db::apply_device_overrides(&mut snapshot.wifi, &self.traffic_db);
@@ -333,16 +354,26 @@ impl PollEngine {
 
         let results = run_icmp_probes(&self.probe_targets).await;
 
-        // Update stability: any target reachable → ISP is up
-        let any_ok = results.iter().any(|r| r.latency_ms.is_some());
-        self.stability_history.push(any_ok);
-        if self.stability_history.len() > 30 {
+        // ── Three-state quality classification ──
+        let quality = classify_probe_quality(&results);
+        self.stability_history.push(quality);
+
+        // ── Dynamic window: keep ~30 min worth of history ──
+        let probe_interval = {
+            let cfg = self.config.read().await;
+            cfg.probe_interval_secs
+        };
+        let max_entries = (30 * 60 / probe_interval as usize).clamp(10, 120);
+        while self.stability_history.len() > max_entries {
             self.stability_history.remove(0);
         }
 
         let ok = results.iter().filter(|r| r.latency_ms.is_some()).count();
         let total = results.len();
-        debug!("Probe complete: {}/{} targets reachable", ok, total);
+        debug!(
+            "Probe complete: {}/{} reachable, quality={:?}",
+            ok, total, quality,
+        );
 
         self.last_probe_results = results;
     }
@@ -413,6 +444,7 @@ impl PollEngine {
             IspStability {
                 online_rate: 100.0,
                 segments: vec![],
+                window_minutes: 30,
             },
             &self.traffic_db,
             poll_interval_secs,
@@ -511,8 +543,13 @@ impl PollEngine {
             || update.wan_traffic_points.is_some()
     }
 
-    /// Build ISP stability from rolling history.
-    fn build_stability(&self) -> IspStability {
+    /// Build ISP stability from rolling probe quality history.
+    ///
+    /// Produces three segments: Good (green), Degraded (amber), Down (gray).
+    /// Online rate counts Good + Degraded as "online" (degraded is still usable).
+    ///
+    /// `probe_interval_secs` is used to calculate the real time window.
+    fn build_stability(&self, probe_interval_secs: u64) -> IspStability {
         let total = self.stability_history.len() as f64;
         if total == 0.0 {
             return IspStability {
@@ -524,14 +561,32 @@ impl PollEngine {
                         label: Some("100%".into()),
                     },
                 ],
+                window_minutes: 30,
             };
         }
 
-        let successful = self.stability_history.iter().filter(|&&s| s).count() as f64;
-        let online_rate = (successful / total) * 100.0;
+        let good = self
+            .stability_history
+            .iter()
+            .filter(|s| matches!(s, ProbeQuality::Good))
+            .count() as f64;
+        let degraded = self
+            .stability_history
+            .iter()
+            .filter(|s| matches!(s, ProbeQuality::Degraded))
+            .count() as f64;
+        let down = self
+            .stability_history
+            .iter()
+            .filter(|s| matches!(s, ProbeQuality::Down))
+            .count() as f64;
 
-        let good = successful;
-        let bad = total - successful;
+        // Online rate = Good + Degraded (degraded is still online, just degraded quality)
+        let online_rate = ((good + degraded) / total) * 100.0;
+
+        // Actual time window = history_entries × probe_interval
+        let window_minutes = ((self.stability_history.len() as u64 * probe_interval_secs) / 60)
+            .max(1) as u32;
 
         let segments = vec![
             StabilitySegment {
@@ -541,12 +596,16 @@ impl PollEngine {
             },
             StabilitySegment {
                 color: "#f59e0b".into(),
-                value: 0.0,
-                label: None,
+                value: degraded,
+                label: if degraded > 0.0 {
+                    Some(format!("{:.0}", degraded))
+                } else {
+                    None
+                },
             },
             StabilitySegment {
                 color: "#6b7280".into(),
-                value: bad,
+                value: down,
                 label: None,
             },
         ];
@@ -554,6 +613,7 @@ impl PollEngine {
         IspStability {
             online_rate,
             segments,
+            window_minutes,
         }
     }
 }
@@ -592,7 +652,43 @@ async fn run_icmp_probes(
     results
 }
 
-/// Ping a single target: resolve hostname → ICMP echo → classify RTT.
+/// Send N ICMP pings to a host, collecting individual RTTs.
+///
+/// Returns a vector of latencies (in ms) for successful pings.
+/// Failed or timed-out pings are omitted.
+async fn send_n_pings(
+    pinger: &mut surge_ping::Pinger,
+    host: &str,
+) -> Vec<f64> {
+    let mut latencies = Vec::with_capacity(PING_COUNT);
+    for seq in 0..PING_COUNT {
+        // First ping fires immediately; subsequent pings are spaced by PING_GAP_MS.
+        if seq > 0 {
+            tokio::time::sleep(Duration::from_millis(PING_GAP_MS)).await;
+        }
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(PING_TIMEOUT_SECS),
+            pinger.ping(surge_ping::PingSequence(seq as u16), &[0u8; 56]),
+        )
+        .await;
+
+        match result {
+            Ok(Ok((_packet, rtt))) => {
+                latencies.push(rtt.as_secs_f64() * 1000.0);
+            }
+            Ok(Err(ref e)) => {
+                debug!("Ping #{seq} to {host} failed: {e}");
+            }
+            Err(_) => {
+                debug!("Ping #{seq} to {host} timed out");
+            }
+        }
+    }
+    latencies
+}
+
+/// Ping a single target: resolve hostname → send N ICMP pings → majority-vote decision.
 async fn probe_one(name: &str, host: &str, category: &str) -> LatencyProbe {
     let down = || LatencyProbe {
         target: name.to_string(),
@@ -616,7 +712,7 @@ async fn probe_one(name: &str, host: &str, category: &str) -> LatencyProbe {
         None => return down(),
     };
 
-    // Create ICMP client + pinger for this target
+    // Create ICMP client + pinger for this target (reuse for all pings)
     let client = match surge_ping::Client::new(&surge_ping::Config::new()) {
         Ok(c) => c,
         Err(e) => {
@@ -629,33 +725,62 @@ async fn probe_one(name: &str, host: &str, category: &str) -> LatencyProbe {
         .pinger(ip, surge_ping::PingIdentifier(0))
         .await;
 
-    // Send ping with 2-second timeout
-    let result = tokio::time::timeout(
-        Duration::from_secs(2),
-        pinger.ping(surge_ping::PingSequence(0), &[0u8; 56]),
-    )
-    .await;
+    let latencies = send_n_pings(&mut pinger, host).await;
+    let success = latencies.len();
 
-    match result {
-        Ok(Ok((_packet, rtt))) => {
-            let ms = rtt.as_secs_f64() * 1000.0;
-            LatencyProbe {
-                target: name.to_string(),
-                host: host.to_string(),
-                latency_ms: Some(ms),
-                status: classify_latency(ms),
-                category: category.to_string(),
-            }
+    // ── Majority-vote decision ──
+    if success > PING_COUNT / 2 {
+        // Majority succeeded: use average RTT
+        let avg_ms = latencies.iter().sum::<f64>() / success as f64;
+        LatencyProbe {
+            target: name.to_string(),
+            host: host.to_string(),
+            latency_ms: Some(avg_ms),
+            status: classify_latency(avg_ms),
+            category: category.to_string(),
         }
-        Ok(Err(e)) => {
-            debug!("Ping {name} ({host}) failed: {e}");
-            down()
-        }
-        Err(_timeout) => {
-            debug!("Ping {name} ({host}) timed out");
-            down()
-        }
+    } else if success > 0 {
+        // Minority succeeded — unreliable, treat as down
+        debug!(
+            "{name} ({host}): only {}/{} pings succeeded, marking down",
+            success, PING_COUNT,
+        );
+        down()
+    } else {
+        // All failed or timed out
+        down()
     }
+}
+
+/// Classify the overall network quality from this round's probe results.
+///
+/// Rules (evaluated in order):
+/// 1. All targets unreachable → Down
+/// 2. Majority (>50%) unreachable → Down (likely ISP outage)
+/// 3. Over 1/3 of targets are poor-latency or unreachable → Degraded
+/// 4. Otherwise → Good
+fn classify_probe_quality(results: &[LatencyProbe]) -> ProbeQuality {
+    let total = results.len();
+    if total == 0 {
+        return ProbeQuality::Good;
+    }
+
+    let reachable = results.iter().filter(|r| r.latency_ms.is_some()).count();
+    let down_count = total - reachable;
+    let poor_count = results.iter().filter(|r| r.status == "poor").count();
+    let problem_count = poor_count + down_count;
+
+    // All or majority unreachable → likely link-down / ISP outage
+    if reachable == 0 || down_count > total / 2 {
+        return ProbeQuality::Down;
+    }
+
+    // More than 1/3 of targets problematic → degraded quality
+    if problem_count > total / 3 {
+        return ProbeQuality::Degraded;
+    }
+
+    ProbeQuality::Good
 }
 
 /// Resolve a hostname to an IP address.

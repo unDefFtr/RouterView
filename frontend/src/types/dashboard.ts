@@ -123,6 +123,7 @@ export interface StabilitySegment {
 export interface IspStability {
   online_rate: number;
   segments: StabilitySegment[];
+  window_minutes: number;
 }
 
 // ── Full Snapshot ────────────────────────────────────────
@@ -231,4 +232,5 @@ export const DEFAULT_STABILITY: IspStability = {
     { color: '#f59e0b', value: 0, label: null },
     { color: '#6b7280', value: 0, label: null },
   ],
+  window_minutes: 30,
 };

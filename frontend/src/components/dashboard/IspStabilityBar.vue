@@ -37,7 +37,7 @@ const { stability } = storeToRefs(store);
         <span class="legend-dot" style="background: #6b7280" />
         <span>不可用</span>
       </div>
-      <span class="legend-note">最近 30 分钟</span>
+      <span class="legend-note">最近 {{ stability.window_minutes }} 分钟</span>
     </div>
   </div>
 </template>
