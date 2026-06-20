@@ -48,7 +48,7 @@ pub fn to_dashboard_snapshot(
     let system = extract_system_info(&sys);
 
     // ── Gateway Info (primary + all WAN entries) ──────────
-    let gateway = extract_gateway(&primary_wan, &all_wans, &leases, prev_counters);
+    let gateway = extract_gateway(&primary_wan, &all_wans, &leases, prev_counters, poll_interval_secs);
 
     // ── Interface Summary ─────────────────────────────────
     let interface_summary = extract_interface_summary(&interfaces, &arp);
@@ -58,18 +58,18 @@ pub fn to_dashboard_snapshot(
     let isp = extract_isp(&identity, &primary_wan, &all_wans, prev_counters, traffic_db, poll_interval_secs, connection_count);
 
     // ── Traffic (aggregate + per-WAN points) ───────────────
-    let traffic = extract_traffic(&all_wans, prev_counters, &now);
+    let traffic = extract_traffic(&all_wans, prev_counters, &now, poll_interval_secs);
 
     // ── WiFi Info ─────────────────────────────────────────
     let wifi = extract_wifi(&wireless_regs, &arp, &leases);
 
     // ── Per-interface status with rates ───────────────────
-    let interface_statuses = extract_interface_statuses(&interfaces, prev_counters, &all_wans);
+    let interface_statuses = extract_interface_statuses(&interfaces, prev_counters, &all_wans, poll_interval_secs);
 
     // ── Build per-WAN snapshot fields ─────────────────────
-    let wans: Vec<WanEntry> = build_wan_entries(&all_wans, prev_counters);
+    let wans: Vec<WanEntry> = build_wan_entries(&all_wans, prev_counters, poll_interval_secs);
     let wans_isp: Vec<WanIspInfo> = build_wan_isp_entries(&all_wans, &identity);
-    let wan_traffic_points: Vec<TrafficPoint> = build_wan_traffic_points(&all_wans, prev_counters, &now);
+    let wan_traffic_points: Vec<TrafficPoint> = build_wan_traffic_points(&all_wans, prev_counters, &now, poll_interval_secs);
 
     Ok(DashboardSnapshot {
         system,
@@ -268,6 +268,7 @@ fn extract_gateway(
     all_wans: &[WanInfo],
     leases: &[DhcpLease],
     prev_counters: Option<&HashMap<String, (u64, u64)>>,
+    poll_interval_secs: f64,
 ) -> GatewayInfo {
     let ip_allocations = leases
         .iter()
@@ -278,9 +279,9 @@ fn extract_gateway(
         wan_interface: primary.interface_name.clone(),
         wan_ip: primary.ip_address.clone(),
         gateway_ip: primary.gateway.clone(),
-        wan_online: primary.online,
+        wan_online: all_wans.iter().any(|w| w.online),
         ip_allocations,
-        wans: build_wan_entries(all_wans, prev_counters),
+        wans: build_wan_entries(all_wans, prev_counters, poll_interval_secs),
     }
 }
 
@@ -331,6 +332,7 @@ fn extract_interface_statuses(
     interfaces: &[Interface],
     prev_counters: Option<&HashMap<String, (u64, u64)>>,
     all_wans: &[WanInfo],
+    poll_interval_secs: f64,
 ) -> Vec<InterfaceStatus> {
     // Build a set of WAN interface names for fast lookup
     let wan_names: HashSet<&str> = all_wans.iter().map(|w| w.interface_name.as_str()).collect();
@@ -346,7 +348,7 @@ fn extract_interface_statuses(
                     let tx = parse_u64(&iface.tx_byte);
                     let rx_diff = rx.saturating_sub(*prev_rx);
                     let tx_diff = tx.saturating_sub(*prev_tx);
-                    (rx_diff as f64 * 8.0 / 3.0, tx_diff as f64 * 8.0 / 3.0)
+                    (rx_diff as f64 * 8.0 / poll_interval_secs, tx_diff as f64 * 8.0 / poll_interval_secs)
                 })
                 .unwrap_or((0.0, 0.0));
 
@@ -399,7 +401,7 @@ fn extract_isp(
     };
 
     // Primary WAN rate
-    let (download_bps, upload_bps) = compute_wan_rate(primary, prev_counters)
+    let (download_bps, upload_bps) = compute_wan_rate(primary, prev_counters, poll_interval_secs)
         .unwrap_or((0.0, 0.0));
 
     // Accumulated month-to-date usage from stored traffic history
@@ -407,7 +409,7 @@ fn extract_isp(
 
     IspInfo {
         name: isp_name,
-        online: primary.online,
+        online: all_wans.iter().any(|w| w.online),
         monthly_usage_gb: dl_gb + ul_gb,
         download_bps,
         upload_bps,
@@ -420,6 +422,7 @@ fn extract_isp(
 fn compute_wan_rate(
     wan: &WanInfo,
     prev_counters: Option<&HashMap<String, (u64, u64)>>,
+    poll_interval_secs: f64,
 ) -> Option<(f64, f64)> {
     let iface = wan.iface.as_ref()?;
     let prev = prev_counters?;
@@ -428,7 +431,10 @@ fn compute_wan_rate(
     let tx = parse_u64(&iface.tx_byte);
     let rx_diff = rx.saturating_sub(*prev_rx);
     let tx_diff = tx.saturating_sub(*prev_tx);
-    Some((rx_diff as f64 * 8.0 / 3.0, tx_diff as f64 * 8.0 / 3.0))
+    Some((
+        rx_diff as f64 * 8.0 / poll_interval_secs,
+        tx_diff as f64 * 8.0 / poll_interval_secs,
+    ))
 }
 
 // ── Multi-WAN Builder Helpers ────────────────────────────────────
@@ -437,13 +443,14 @@ fn compute_wan_rate(
 fn build_wan_entries(
     all_wans: &[WanInfo],
     prev_counters: Option<&HashMap<String, (u64, u64)>>,
+    poll_interval_secs: f64,
 ) -> Vec<WanEntry> {
     all_wans
         .iter()
         .enumerate()
         .map(|(i, wan)| {
             let (download_bps, upload_bps) =
-                compute_wan_rate(wan, prev_counters).unwrap_or((0.0, 0.0));
+                compute_wan_rate(wan, prev_counters, poll_interval_secs).unwrap_or((0.0, 0.0));
             WanEntry {
                 wan_name: wan.interface_name.clone(),
                 wan_ip: wan.ip_address.clone(),
@@ -485,12 +492,13 @@ fn build_wan_traffic_points(
     all_wans: &[WanInfo],
     prev_counters: Option<&HashMap<String, (u64, u64)>>,
     now: &str,
+    poll_interval_secs: f64,
 ) -> Vec<TrafficPoint> {
     all_wans
         .iter()
         .filter_map(|wan| {
             let (download_bps, upload_bps) =
-                compute_wan_rate(wan, prev_counters).unwrap_or((0.0, 0.0));
+                compute_wan_rate(wan, prev_counters, poll_interval_secs).unwrap_or((0.0, 0.0));
             if download_bps > 0.0 || upload_bps > 0.0 {
                 Some(TrafficPoint {
                     timestamp: now.to_string(),
@@ -509,12 +517,13 @@ fn extract_traffic(
     all_wans: &[WanInfo],
     prev_counters: Option<&HashMap<String, (u64, u64)>>,
     now: &str,
+    poll_interval_secs: f64,
 ) -> TrafficSnapshot {
     // Sum download/upload across all WANs for the aggregate traffic point
     let (download_bps, upload_bps) = all_wans
         .iter()
         .fold((0.0f64, 0.0f64), |(dl, ul), wan| {
-            if let Some((wdl, wul)) = compute_wan_rate(wan, prev_counters) {
+            if let Some((wdl, wul)) = compute_wan_rate(wan, prev_counters, poll_interval_secs) {
                 (dl + wdl, ul + wul)
             } else {
                 (dl, ul)
