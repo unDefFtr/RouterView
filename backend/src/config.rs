@@ -27,6 +27,10 @@ pub struct Config {
     pub db_raw_retention_days: u64,
     /// Days after which all traffic data is deleted
     pub db_total_retention_days: u64,
+    /// Latency threshold: RTT below this is "good" (ms)
+    pub latency_good_ms: u64,
+    /// Latency threshold: RTT above this is "poor" (ms), between good and poor is "moderate"
+    pub latency_poor_ms: u64,
 }
 
 impl Config {
@@ -70,6 +74,8 @@ impl Config {
             db_path: env::var("DB_PATH").unwrap_or_else(|_| "traffic.db".to_string()),
             db_raw_retention_days: parse_env::<u64>("DB_RAW_RETENTION_DAYS", 7)?,
             db_total_retention_days: parse_env::<u64>("DB_TOTAL_RETENTION_DAYS", 90)?,
+            latency_good_ms: parse_env::<u64>("LATENCY_GOOD_MS", 30)?,
+            latency_poor_ms: parse_env::<u64>("LATENCY_POOR_MS", 100)?,
         })
     }
 

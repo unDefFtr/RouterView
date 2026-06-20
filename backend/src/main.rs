@@ -51,6 +51,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // ── Probe targets: load from DB, convert to engine format ──
+    let probe_rows = traffic_db.get_all_probe_targets();
+    tracing::info!("Loaded {} probe targets from DB", probe_rows.len());
+    let probe_targets: Vec<(String, String, String)> = probe_rows
+        .iter()
+        .map(|r| (r.name.clone(), r.host.clone(), r.category.clone()))
+        .collect();
+    let probe_targets_arc: Arc<tokio::sync::RwLock<Vec<(String, String, String)>>> =
+        Arc::new(tokio::sync::RwLock::new(probe_targets));
+
     // Create broadcast channel for WebSocket fan-out
     let (broadcast_tx, _) = broadcast::channel::<Arc<ws::protocol::ServerMessage>>(128);
 
@@ -65,6 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         connection_count: std::sync::atomic::AtomicUsize::new(0),
         last_snapshot: snapshot_cache.clone(),
         traffic_db: traffic_db.clone(),
+        probe_targets: probe_targets_arc.clone(),
     });
 
     // Start the poll engine in a background task
@@ -76,6 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 state.broadcast_tx.clone(),
                 snapshot_cache,
                 traffic_db,
+                state.probe_targets.clone(),
             )
             .await
             .run()

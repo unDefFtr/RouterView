@@ -55,6 +55,8 @@ pub async fn config_info(State(state): State<Arc<AppState>>) -> (StatusCode, Jso
         "probe_interval_secs": cfg.probe_interval_secs,
         "db_raw_retention_days": cfg.db_raw_retention_days,
         "db_total_retention_days": cfg.db_total_retention_days,
+        "latency_good_ms": cfg.latency_good_ms,
+        "latency_poor_ms": cfg.latency_poor_ms,
         "theme": cfg.theme,
         "routeros_configured": cfg.has_connection_config(),
         "wizard_completed": wizard_completed,
@@ -92,6 +94,8 @@ pub async fn update_config(
         "server_port",
         "db_raw_retention_days",
         "db_total_retention_days",
+        "latency_good_ms",
+        "latency_poor_ms",
         "theme",
         "wizard_completed",
     ];
@@ -179,6 +183,16 @@ pub async fn update_config(
                         cfg.db_total_retention_days = n;
                     }
                 }
+                "latency_good_ms" => {
+                    if let Some(n) = body.get(key).and_then(|v| v.as_u64()) {
+                        cfg.latency_good_ms = n;
+                    }
+                }
+                "latency_poor_ms" => {
+                    if let Some(n) = body.get(key).and_then(|v| v.as_u64()) {
+                        cfg.latency_poor_ms = n;
+                    }
+                }
                 "theme" => {
                     if let Some(v) = body.get(key).and_then(|v| v.as_str()) {
                         cfg.theme = v.to_string();
@@ -247,6 +261,8 @@ pub async fn test_connection(
         db_raw_retention_days: cfg.db_raw_retention_days,
         db_total_retention_days: cfg.db_total_retention_days,
         theme: cfg.theme.clone(),
+        latency_good_ms: cfg.latency_good_ms,
+        latency_poor_ms: cfg.latency_poor_ms,
     };
 
     let test_url = format!("{}/system/resource", test_config.routeros_base_url());

@@ -53,8 +53,11 @@ pub struct PollEngine {
     traffic_history: Vec<TrafficPoint>,
     /// Per-WAN traffic history buffers, keyed by WAN interface name.
     wan_traffic_history: HashMap<String, Vec<TrafficPoint>>,
-    /// Latency probe targets.
-    probe_targets: Vec<(String, String, String)>,
+    /// Latency probe targets — shared with API handlers for hot-reload.
+    probe_targets: Arc<RwLock<Vec<(String, String, String)>>>,
+    /// Latency classification thresholds from config.
+    latency_good_ms: f64,
+    latency_poor_ms: f64,
     /// Latency probe results from last probe cycle.
     last_probe_results: Vec<LatencyProbe>,
     /// Stability tracking: rolling window of probe quality assessments.
@@ -71,6 +74,7 @@ impl PollEngine {
         broadcast_tx: broadcast::Sender<Arc<ServerMessage>>,
         snapshot_cache: Arc<RwLock<Option<Arc<DashboardSnapshot>>>>,
         traffic_db: Arc<TrafficDb>,
+        probe_targets: Arc<RwLock<Vec<(String, String, String)>>>,
     ) -> Self {
         let (client, conn_params) = {
             let cfg = config.read().await;
@@ -94,9 +98,15 @@ impl PollEngine {
             }
         };
 
-        let probe_targets = crate::poller::transform::default_latency_probe_targets(&[]);
+        let probe_targets_snapshot = probe_targets.read().await.clone();
 
-        let last_probe_results = run_icmp_probes(&probe_targets).await;
+        // Read initial latency thresholds
+        let (latency_good_ms, latency_poor_ms) = {
+            let cfg = config.read().await;
+            (cfg.latency_good_ms as f64, cfg.latency_poor_ms as f64)
+        };
+
+        let last_probe_results = run_icmp_probes(&probe_targets_snapshot, latency_good_ms, latency_poor_ms).await;
 
         info!(
             "Poll engine: {} probe targets initialized ({}/{} reachable)",
@@ -130,6 +140,8 @@ impl PollEngine {
             stability_history: Vec::with_capacity(60),
             traffic_db,
             poll_count: 0,
+            latency_good_ms,
+            latency_poor_ms,
         }
     }
 
@@ -347,12 +359,22 @@ impl PollEngine {
 
     /// Execute one latency probe cycle — send ICMP pings via surge-ping.
     async fn probe_tick(&mut self) {
+        // Read latest targets and thresholds from shared state
+        let targets = self.probe_targets.read().await.clone();
+
+        // Hot-reload latency thresholds
+        {
+            let cfg = self.config.read().await;
+            self.latency_good_ms = cfg.latency_good_ms as f64;
+            self.latency_poor_ms = cfg.latency_poor_ms as f64;
+        }
+
         debug!(
             "Probe tick — pinging {} targets",
-            self.probe_targets.len()
+            targets.len()
         );
 
-        let results = run_icmp_probes(&self.probe_targets).await;
+        let results = run_icmp_probes(&targets, self.latency_good_ms, self.latency_poor_ms).await;
 
         // ── Three-state quality classification ──
         let quality = classify_probe_quality(&results);
@@ -628,6 +650,8 @@ impl PollEngine {
 /// its own ICMP socket. All targets are pinged in parallel via `tokio::spawn`.
 async fn run_icmp_probes(
     targets: &[(String, String, String)],
+    latency_good_ms: f64,
+    latency_poor_ms: f64,
 ) -> Vec<LatencyProbe> {
     // Fire all pings concurrently — each task owns its Client (raw socket)
     let handles: Vec<_> = targets
@@ -636,8 +660,10 @@ async fn run_icmp_probes(
             let name = name.clone();
             let host = host.clone();
             let category = cat.clone();
+            let good = latency_good_ms;
+            let poor = latency_poor_ms;
             tokio::spawn(async move {
-                probe_one(&name, &host, &category).await
+                probe_one(&name, &host, &category, good, poor).await
             })
         })
         .collect();
@@ -689,7 +715,13 @@ async fn send_n_pings(
 }
 
 /// Ping a single target: resolve hostname → send N ICMP pings → majority-vote decision.
-async fn probe_one(name: &str, host: &str, category: &str) -> LatencyProbe {
+async fn probe_one(
+    name: &str,
+    host: &str,
+    category: &str,
+    latency_good_ms: f64,
+    latency_poor_ms: f64,
+) -> LatencyProbe {
     let down = || LatencyProbe {
         target: name.to_string(),
         host: host.to_string(),
@@ -736,7 +768,7 @@ async fn probe_one(name: &str, host: &str, category: &str) -> LatencyProbe {
             target: name.to_string(),
             host: host.to_string(),
             latency_ms: Some(avg_ms),
-            status: classify_latency(avg_ms),
+            status: classify_latency(avg_ms, latency_good_ms, latency_poor_ms),
             category: category.to_string(),
         }
     } else if success > 0 {
@@ -816,10 +848,10 @@ fn timestamp_to_ms(ts: &str) -> i64 {
 }
 
 /// Classify RTT into a status label for the frontend's color coding.
-fn classify_latency(ms: f64) -> String {
-    if ms < 30.0 {
+fn classify_latency(ms: f64, good_ms: f64, poor_ms: f64) -> String {
+    if ms < good_ms {
         "good".to_string()
-    } else if ms < 100.0 {
+    } else if ms < poor_ms {
         "moderate".to_string()
     } else {
         "poor".to_string()

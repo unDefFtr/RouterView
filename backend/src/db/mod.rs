@@ -1,5 +1,6 @@
 use chrono::{Datelike, Timelike};
 use rusqlite::{Connection, params};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -22,6 +23,16 @@ pub struct DeviceOverride {
     pub custom_name: Option<String>,
     pub custom_type: Option<String>,
     pub updated_at: i64,
+}
+
+/// A latency probe target stored in SQLite.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProbeTargetRow {
+    pub id: i64,
+    pub name: String,
+    pub host: String,
+    pub category: String,
+    pub sort_order: i64,
 }
 
 /// A simple SQLite-backed store for traffic history and device overrides.
@@ -94,6 +105,21 @@ impl TrafficDb {
             )",
             [],
         )?;
+
+        // User-configurable latency probe targets
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS probe_targets (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                name       TEXT NOT NULL,
+                host       TEXT NOT NULL,
+                category   TEXT NOT NULL DEFAULT 'custom',
+                sort_order INTEGER NOT NULL DEFAULT 0
+            )",
+            [],
+        )?;
+
+        // Seed default probe targets (idempotent — skips if any exist)
+        seed_default_probe_targets_inner(&conn);
 
         info!("Traffic DB opened at {}", path.display());
         Ok(Self {
@@ -588,6 +614,100 @@ impl TrafficDb {
         Ok(())
     }
 
+    // ── Probe Targets ─────────────────────────────────────────
+
+    /// Get all probe targets ordered by sort_order, then id.
+    pub fn get_all_probe_targets(&self) -> Vec<ProbeTargetRow> {
+        let conn = match self.conn.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("TrafficDB lock poisoned during get_all_probe_targets: {e}");
+                return vec![];
+            }
+        };
+        let mut stmt = match conn.prepare(
+            "SELECT id, name, host, category, sort_order FROM probe_targets ORDER BY sort_order, id",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("TrafficDB prepare probe_targets query failed: {e}");
+                return vec![];
+            }
+        };
+        stmt.query_map([], |row| {
+            Ok(ProbeTargetRow {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                host: row.get(2)?,
+                category: row.get(3)?,
+                sort_order: row.get(4)?,
+            })
+        })
+        .ok()
+        .into_iter()
+        .flat_map(|r| r.filter_map(|x| x.ok()))
+        .collect()
+    }
+
+    /// Replace all probe targets in a transaction (DELETE all + INSERT new).
+    pub fn replace_all_probe_targets(&self, targets: &[ProbeTargetRow]) {
+        let conn = match self.conn.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("TrafficDB lock poisoned during replace_all_probe_targets: {e}");
+                return;
+            }
+        };
+
+        // Wrap in a transaction for atomicity
+        if let Err(e) = conn.execute_batch("BEGIN") {
+            warn!("TrafficDB begin tx failed: {e}");
+            return;
+        }
+
+        if let Err(e) = conn.execute("DELETE FROM probe_targets", []) {
+            warn!("TrafficDB delete probe_targets failed: {e}");
+            let _ = conn.execute_batch("ROLLBACK");
+            return;
+        }
+
+        let mut insert_stmt = match conn.prepare(
+            "INSERT INTO probe_targets (name, host, category, sort_order) VALUES (?1, ?2, ?3, ?4)",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("TrafficDB prepare insert probe_targets failed: {e}");
+                let _ = conn.execute_batch("ROLLBACK");
+                return;
+            }
+        };
+
+        for t in targets {
+            if let Err(e) = insert_stmt.execute(params![t.name, t.host, t.category, t.sort_order]) {
+                warn!("TrafficDB insert probe_target failed: {e}");
+            }
+        }
+
+        if let Err(e) = conn.execute_batch("COMMIT") {
+            warn!("TrafficDB commit tx failed: {e}");
+        }
+    }
+
+    /// Reset probe targets to defaults: DELETE all, re-seed.
+    pub fn reset_probe_targets(&self) {
+        let conn = match self.conn.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("TrafficDB lock poisoned during reset_probe_targets: {e}");
+                return;
+            }
+        };
+        if let Err(e) = conn.execute("DELETE FROM probe_targets", []) {
+            warn!("TrafficDB delete probe_targets for reset failed: {e}");
+        }
+        seed_default_probe_targets_inner(&conn);
+    }
+
     // ── Config Store ────────────────────────────────────────────
 
     /// Set a config key/value (INSERT OR REPLACE).
@@ -748,6 +868,39 @@ fn migrate_traffic_schema(conn: &rusqlite::Connection) {
 
         info!("{table} migration complete");
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Probe target seed data
+// ═══════════════════════════════════════════════════════════════════
+
+/// Seed default probe targets into the database.
+/// Idempotent: does nothing if any rows already exist.
+fn seed_default_probe_targets_inner(conn: &rusqlite::Connection) {
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM probe_targets", [], |r| r.get(0))
+        .unwrap_or(0);
+    if count > 0 {
+        return;
+    }
+
+    let defaults = crate::poller::transform::default_latency_probe_targets(&[]);
+    let mut stmt = match conn.prepare(
+        "INSERT INTO probe_targets (name, host, category, sort_order) VALUES (?1, ?2, ?3, ?4)",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Seed probe_targets prepare failed: {e}");
+            return;
+        }
+    };
+
+    for (i, (name, host, category)) in defaults.iter().enumerate() {
+        if let Err(e) = stmt.execute(params![name, host, category, i as i64]) {
+            warn!("Seed probe_targets insert failed for {name}: {e}");
+        }
+    }
+    info!("Seeded {} default probe targets", defaults.len());
 }
 
 /// Get current unix time in milliseconds.

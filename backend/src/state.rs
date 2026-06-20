@@ -18,4 +18,6 @@ pub struct AppState {
     pub last_snapshot: Arc<RwLock<Option<Arc<DashboardSnapshot>>>>,
     /// SQLite traffic history database.
     pub traffic_db: Arc<TrafficDb>,
+    /// Shared probe target list — hot-reloaded on API changes, read by PollEngine.
+    pub probe_targets: Arc<RwLock<Vec<(String, String, String)>>>,
 }

@@ -30,6 +30,10 @@ pub struct MergedConfig {
 
     // UI
     pub theme: String,
+
+    // Latency thresholds
+    pub latency_good_ms: u64,
+    pub latency_poor_ms: u64,
 }
 
 impl MergedConfig {
@@ -84,6 +88,14 @@ impl MergedConfig {
                 .unwrap_or(env.db_total_retention_days),
 
             theme: get("theme").map(|s| s.to_string()).unwrap_or_else(|| "system".to_string()),
+
+            latency_good_ms: get("latency_good_ms")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(env.latency_good_ms),
+
+            latency_poor_ms: get("latency_poor_ms")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(env.latency_poor_ms),
         }
     }
 

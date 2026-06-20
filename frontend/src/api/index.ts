@@ -108,6 +108,8 @@ export interface FullConfig {
   probe_interval_secs: number;
   db_raw_retention_days: number;
   db_total_retention_days: number;
+  latency_good_ms: number;
+  latency_poor_ms: number;
   theme: string;
   routeros_configured: boolean;
   wizard_completed: boolean;
@@ -150,6 +152,48 @@ export async function testConnection(
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(params || {}),
+  });
+  if (!res.ok) {
+    throw new Error(`API error: ${res.status} ${res.statusText}`);
+  }
+  return res.json();
+}
+
+// ── Probe Targets ─────────────────────────────────────────────
+
+export interface ProbeTarget {
+  id?: number;       // absent for new items
+  name: string;
+  host: string;
+  category: string;
+  sort_order?: number;
+}
+
+export interface ProbeTargetsResponse {
+  targets: ProbeTarget[];
+}
+
+export async function fetchProbeTargets(): Promise<ProbeTargetsResponse> {
+  return request<ProbeTargetsResponse>('/probes');
+}
+
+export async function updateProbeTargets(
+  targets: ProbeTarget[],
+): Promise<ProbeTargetsResponse> {
+  const res = await fetch(`${API_BASE}/probes`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(targets),
+  });
+  if (!res.ok) {
+    throw new Error(`API error: ${res.status} ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function resetProbeTargets(): Promise<ProbeTargetsResponse> {
+  const res = await fetch(`${API_BASE}/probes/reset`, {
+    method: 'POST',
   });
   if (!res.ok) {
     throw new Error(`API error: ${res.status} ${res.statusText}`);

@@ -4,6 +4,7 @@ import { useThemeStore, type ThemePreference } from '@/stores/theme';
 import { useDashboardStore } from '@/stores/dashboard';
 import { useViewport } from '@/composables/useViewport';
 import FeatherIcon from '@/components/shared/FeatherIcon.vue';
+import ProbeTargetEditor from '@/components/settings/ProbeTargetEditor.vue';
 import {
   fetchFullConfig,
   fetchHealth,
@@ -191,6 +192,8 @@ onMounted(() => {
           </label>
         </div>
       </section>
+
+      <ProbeTargetEditor />
 
         </div>
         <div class="settings-col">
@@ -391,6 +394,38 @@ onMounted(() => {
                 <span v-if="saveStatus['db_total_retention_days'] === 'saved'" class="save-badge">已保存</span>
               </div>
               <span class="field-hint">所有聚合数据的最大保留天数，超期后自动清理。</span>
+            </div>
+
+            <div class="field">
+              <label class="field-label">延迟阈值：优秀 (ms)</label>
+              <div class="field-control">
+                <input
+                  class="field-input mono short"
+                  type="number"
+                  min="1"
+                  max="500"
+                  :value="config.latency_good_ms"
+                  @input="(e: any) => { const v = parseInt(e.target.value) || 30; config!.latency_good_ms = v; debounceSave('latency_good_ms', v) }"
+                />
+                <span v-if="saveStatus['latency_good_ms'] === 'saved'" class="save-badge">已保存 — 即时生效</span>
+              </div>
+              <span class="field-hint">延迟低于此值显示为"低延迟"（绿色），默认 30ms。</span>
+            </div>
+
+            <div class="field">
+              <label class="field-label">延迟阈值：较差 (ms)</label>
+              <div class="field-control">
+                <input
+                  class="field-input mono short"
+                  type="number"
+                  min="1"
+                  max="2000"
+                  :value="config.latency_poor_ms"
+                  @input="(e: any) => { const v = parseInt(e.target.value) || 100; config!.latency_poor_ms = v; debounceSave('latency_poor_ms', v) }"
+                />
+                <span v-if="saveStatus['latency_poor_ms'] === 'saved'" class="save-badge">已保存 — 即时生效</span>
+              </div>
+              <span class="field-hint">延迟高于此值显示为"高延迟"（红色），介于两阈值之间为"一般"（橙色）。默认 100ms。</span>
             </div>
           </div>
         </template>
