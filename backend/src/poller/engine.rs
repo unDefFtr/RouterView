@@ -744,8 +744,12 @@ async fn probe_one(
         None => return down(),
     };
 
-    // Create ICMP client + pinger for this target (reuse for all pings)
-    let client = match surge_ping::Client::new(&surge_ping::Config::new()) {
+    // Create ICMP client + pinger — choose ICMP kind based on resolved IP family
+    let config = match ip {
+        IpAddr::V4(_) => surge_ping::Config::new(),
+        IpAddr::V6(_) => surge_ping::Config::builder().kind(surge_ping::ICMP::V6).build(),
+    };
+    let client = match surge_ping::Client::new(&config) {
         Ok(c) => c,
         Err(e) => {
             debug!("ICMP client failed for {host}: {e}");
@@ -831,7 +835,17 @@ async fn resolve_host(host: &str) -> Option<IpAddr> {
     .await;
 
     match result {
-        Ok(Ok(mut addrs)) => addrs.next().map(|a| a.ip()),
+        Ok(Ok(addrs)) => {
+            let mut v6 = None;
+            for a in addrs {
+                match a.ip() {
+                    IpAddr::V4(_) => return Some(a.ip()),
+                    IpAddr::V6(_) if v6.is_none() => v6 = Some(a.ip()),
+                    _ => {}
+                }
+            }
+            v6
+        }
         _ => {
             debug!("DNS lookup failed for: {}", host);
             None
