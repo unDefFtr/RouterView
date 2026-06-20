@@ -33,6 +33,10 @@ const currentIspOnline = computed(() => {
     const match = wansIsp.value.find((w) => w.wan_name === selectedWan.value);
     if (match) return match.online;
   }
+  // No WAN selected — online iff at least one WAN is up
+  if (hasMultipleWans.value) {
+    return wansIsp.value.some((w) => w.online);
+  }
   return isp.value.online;
 });
 
