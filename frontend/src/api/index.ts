@@ -40,18 +40,25 @@ export interface TrafficHistoryPoint {
   timestamp_ms: number;
   download_bps: number;
   upload_bps: number;
+  wan_name?: string | null;
 }
 
 export interface TrafficHistoryResponse {
   points: TrafficHistoryPoint[];
   interval_secs: number;
+  wan_names?: string[];
 }
 
 export async function fetchTrafficHistory(
   start: number,
   end: number,
+  wanName?: string,
 ): Promise<TrafficHistoryResponse> {
-  return request<TrafficHistoryResponse>(`/traffic?start=${start}&end=${end}`);
+  let url = `/traffic?start=${start}&end=${end}`;
+  if (wanName) {
+    url += `&wan_name=${encodeURIComponent(wanName)}`;
+  }
+  return request<TrafficHistoryResponse>(url);
 }
 
 // ── Device Overrides ─────────────────────────────────────────

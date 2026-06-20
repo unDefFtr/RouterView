@@ -10,6 +10,8 @@ pub struct TrafficRecord {
     pub timestamp_ms: i64,   // unix milliseconds
     pub download_bps: f64,
     pub upload_bps: f64,
+    /// WAN interface name (None = aggregate)
+    pub wan_name: Option<String>,
 }
 
 /// A user-assigned device override stored in SQLite.
@@ -81,14 +83,22 @@ impl TrafficDb {
             [],
         )?;
 
+        // Migrate: add wan_name column for multi-WAN support (idempotent)
+        conn.execute_batch(
+            "ALTER TABLE traffic_points ADD COLUMN wan_name TEXT DEFAULT NULL;"
+        ).ok();
+        conn.execute_batch(
+            "ALTER TABLE traffic_1m ADD COLUMN wan_name TEXT DEFAULT NULL;"
+        ).ok();
+
         info!("Traffic DB opened at {}", path.display());
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
-    /// Insert a single raw traffic point (idempotent on timestamp).
-    pub fn insert(&self, ts_ms: i64, download_bps: f64, upload_bps: f64) {
+    /// Insert a single raw traffic point (idempotent on timestamp + wan_name).
+    pub fn insert(&self, ts_ms: i64, download_bps: f64, upload_bps: f64, wan_name: Option<&str>) {
         let conn = match self.conn.lock() {
             Ok(c) => c,
             Err(e) => {
@@ -97,8 +107,8 @@ impl TrafficDb {
             }
         };
         if let Err(e) = conn.execute(
-            "INSERT OR IGNORE INTO traffic_points (ts, download_bps, upload_bps) VALUES (?1, ?2, ?3)",
-            params![ts_ms, download_bps, upload_bps],
+            "INSERT OR IGNORE INTO traffic_points (ts, download_bps, upload_bps, wan_name) VALUES (?1, ?2, ?3, ?4)",
+            params![ts_ms, download_bps, upload_bps, wan_name],
         ) {
             warn!("TrafficDB insert failed: {e}");
         }
@@ -125,7 +135,7 @@ impl TrafficDb {
         // Query raw points
         {
             let mut stmt = match conn.prepare(
-                "SELECT ts, download_bps, upload_bps
+                "SELECT ts, download_bps, upload_bps, wan_name
                  FROM traffic_points
                  WHERE ts >= ?1 AND ts < ?2
                  ORDER BY ts ASC
@@ -144,6 +154,7 @@ impl TrafficDb {
                         timestamp_ms: row.get(0)?,
                         download_bps: row.get(1)?,
                         upload_bps: row.get(2)?,
+                        wan_name: row.get(3)?,
                     })
                 })
                 .ok()
@@ -158,7 +169,7 @@ impl TrafficDb {
         let agg_to = to_ms.min(raw_cutoff);
         if from_ms < agg_to {
             let mut stmt = match conn.prepare(
-                "SELECT bucket, download_avg, upload_avg
+                "SELECT bucket, download_avg, upload_avg, wan_name
                  FROM traffic_1m
                  WHERE bucket >= ?1 AND bucket < ?2
                  ORDER BY bucket ASC
@@ -177,6 +188,100 @@ impl TrafficDb {
                         timestamp_ms: row.get(0)?,
                         download_bps: row.get(1)?,
                         upload_bps: row.get(2)?,
+                        wan_name: row.get(3)?,
+                    })
+                })
+                .ok()
+                .into_iter()
+                .flat_map(|r| r.filter_map(|x| x.ok()))
+                .collect();
+
+            records.extend(agg_rows);
+        }
+
+        records.sort_by_key(|r| r.timestamp_ms);
+        records.dedup_by_key(|r| r.timestamp_ms);
+        if records.len() > 14400 {
+            records.truncate(14400);
+        }
+
+        records
+    }
+
+    /// Query traffic records for a specific WAN interface.
+    ///
+    /// Same merge logic as `query()` but filtered to a single wan_name.
+    pub fn query_by_wan(&self, from_ms: i64, to_ms: i64, wan_name: &str) -> Vec<TrafficRecord> {
+        let conn = match self.conn.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("TrafficDB lock poisoned: {e}");
+                return vec![];
+            }
+        };
+
+        let now_ms = current_time_ms();
+        let raw_cutoff = now_ms - 7 * 86400 * 1000;
+
+        let mut records: Vec<TrafficRecord> = Vec::new();
+
+        // Query raw points for this WAN
+        {
+            let mut stmt = match conn.prepare(
+                "SELECT ts, download_bps, upload_bps, wan_name
+                 FROM traffic_points
+                 WHERE ts >= ?1 AND ts < ?2 AND wan_name = ?3
+                 ORDER BY ts ASC
+                 LIMIT 14400",
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("TrafficDB prepare query_by_wan raw failed: {e}");
+                    return vec![];
+                }
+            };
+
+            let raw_rows: Vec<TrafficRecord> = stmt
+                .query_map(params![from_ms, to_ms, wan_name], |row| {
+                    Ok(TrafficRecord {
+                        timestamp_ms: row.get(0)?,
+                        download_bps: row.get(1)?,
+                        upload_bps: row.get(2)?,
+                        wan_name: row.get(3)?,
+                    })
+                })
+                .ok()
+                .into_iter()
+                .flat_map(|r| r.filter_map(|x| x.ok()))
+                .collect();
+
+            records.extend(raw_rows);
+        }
+
+        // Query 1-minute aggregated points for this WAN
+        let agg_to = to_ms.min(raw_cutoff);
+        if from_ms < agg_to {
+            let mut stmt = match conn.prepare(
+                "SELECT bucket, download_avg, upload_avg, wan_name
+                 FROM traffic_1m
+                 WHERE bucket >= ?1 AND bucket < ?2 AND wan_name = ?3
+                 ORDER BY bucket ASC
+                 LIMIT 14400",
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("TrafficDB prepare query_by_wan 1m failed: {e}");
+                    return records;
+                }
+            };
+
+            let agg_rows: Vec<TrafficRecord> = stmt
+                .query_map(params![from_ms, agg_to, wan_name], |row| {
+                    Ok(TrafficRecord {
+                        timestamp_ms: row.get(0)?,
+                        download_bps: row.get(1)?,
+                        upload_bps: row.get(2)?,
+                        wan_name: row.get(3)?,
                     })
                 })
                 .ok()
@@ -212,9 +317,9 @@ impl TrafficDb {
         };
 
         // Aggregate raw points older than raw_cutoff into 1-minute buckets
-        let raw_rows: Vec<(i64, f64, f64)> = {
+        let raw_rows: Vec<(i64, f64, f64, Option<String>)> = {
             let mut stmt = match conn.prepare(
-                "SELECT ts, download_bps, upload_bps
+                "SELECT ts, download_bps, upload_bps, wan_name
                  FROM traffic_points
                  WHERE ts < ?1
                  ORDER BY ts ASC",
@@ -229,7 +334,8 @@ impl TrafficDb {
             stmt.query_map(params![raw_cutoff], |row| {
                 Ok((row.get::<_, i64>(0)?,
                     row.get::<_, f64>(1)?,
-                    row.get::<_, f64>(2)?))
+                    row.get::<_, f64>(2)?,
+                    row.get::<_, Option<String>>(3)?))
             })
             .ok()
             .into_iter()
@@ -237,25 +343,25 @@ impl TrafficDb {
             .collect()
         };
 
-        // Build 1-minute buckets
-        let mut bucket_sums: Vec<(i64, f64, f64, i64)> = Vec::new();
-        for (ts, dl, ul) in &raw_rows {
+        // Build 1-minute buckets keyed by (bucket, wan_name)
+        let mut bucket_sums: Vec<(i64, Option<String>, f64, f64, i64)> = Vec::new();
+        for (ts, dl, ul, wan_name) in &raw_rows {
             let bucket = ts / 60000 * 60000;
             if let Some(last) = bucket_sums.last_mut() {
-                if last.0 == bucket {
-                    last.1 += dl;
-                    last.2 += ul;
-                    last.3 += 1;
+                if last.0 == bucket && last.1 == *wan_name {
+                    last.2 += dl;
+                    last.3 += ul;
+                    last.4 += 1;
                     continue;
                 }
             }
-            bucket_sums.push((bucket, *dl, *ul, 1));
+            bucket_sums.push((bucket, wan_name.clone(), *dl, *ul, 1));
         }
 
         if !bucket_sums.is_empty() {
             let mut insert_stmt = match conn.prepare(
-                "INSERT OR REPLACE INTO traffic_1m (bucket, download_avg, upload_avg)
-                 VALUES (?1, ?2, ?3)",
+                "INSERT OR REPLACE INTO traffic_1m (bucket, download_avg, upload_avg, wan_name)
+                 VALUES (?1, ?2, ?3, ?4)",
             ) {
                 Ok(s) => s,
                 Err(e) => {
@@ -264,14 +370,14 @@ impl TrafficDb {
                 }
             };
 
-            for (bucket, dl_sum, ul_sum, count) in &bucket_sums {
+            for (bucket, wan_name, dl_sum, ul_sum, count) in &bucket_sums {
                 let c = *count as f64;
-                if let Err(e) = insert_stmt.execute(params![bucket, dl_sum / c, ul_sum / c]) {
+                if let Err(e) = insert_stmt.execute(params![bucket, dl_sum / c, ul_sum / c, wan_name.as_deref()]) {
                     warn!("TrafficDB aggregate insert failed: {e}");
                 }
             }
 
-            let total_points: i64 = bucket_sums.iter().map(|(_, _, _, c)| c).sum();
+            let total_points: i64 = bucket_sums.iter().map(|(_, _, _, _, c)| c).sum();
             info!(
                 "TrafficDB aggregated {} buckets ({} raw points)",
                 bucket_sums.len(),

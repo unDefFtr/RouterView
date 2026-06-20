@@ -5,7 +5,7 @@ import { storeToRefs } from 'pinia';
 import FeatherIcon from '@/components/shared/FeatherIcon.vue';
 
 const store = useDashboardStore();
-const { system, gateway, interfaces } = storeToRefs(store);
+const { system, gateway, interfaces, wans, hasMultipleWans } = storeToRefs(store);
 
 const memoryUsagePct = computed(() => {
   if (system.value.total_memory === 0) return 0;
@@ -23,6 +23,23 @@ const cpuColor = computed(() => {
   if (cpu > 50) return 'var(--color-warning)';
   return 'var(--color-success)';
 });
+
+const onlineWanCount = computed(() => wans.value.filter((w) => w.online).length);
+const totalWanCount = computed(() => wans.value.length || 1);
+const wanOnline = computed(() => {
+  if (wans.value.length > 0) {
+    return wans.value.some((w) => w.online);
+  }
+  return gateway.value.wan_online;
+});
+
+function formatRate(bps: number): string {
+  if (bps === 0) return '0';
+  const mbps = bps / 1_000_000;
+  if (mbps >= 1) return mbps.toFixed(1) + 'M';
+  const kbps = bps / 1_000;
+  return kbps.toFixed(0) + 'K';
+}
 </script>
 
 <template>
@@ -44,10 +61,13 @@ const cpuColor = computed(() => {
 
     <!-- Summary icons row -->
     <div class="summary-row">
-      <div class="summary-item" :class="{ online: gateway.wan_online }">
+      <div class="summary-item" :class="{ online: wanOnline }">
         <FeatherIcon name="globe" :size="16" />
         <span class="summary-label">WAN</span>
-        <span class="summary-value">{{ gateway.wan_online ? '在线' : '离线' }}</span>
+        <span class="summary-value">
+          <template v-if="hasMultipleWans">{{ onlineWanCount }}/{{ totalWanCount }}</template>
+          <template v-else>{{ gateway.wan_online ? '在线' : '离线' }}</template>
+        </span>
       </div>
       <div class="summary-item">
         <FeatherIcon name="server" :size="16" />
@@ -78,16 +98,57 @@ const cpuColor = computed(() => {
         <span class="metric-value mono">{{ system.uptime }}</span>
       </div>
       <div class="metric-item">
+        <span class="metric-label">版本</span>
+        <span class="metric-value mono">RouterOS {{ system.version }}</span>
+      </div>
+    </div>
+
+    <!-- Multi-WAN list: embedded directly (rates + IP + gateway) -->
+    <div v-if="hasMultipleWans" class="wan-list">
+      <div
+        v-for="wan in wans"
+        :key="wan.wan_name"
+        class="wan-item"
+        :class="{ offline: !wan.online }"
+      >
+        <div class="wan-left">
+          <span
+            class="wan-dot"
+            :style="{ backgroundColor: wan.online ? 'var(--color-success)' : 'var(--color-danger)' }"
+          />
+          <div class="wan-info">
+            <span class="wan-name">
+              {{ wan.wan_name }}
+              <span v-if="wan.is_primary" class="primary-badge">主</span>
+            </span>
+            <span class="wan-detail">
+              <span class="wan-ip">{{ wan.wan_ip }}</span>
+              <span class="wan-gw">→ {{ wan.gateway_ip }}</span>
+            </span>
+          </div>
+        </div>
+        <div class="wan-right">
+          <span class="wan-rate rx">
+            <FeatherIcon name="download" :size="10" :stroke-width="2.5" />
+            {{ formatRate(wan.download_bps) }}
+          </span>
+          <span class="wan-rate tx">
+            <FeatherIcon name="upload" :size="10" :stroke-width="2.5" />
+            {{ formatRate(wan.upload_bps) }}
+          </span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Single-WAN metrics (fallback) -->
+    <div v-else class="metrics-grid">
+      <div class="metric-item">
         <span class="metric-label">WAN IP</span>
         <span class="metric-value mono wan-ip">{{ gateway.wan_ip }}</span>
       </div>
       <div class="metric-item">
         <span class="metric-label">网关</span>
         <span class="metric-value mono">{{ gateway.gateway_ip }}</span>
-      </div>
-      <div class="metric-item">
-        <span class="metric-label">版本</span>
-        <span class="metric-value mono">RouterOS {{ system.version }}</span>
       </div>
     </div>
 
@@ -244,6 +305,118 @@ const cpuColor = computed(() => {
 
 .wan-ip {
   color: var(--color-accent);
+}
+
+/* ── Embedded multi-WAN list ────────────────────────── */
+
+.wan-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px;
+  background: var(--color-bg-input);
+  border-radius: var(--border-radius-sm);
+  border: 1px solid var(--color-border-light);
+}
+
+.wan-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 5px 6px;
+  border-radius: 4px;
+  transition: background var(--transition-fast);
+}
+
+.wan-item:hover {
+  background: var(--color-bg-hover);
+}
+
+.wan-item.offline {
+  opacity: 0.55;
+}
+
+.wan-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.wan-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.wan-info {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.wan-name {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--color-text-primary);
+  font-family: var(--font-mono);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.primary-badge {
+  font-size: 0.55rem;
+  font-weight: 700;
+  padding: 0px 4px;
+  border-radius: 3px;
+  background: var(--color-accent);
+  color: #fff;
+  font-family: var(--font-sans);
+  line-height: 1.4;
+}
+
+.wan-detail {
+  font-size: 0.65rem;
+  color: var(--color-text-muted);
+  font-family: var(--font-mono);
+  display: flex;
+  gap: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.wan-gw {
+  opacity: 0.7;
+}
+
+.wan-right {
+  display: flex;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.wan-rate {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  font-weight: 500;
+}
+
+.wan-rate.rx {
+  color: var(--color-success);
+  min-width: 48px;
+  justify-content: flex-end;
+}
+
+.wan-rate.tx {
+  color: var(--color-accent);
+  min-width: 48px;
+  justify-content: flex-end;
 }
 
 .resource-bars {

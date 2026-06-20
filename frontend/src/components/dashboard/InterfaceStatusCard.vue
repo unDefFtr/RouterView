@@ -60,7 +60,10 @@ const stoppedColor = 'var(--color-danger)';
             :style="{ backgroundColor: iface.running ? runningColor : stoppedColor }"
           />
           <div class="iface-info">
-            <span class="iface-name">{{ iface.name }}</span>
+            <span class="iface-name">
+              {{ iface.name }}
+              <span v-if="iface.is_wan" class="wan-badge">WAN</span>
+            </span>
             <span class="iface-type">{{ typeLabel(iface.type) }}</span>
           </div>
         </div>
@@ -162,6 +165,20 @@ const stoppedColor = 'var(--color-danger)';
   font-weight: 600;
   color: var(--color-text-primary);
   font-family: var(--font-mono);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.wan-badge {
+  font-size: 0.5rem;
+  font-weight: 700;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: var(--color-accent);
+  color: #fff;
+  font-family: var(--font-sans);
+  line-height: 1.4;
 }
 
 .iface-type {

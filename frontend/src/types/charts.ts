@@ -8,6 +8,7 @@ export interface TrafficChartData {
   timestamp: string;
   download_bps: number;
   upload_bps: number;
+  wan_name?: string;
 }
 
 export type TimeRange = '5M' | '1H' | '6H' | '24H' | '7D' | '30D';

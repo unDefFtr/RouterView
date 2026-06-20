@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 
 use tracing::debug;
@@ -33,29 +33,38 @@ pub fn to_dashboard_snapshot(
 ) -> Result<DashboardSnapshot, AppError> {
     let now = chrono::Utc::now().to_rfc3339();
 
-    // ── Find the default-route WAN ───────────────────────
-    let wan_info = resolve_wan(&ips, &interfaces, &routes);
+    // ── Find all WANs from the routing table ──────────────
+    let all_wans = resolve_all_wans(&ips, &interfaces, &routes);
+    let primary_wan = all_wans
+        .first()
+        .cloned()
+        .unwrap_or_else(|| fallback_wan(&ips, &interfaces));
 
     // ── System Info ───────────────────────────────────────
     let system = extract_system_info(&sys);
 
-    // ── Gateway Info (from routing table) ────────────────
-    let gateway = extract_gateway(&wan_info, &leases);
+    // ── Gateway Info (primary + all WAN entries) ──────────
+    let gateway = extract_gateway(&primary_wan, &all_wans, &leases, prev_counters);
 
     // ── Interface Summary ─────────────────────────────────
     let interface_summary = extract_interface_summary(&interfaces, &arp);
 
-    // ── ISP Info ──────────────────────────────────────────
-    let isp = extract_isp(&identity, &wan_info, prev_counters);
+    // ── ISP Info (primary + per-WAN) ──────────────────────
+    let isp = extract_isp(&identity, &primary_wan, &all_wans, prev_counters);
 
-    // ── Traffic (WAN interface only, from routing table) ──
-    let traffic = extract_traffic(&wan_info, prev_counters, &now);
+    // ── Traffic (aggregate + per-WAN points) ───────────────
+    let traffic = extract_traffic(&all_wans, prev_counters, &now);
 
     // ── WiFi Info ─────────────────────────────────────────
     let wifi = extract_wifi(&wireless_regs, &arp, &leases);
 
     // ── Per-interface status with rates ───────────────────
-    let interface_statuses = extract_interface_statuses(&interfaces, prev_counters);
+    let interface_statuses = extract_interface_statuses(&interfaces, prev_counters, &all_wans);
+
+    // ── Build per-WAN snapshot fields ─────────────────────
+    let wans: Vec<WanEntry> = build_wan_entries(&all_wans, prev_counters);
+    let wans_isp: Vec<WanIspInfo> = build_wan_isp_entries(&all_wans, &identity);
+    let wan_traffic_points: Vec<TrafficPoint> = build_wan_traffic_points(&all_wans, prev_counters, &now);
 
     Ok(DashboardSnapshot {
         system,
@@ -68,12 +77,16 @@ pub fn to_dashboard_snapshot(
         stability,
         interface_statuses,
         timestamp: now,
+        wans,
+        wans_isp,
+        wan_traffic_points,
     })
 }
 
 // ── WAN Resolution ───────────────────────────────────────────────
 
 /// The resolved WAN — derived from the default route in the routing table.
+#[derive(Clone)]
 struct WanInfo {
     /// Interface name of the default-route egress
     interface_name: String,
@@ -87,17 +100,17 @@ struct WanInfo {
     iface: Option<Interface>,
 }
 
-/// Look at `/ip/route` for the active default route (`dst-address=0.0.0.0/0`).
-/// From it we get the real gateway IP and egress interface name, then match
-/// an IP from `/ip/address` that lives on that interface.
+/// Collect ALL active default routes from the routing table.
+/// Each distinct (gateway, interface) pair becomes one WanInfo.
 ///
-/// Fallback chain:
-///   1. Active default route with gateway-status=reachable
-///   2. Any active default route
-///   3. First running ethernet interface with a non-loopback IP
-fn resolve_wan(ips: &[IpAddress], interfaces: &[Interface], routes: &[Route]) -> WanInfo {
-    // ── Step 1: find the default route ─────────────────────
-    let default_route = routes
+/// Routes are sorted so reachable gateways come first; the first online
+/// entry is treated as the primary WAN by callers.
+fn resolve_all_wans(ips: &[IpAddress], interfaces: &[Interface], routes: &[Route]) -> Vec<WanInfo> {
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut wans: Vec<WanInfo> = Vec::new();
+
+    // Collect and sort: reachable gateways first
+    let mut default_routes: Vec<&Route> = routes
         .iter()
         .filter(|r| {
             r.dst_address == "0.0.0.0/0"
@@ -105,74 +118,87 @@ fn resolve_wan(ips: &[IpAddress], interfaces: &[Interface], routes: &[Route]) ->
                 && r.disabled != "true"
                 && !r.gateway.is_empty()
         })
-        .max_by_key(|r| {
-            // Prefer reachable gateways
-            if r.gateway_status == "reachable" { 10u8 } else { 0u8 }
-        });
+        .collect();
 
-    let (default_gateway, route_iface_name) = if let Some(r) = default_route {
-        // RouterOS PPPoE/PPTP/L2TP: the route's `gateway` field contains the virtual
-        // interface name (e.g. "pppoe-cntelecom") and `interface` is empty.
-        // Detect this: if `interface` is empty and `gateway` isn't an IP address,
-        // use `gateway` as the interface name.
-        let iface_from_route = if r.interface.is_empty() && r.gateway.parse::<IpAddr>().is_err() {
-            r.gateway.clone()
+    default_routes.sort_by_key(|r| {
+        if r.gateway_status == "reachable" { 0u8 } else { 1u8 }
+    });
+
+    for route in &default_routes {
+        // RouterOS PPPoE/PPTP/L2TP: the route's `gateway` field contains the
+        // virtual interface name (e.g. "pppoe-cntelecom") and `interface` is empty.
+        let route_iface_name = if route.interface.is_empty()
+            && route.gateway.parse::<IpAddr>().is_err()
+        {
+            route.gateway.clone()
         } else {
-            r.interface.clone()
+            route.interface.clone()
         };
-        (r.gateway.clone(), iface_from_route)
-    } else {
-        // No default route at all — fall back to heuristic
-        return fallback_wan(ips, interfaces);
-    };
 
-    debug!(
-        "Default route: gateway={}, interface={}",
-        default_gateway, route_iface_name,
-    );
+        // Deduplicate by (gateway, interface_name)
+        let key = (route.gateway.clone(), route_iface_name.clone());
+        if !seen.insert(key) {
+            continue;
+        }
 
-    // ── Step 2: find the IP on that egress interface ───────
-    let ip_entry = ips
-        .iter()
-        .filter(|ip| ip.disabled != "true")
-        .find(|ip| {
-            let ifname = if ip.actual_interface.is_empty() {
-                &ip.interface
-            } else {
-                &ip.actual_interface
-            };
-            ifname == &route_iface_name
+        // Find the IP on that egress interface
+        let ip_entry = ips
+            .iter()
+            .filter(|ip| ip.disabled != "true")
+            .find(|ip| {
+                let ifname = if ip.actual_interface.is_empty() {
+                    &ip.interface
+                } else {
+                    &ip.actual_interface
+                };
+                ifname == &route_iface_name
+            });
+
+        let ip_address = ip_entry
+            .map(|e| extract_ip_from_cidr(&e.address))
+            .unwrap_or_else(|| "—".to_string());
+
+        // Find the matching Interface struct
+        let iface = interfaces
+            .iter()
+            .find(|i| i.name == route_iface_name)
+            .cloned();
+
+        let online = iface
+            .as_ref()
+            .map(|i| i.running == "true")
+            .unwrap_or(false);
+
+        wans.push(WanInfo {
+            interface_name: route_iface_name,
+            ip_address,
+            gateway: route.gateway.clone(),
+            online,
+            iface,
         });
-
-    let ip_address = ip_entry
-        .map(|e| extract_ip_from_cidr(&e.address))
-        .unwrap_or_else(|| "—".to_string());
-
-    // ── Step 3: find the matching Interface struct ─────────
-    let iface = interfaces
-        .iter()
-        .find(|i| i.name == route_iface_name)
-        .cloned();
-
-    let online = iface
-        .as_ref()
-        .map(|i| i.running == "true")
-        .unwrap_or(false);
-
-    let wan_info = WanInfo {
-        interface_name: route_iface_name.clone(),
-        ip_address,
-        gateway: default_gateway,
-        online,
-        iface,
-    };
+    }
 
     debug!(
-        "WAN resolved via default route: iface={}, ip={}, gw={}, online={}",
-        route_iface_name, wan_info.ip_address, wan_info.gateway, wan_info.online
+        "resolve_all_wans: found {} WAN(s) from {} default route(s)",
+        wans.len(),
+        default_routes.len(),
     );
 
-    wan_info
+    wans
+}
+
+/// Pick the primary WAN from the resolved list (first reachable, or fallback).
+/// Kept for backward compatibility — single-WAN callers use this.
+fn resolve_wan(ips: &[IpAddress], interfaces: &[Interface], routes: &[Route]) -> WanInfo {
+    let all = resolve_all_wans(ips, interfaces, routes);
+
+    // Prefer the first online WAN
+    if let Some(wan) = all.into_iter().find(|w| w.online) {
+        return wan;
+    }
+
+    // Fallback: pick first running ethernet interface with an IP
+    fallback_wan(ips, interfaces)
 }
 
 /// Fallback when no default route exists.
@@ -232,18 +258,24 @@ fn extract_system_info(sys: &SystemResource) -> SystemInfo {
     }
 }
 
-fn extract_gateway(wan: &WanInfo, leases: &[DhcpLease]) -> GatewayInfo {
+fn extract_gateway(
+    primary: &WanInfo,
+    all_wans: &[WanInfo],
+    leases: &[DhcpLease],
+    prev_counters: Option<&HashMap<String, (u64, u64)>>,
+) -> GatewayInfo {
     let ip_allocations = leases
         .iter()
         .filter(|l| l.status == "bound")
         .count() as u32;
 
     GatewayInfo {
-        wan_interface: wan.interface_name.clone(),
-        wan_ip: wan.ip_address.clone(),
-        gateway_ip: wan.gateway.clone(),
-        wan_online: wan.online,
+        wan_interface: primary.interface_name.clone(),
+        wan_ip: primary.ip_address.clone(),
+        gateway_ip: primary.gateway.clone(),
+        wan_online: primary.online,
         ip_allocations,
+        wans: build_wan_entries(all_wans, prev_counters),
     }
 }
 
@@ -289,10 +321,15 @@ fn extract_interface_summary(interfaces: &[Interface], arp: &[ArpEntry]) -> Inte
 }
 
 /// Build per-interface status with real-time RX/TX rates.
+/// WAN interfaces are tagged with `is_wan` and `wan_name` for UI highlighting.
 fn extract_interface_statuses(
     interfaces: &[Interface],
     prev_counters: Option<&HashMap<String, (u64, u64)>>,
+    all_wans: &[WanInfo],
 ) -> Vec<InterfaceStatus> {
+    // Build a set of WAN interface names for fast lookup
+    let wan_names: HashSet<&str> = all_wans.iter().map(|w| w.interface_name.as_str()).collect();
+
     let mut statuses: Vec<InterfaceStatus> = interfaces
         .iter()
         .filter(|i| i.default_name != "lo" && i.name != "lo") // skip loopback
@@ -308,12 +345,16 @@ fn extract_interface_statuses(
                 })
                 .unwrap_or((0.0, 0.0));
 
+            let is_wan = wan_names.contains(iface.name.as_str());
+
             Some(InterfaceStatus {
                 name: iface.name.clone(),
                 iface_type: iface.iface_type.clone(),
                 running: iface.running == "true",
                 rx_bps,
                 tx_bps,
+                is_wan: if is_wan { Some(true) } else { None },
+                wan_name: if is_wan { Some(iface.name.clone()) } else { None },
             })
         })
         .collect();
@@ -339,7 +380,8 @@ fn extract_interface_statuses(
 
 fn extract_isp(
     identity: &SystemIdentity,
-    wan: &WanInfo,
+    primary: &WanInfo,
+    all_wans: &[WanInfo],
     prev_counters: Option<&HashMap<String, (u64, u64)>>,
 ) -> IspInfo {
     let isp_name = if identity.name.is_empty() {
@@ -348,16 +390,17 @@ fn extract_isp(
         identity.name.clone()
     };
 
-    // Only measure the routing-table-identified WAN interface.
-    let (download_bps, upload_bps) = compute_wan_rate(wan, prev_counters)
+    // Primary WAN rate
+    let (download_bps, upload_bps) = compute_wan_rate(primary, prev_counters)
         .unwrap_or((0.0, 0.0));
 
     IspInfo {
         name: isp_name,
-        online: wan.online,
+        online: primary.online,
         monthly_usage_gb: 0.0,
         download_bps,
         upload_bps,
+        wans: build_wan_isp_entries(all_wans, identity),
     }
 }
 
@@ -376,19 +419,101 @@ fn compute_wan_rate(
     Some((rx_diff as f64 * 8.0 / 3.0, tx_diff as f64 * 8.0 / 3.0))
 }
 
+// ── Multi-WAN Builder Helpers ────────────────────────────────────
+
+/// Build `Vec<WanEntry>` from resolved WANs with real-time rate data.
+fn build_wan_entries(
+    all_wans: &[WanInfo],
+    prev_counters: Option<&HashMap<String, (u64, u64)>>,
+) -> Vec<WanEntry> {
+    all_wans
+        .iter()
+        .enumerate()
+        .map(|(i, wan)| {
+            let (download_bps, upload_bps) =
+                compute_wan_rate(wan, prev_counters).unwrap_or((0.0, 0.0));
+            WanEntry {
+                wan_name: wan.interface_name.clone(),
+                wan_ip: wan.ip_address.clone(),
+                gateway_ip: wan.gateway.clone(),
+                online: wan.online,
+                download_bps,
+                upload_bps,
+                is_primary: i == 0, // first reachable WAN is primary
+            }
+        })
+        .collect()
+}
+
+/// Build `Vec<WanIspInfo>` from resolved WANs.
+fn build_wan_isp_entries(
+    all_wans: &[WanInfo],
+    identity: &SystemIdentity,
+) -> Vec<WanIspInfo> {
+    let isp_name = if identity.name.is_empty() {
+        "Unknown ISP".to_string()
+    } else {
+        identity.name.clone()
+    };
+
+    all_wans
+        .iter()
+        .map(|wan| WanIspInfo {
+            wan_name: wan.interface_name.clone(),
+            name: isp_name.clone(),
+            online: wan.online,
+            download_bps: 0.0, // filled by per-WAN rate elsewhere
+            upload_bps: 0.0,
+        })
+        .collect()
+}
+
+/// Build per-WAN traffic points for the current poll tick.
+fn build_wan_traffic_points(
+    all_wans: &[WanInfo],
+    prev_counters: Option<&HashMap<String, (u64, u64)>>,
+    now: &str,
+) -> Vec<TrafficPoint> {
+    all_wans
+        .iter()
+        .filter_map(|wan| {
+            let (download_bps, upload_bps) =
+                compute_wan_rate(wan, prev_counters).unwrap_or((0.0, 0.0));
+            if download_bps > 0.0 || upload_bps > 0.0 {
+                Some(TrafficPoint {
+                    timestamp: now.to_string(),
+                    download_bps,
+                    upload_bps,
+                    wan_name: Some(wan.interface_name.clone()),
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 fn extract_traffic(
-    wan: &WanInfo,
+    all_wans: &[WanInfo],
     prev_counters: Option<&HashMap<String, (u64, u64)>>,
     now: &str,
 ) -> TrafficSnapshot {
-    let (download_bps, upload_bps) = compute_wan_rate(wan, prev_counters)
-        .unwrap_or((0.0, 0.0));
+    // Sum download/upload across all WANs for the aggregate traffic point
+    let (download_bps, upload_bps) = all_wans
+        .iter()
+        .fold((0.0f64, 0.0f64), |(dl, ul), wan| {
+            if let Some((wdl, wul)) = compute_wan_rate(wan, prev_counters) {
+                (dl + wdl, ul + wul)
+            } else {
+                (dl, ul)
+            }
+        });
 
     debug!(
-        "Traffic: down={:.1} Kbps, up={:.1} Kbps (wan={})",
+        "Traffic ({} WANs): down={:.1} Kbps, up={:.1} Kbps",
+        all_wans.len(),
         download_bps / 1000.0,
         upload_bps / 1000.0,
-        wan.interface_name,
     );
 
     let points = if download_bps > 0.0 || upload_bps > 0.0 {
@@ -396,6 +521,7 @@ fn extract_traffic(
             timestamp: now.to_string(),
             download_bps,
             upload_bps,
+            wan_name: None, // aggregate
         }]
     } else {
         vec![]

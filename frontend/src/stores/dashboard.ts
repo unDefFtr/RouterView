@@ -12,6 +12,8 @@ import type {
   InterfaceStatus,
   DashboardSnapshot,
   DashboardUpdate,
+  WanEntry,
+  WanIspInfo,
 } from '@/types/dashboard';
 import type { TimeRange } from '@/types/charts';
 import { timeRangeToMs } from '@/types/charts';
@@ -47,9 +49,25 @@ export const useDashboardStore = defineStore('dashboard', () => {
   const lastPollTimestamp = ref<string | null>(null);
   const wsConnected = ref(false);
 
-  // Track previous counter values for display
-  const totalDownloadBps = ref(0);
-  const totalUploadBps = ref(0);
+  // ── Multi-WAN State ─────────────────────────────────
+  const wans = ref<WanEntry[]>([]);
+  const wansIsp = ref<WanIspInfo[]>([]);
+  const _wanTrafficBuffers = ref<Record<string, TrafficPoint[]>>({});
+  const selectedWan = ref<string | null>(null);
+
+  // ── Rate Computed (sum of all WANs or single ISP fallback) ──
+  const totalDownloadBps = computed(() => {
+    if (wans.value.length > 0) {
+      return wans.value.reduce((s, w) => s + w.download_bps, 0);
+    }
+    return isp.value.download_bps;
+  });
+  const totalUploadBps = computed(() => {
+    if (wans.value.length > 0) {
+      return wans.value.reduce((s, w) => s + w.upload_bps, 0);
+    }
+    return isp.value.upload_bps;
+  });
 
   // ── Getters ─────────────────────────────────────────
 
@@ -62,6 +80,17 @@ export const useDashboardStore = defineStore('dashboard', () => {
   const trafficPoints = computed(() =>
     pruneByTimestamp(_trafficBuffer.value, trafficTimeRange.value),
   );
+
+  // ── Multi-WAN Getters ───────────────────────────────
+  const hasMultipleWans = computed(() => wans.value.length > 1);
+  const wanNames = computed(() => wans.value.map((w) => w.wan_name));
+  /// Per-WAN traffic points for the selected WAN (reactive viewport).
+  const wanTrafficPoints = computed(() => {
+    if (!selectedWan.value) return [] as TrafficPoint[];
+    const buf = _wanTrafficBuffers.value[selectedWan.value];
+    if (!buf) return [] as TrafficPoint[];
+    return pruneByTimestamp(buf, trafficTimeRange.value);
+  });
 
   // ── Actions ─────────────────────────────────────────
 
@@ -77,8 +106,25 @@ export const useDashboardStore = defineStore('dashboard', () => {
     stability.value = snapshot.stability;
     interfaceStatuses.value = snapshot.interface_statuses;
 
-    totalDownloadBps.value = snapshot.isp.download_bps;
-    totalUploadBps.value = snapshot.isp.upload_bps;
+    // Multi-WAN fields
+    wans.value = snapshot.wans || [];
+    wansIsp.value = snapshot.wans_isp || [];
+
+    // Populate per-WAN traffic buffers
+    if (snapshot.wan_traffic_points && snapshot.wan_traffic_points.length > 0) {
+      const newBuffers: Record<string, TrafficPoint[]> = { ..._wanTrafficBuffers.value };
+      for (const pt of snapshot.wan_traffic_points) {
+        if (pt.wan_name) {
+          if (!newBuffers[pt.wan_name]) {
+            newBuffers[pt.wan_name] = [];
+          }
+          newBuffers[pt.wan_name].push(pt);
+          // Prune to 6h
+          newBuffers[pt.wan_name] = pruneByTimestamp(newBuffers[pt.wan_name], '6H');
+        }
+      }
+      _wanTrafficBuffers.value = newBuffers;
+    }
 
     routerosConnected.value = true;
     lastPollTimestamp.value = snapshot.timestamp;
@@ -92,8 +138,6 @@ export const useDashboardStore = defineStore('dashboard', () => {
     if (update.interfaces) Object.assign(interfaces.value, update.interfaces);
     if (update.isp) {
       Object.assign(isp.value, update.isp);
-      totalDownloadBps.value = update.isp.download_bps;
-      totalUploadBps.value = update.isp.upload_bps;
     }
     if (update.traffic) {
       _trafficBuffer.value.push(update.traffic);
@@ -103,6 +147,23 @@ export const useDashboardStore = defineStore('dashboard', () => {
     if (update.wifi) Object.assign(wifi.value, update.wifi);
     if (update.stability) Object.assign(stability.value, update.stability);
     if (update.interface_statuses) interfaceStatuses.value = update.interface_statuses;
+
+    // Multi-WAN updates
+    if (update.wans) wans.value = update.wans;
+    if (update.wans_isp) wansIsp.value = update.wans_isp;
+    if (update.wan_traffic_points && update.wan_traffic_points.length > 0) {
+      const newBuffers = { ..._wanTrafficBuffers.value };
+      for (const pt of update.wan_traffic_points) {
+        if (pt.wan_name) {
+          if (!newBuffers[pt.wan_name]) {
+            newBuffers[pt.wan_name] = [];
+          }
+          newBuffers[pt.wan_name].push(pt);
+          newBuffers[pt.wan_name] = pruneByTimestamp(newBuffers[pt.wan_name], '6H');
+        }
+      }
+      _wanTrafficBuffers.value = newBuffers;
+    }
 
     lastPollTimestamp.value = update.timestamp;
     routerosConnected.value = true;
@@ -115,6 +176,10 @@ export const useDashboardStore = defineStore('dashboard', () => {
 
   function setTrafficTimeRange(range: TimeRange) {
     trafficTimeRange.value = range;
+  }
+
+  function selectWan(wanName: string | null) {
+    selectedWan.value = wanName;
   }
 
   /** Filter traffic points by actual timestamp, keeping only those within the window. */
@@ -146,17 +211,26 @@ export const useDashboardStore = defineStore('dashboard', () => {
     wsConnected,
     totalDownloadBps,
     totalUploadBps,
+    // Multi-WAN state
+    wans,
+    wansIsp,
+    selectedWan,
     // Getters
     isLive,
     systemUptimeFormatted,
     downloadRate,
     uploadRate,
     onlineRateFormatted,
+    // Multi-WAN getters
+    hasMultipleWans,
+    wanNames,
+    wanTrafficPoints,
     // Actions
     handleSnapshot,
     handleUpdate,
     handleConnectionStatus,
     setTrafficTimeRange,
+    selectWan,
   };
 });
 

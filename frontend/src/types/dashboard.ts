@@ -16,12 +16,31 @@ export interface SystemInfo {
   board_name: string;
 }
 
+export interface WanEntry {
+  wan_name: string;
+  wan_ip: string;
+  gateway_ip: string;
+  online: boolean;
+  download_bps: number;
+  upload_bps: number;
+  is_primary: boolean;
+}
+
+export interface WanIspInfo {
+  wan_name: string;
+  name: string;
+  online: boolean;
+  download_bps: number;
+  upload_bps: number;
+}
+
 export interface GatewayInfo {
   wan_interface: string;
   wan_ip: string;
   gateway_ip: string;
   wan_online: boolean;
   ip_allocations: number;
+  wans: WanEntry[];
 }
 
 export interface InterfaceSummary {
@@ -37,6 +56,7 @@ export interface IspInfo {
   monthly_usage_gb: number;
   download_bps: number;
   upload_bps: number;
+  wans: WanIspInfo[];
 }
 
 export interface InterfaceStatus {
@@ -45,6 +65,8 @@ export interface InterfaceStatus {
   running: boolean;
   rx_bps: number;
   tx_bps: number;
+  is_wan?: boolean;
+  wan_name?: string;
 }
 
 export interface LatencyProbe {
@@ -59,6 +81,7 @@ export interface TrafficPoint {
   timestamp: string;
   download_bps: number;
   upload_bps: number;
+  wan_name?: string;
 }
 
 export interface TrafficSnapshot {
@@ -115,6 +138,9 @@ export interface DashboardSnapshot {
   stability: IspStability;
   interface_statuses: InterfaceStatus[];
   timestamp: string;
+  wans: WanEntry[];
+  wans_isp: WanIspInfo[];
+  wan_traffic_points: TrafficPoint[];
 }
 
 // ── Differential Update ──────────────────────────────────
@@ -130,6 +156,9 @@ export interface DashboardUpdate {
   stability: IspStability | null;
   interface_statuses: InterfaceStatus[] | null;
   timestamp: string;
+  wans: WanEntry[] | null;
+  wans_isp: WanIspInfo[] | null;
+  wan_traffic_points: TrafficPoint[] | null;
 }
 
 // ── Connection Status ────────────────────────────────────
@@ -168,6 +197,7 @@ export const DEFAULT_GATEWAY_INFO: GatewayInfo = {
   gateway_ip: '—',
   wan_online: false,
   ip_allocations: 0,
+  wans: [],
 };
 
 export const DEFAULT_INTERFACE_SUMMARY: InterfaceSummary = {
@@ -183,6 +213,7 @@ export const DEFAULT_ISP_INFO: IspInfo = {
   monthly_usage_gb: 0,
   download_bps: 0,
   upload_bps: 0,
+  wans: [],
 };
 
 export const DEFAULT_WIFI_INFO: WifiInfo = {

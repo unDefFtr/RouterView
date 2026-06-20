@@ -11,6 +11,9 @@ use crate::state::AppState;
 pub struct TrafficQueryParams {
     pub start: i64,  // unix milliseconds, inclusive
     pub end: i64,    // unix milliseconds, exclusive
+    /// Optional WAN interface name filter for per-WAN queries
+    #[serde(default)]
+    pub wan_name: Option<String>,
 }
 
 /// A single traffic data point in the API response.
@@ -19,6 +22,9 @@ pub struct TrafficPointResponse {
     pub timestamp_ms: i64,
     pub download_bps: f64,
     pub upload_bps: f64,
+    /// WAN interface name (None = aggregate)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wan_name: Option<String>,
 }
 
 /// Response for GET /api/traffic.
@@ -54,7 +60,11 @@ pub async fn query_traffic(
         ));
     }
 
-    let records = state.traffic_db.query(params.start, params.end);
+    let records = if let Some(ref wan_name) = params.wan_name {
+        state.traffic_db.query_by_wan(params.start, params.end, wan_name)
+    } else {
+        state.traffic_db.query(params.start, params.end)
+    };
 
     // Determine interval: if all points are <7 days old it's ~5s, otherwise ~60s
     let now_ms = std::time::SystemTime::now()
@@ -70,6 +80,7 @@ pub async fn query_traffic(
             timestamp_ms: r.timestamp_ms,
             download_bps: r.download_bps,
             upload_bps: r.upload_bps,
+            wan_name: r.wan_name,
         })
         .collect();
 

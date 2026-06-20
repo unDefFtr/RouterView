@@ -42,6 +42,15 @@ pub struct DashboardSnapshot {
     pub stability: IspStability,
     pub interface_statuses: Vec<InterfaceStatus>,
     pub timestamp: String,
+    /// All WAN gateway entries (multi-WAN)
+    #[serde(default)]
+    pub wans: Vec<WanEntry>,
+    /// Per-WAN ISP info (multi-WAN)
+    #[serde(default)]
+    pub wans_isp: Vec<WanIspInfo>,
+    /// Per-WAN traffic points for the current poll (multi-WAN)
+    #[serde(default)]
+    pub wan_traffic_points: Vec<TrafficPoint>,
 }
 
 /// Differential update — every field is optional; only present when changed.
@@ -57,6 +66,15 @@ pub struct DashboardUpdate {
     pub stability: Option<IspStability>,
     pub interface_statuses: Option<Vec<InterfaceStatus>>,
     pub timestamp: String,
+    /// All WAN gateway entries (when changed)
+    #[serde(default)]
+    pub wans: Option<Vec<WanEntry>>,
+    /// Per-WAN ISP info (when changed)
+    #[serde(default)]
+    pub wans_isp: Option<Vec<WanIspInfo>>,
+    /// Per-WAN traffic points for this poll (always sent when available)
+    #[serde(default)]
+    pub wan_traffic_points: Option<Vec<TrafficPoint>>,
 }
 
 // ── System Info ──────────────────────────────────────────────
@@ -89,16 +107,38 @@ pub struct SystemInfo {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct GatewayInfo {
-    /// WAN interface name
+    /// WAN interface name (primary WAN — preserved for backward compat)
     pub wan_interface: String,
-    /// WAN IP address
+    /// WAN IP address (primary WAN)
     pub wan_ip: String,
-    /// Gateway IP address
+    /// Gateway IP address (primary WAN)
     pub gateway_ip: String,
-    /// Whether the WAN link is up
+    /// Whether the primary WAN link is up
     pub wan_online: bool,
     /// Number of IP addresses assigned (DHCP pool used)
     pub ip_allocations: u32,
+    /// All WAN entries (multi-WAN support)
+    #[serde(default)]
+    pub wans: Vec<WanEntry>,
+}
+
+/// Per-WAN gateway status entry for multi-WAN deployments.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct WanEntry {
+    /// WAN interface name (e.g. "pppoe-cntelecom", "ether1")
+    pub wan_name: String,
+    /// IP address assigned to this WAN interface
+    pub wan_ip: String,
+    /// Gateway IP for this WAN
+    pub gateway_ip: String,
+    /// Whether this WAN link is up
+    pub online: bool,
+    /// Current download rate in bps
+    pub download_bps: f64,
+    /// Current upload rate in bps
+    pub upload_bps: f64,
+    /// Whether this is the primary (lowest-distance) default route
+    pub is_primary: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -117,15 +157,33 @@ pub struct InterfaceSummary {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct IspInfo {
-    /// ISP name (derived from WAN interface comment or system identity)
+    /// ISP name (derived from system identity; primary WAN)
     pub name: String,
-    /// Whether the ISP link is online
+    /// Whether the ISP link is online (primary WAN)
     pub online: bool,
     /// Estimated monthly data usage in GB
     pub monthly_usage_gb: f64,
-    /// Current download rate in bps
+    /// Current download rate in bps (primary WAN)
     pub download_bps: f64,
-    /// Current upload rate in bps
+    /// Current upload rate in bps (primary WAN)
+    pub upload_bps: f64,
+    /// Per-WAN ISP info (multi-WAN support)
+    #[serde(default)]
+    pub wans: Vec<WanIspInfo>,
+}
+
+/// Per-WAN ISP info for multi-WAN deployments.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct WanIspInfo {
+    /// WAN interface name this ISP corresponds to
+    pub wan_name: String,
+    /// ISP name for this WAN (derived from system identity)
+    pub name: String,
+    /// Whether this WAN link is online
+    pub online: bool,
+    /// Current download rate in bps for this WAN
+    pub download_bps: f64,
+    /// Current upload rate in bps for this WAN
     pub upload_bps: f64,
 }
 
@@ -159,6 +217,9 @@ pub struct TrafficPoint {
     pub download_bps: f64,
     /// Upload rate in bps
     pub upload_bps: f64,
+    /// WAN interface name (None = aggregate traffic)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wan_name: Option<String>,
 }
 
 // ── WiFi & Devices ───────────────────────────────────────────
@@ -227,6 +288,12 @@ pub struct InterfaceStatus {
     pub rx_bps: f64,
     /// Current upload rate in bps
     pub tx_bps: f64,
+    /// Whether this interface is a WAN egress
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_wan: Option<bool>,
+    /// WAN name this interface corresponds to (if it is a WAN)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wan_name: Option<String>,
 }
 
 // ── ISP Stability ────────────────────────────────────────────

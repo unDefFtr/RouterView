@@ -7,7 +7,24 @@ import RateDisplay from '@/components/shared/RateDisplay.vue';
 import FeatherIcon from '@/components/shared/FeatherIcon.vue';
 
 const store = useDashboardStore();
-const { isp, latencyProbes } = storeToRefs(store);
+const { isp, latencyProbes, hasMultipleWans, wansIsp, selectedWan } = storeToRefs(store);
+
+/// Current ISP display: selected WAN's ISP info, or primary fallback
+const currentIspName = computed(() => {
+  if (hasMultipleWans.value && selectedWan.value) {
+    const match = wansIsp.value.find((w) => w.wan_name === selectedWan.value);
+    if (match) return match.name;
+  }
+  return isp.value.name;
+});
+
+const currentIspOnline = computed(() => {
+  if (hasMultipleWans.value && selectedWan.value) {
+    const match = wansIsp.value.find((w) => w.wan_name === selectedWan.value);
+    if (match) return match.online;
+  }
+  return isp.value.online;
+});
 
 const latStatusColor = (status: string): string => {
   switch (status) {
@@ -72,13 +89,25 @@ const goodProbes = computed(() => latencyProbes.value.filter(p => p.status === '
     <!-- ISP Header -->
     <div class="isp-header">
       <div class="isp-name-row">
-        <span class="isp-name">{{ isp.name }}</span>
-        <StatusBadge :status="isp.online ? 'online' : 'offline'" :pulse="true" />
+        <span class="isp-name">{{ currentIspName }}</span>
+        <StatusBadge :status="currentIspOnline ? 'online' : 'offline'" :pulse="true" />
       </div>
       <div class="isp-usage">
         <span class="usage-label">本月用量</span>
         <span class="usage-value">{{ isp.monthly_usage_gb.toFixed(0) }} GB</span>
       </div>
+    </div>
+
+    <!-- WAN Selector (multi-WAN) -->
+    <div v-if="hasMultipleWans" class="wan-select-row">
+      <select
+        class="wan-select"
+        :value="selectedWan ?? ''"
+        @change="store.selectWan($event.target ? ($event.target as HTMLSelectElement).value || null : null)"
+      >
+        <option value="">全部 (合计)</option>
+        <option v-for="w in wansIsp" :key="w.wan_name" :value="w.wan_name">{{ w.wan_name }}</option>
+      </select>
     </div>
 
     <!-- Real-time rates -->
@@ -172,6 +201,29 @@ const goodProbes = computed(() => latencyProbes.value.filter(p => p.status === '
   font-weight: 700;
   font-family: var(--font-mono);
   color: var(--color-text-primary);
+}
+
+.wan-select-row {
+  margin-top: -6px;
+}
+
+.wan-select {
+  width: 100%;
+  padding: 4px 8px;
+  font-size: 0.75rem;
+  font-weight: 500;
+  font-family: var(--font-sans);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--border-radius-sm);
+  background: var(--color-bg-input);
+  color: var(--color-text-primary);
+  cursor: pointer;
+  outline: none;
+  transition: border-color var(--transition-fast);
+}
+
+.wan-select:focus {
+  border-color: var(--color-accent);
 }
 
 .isp-rates {

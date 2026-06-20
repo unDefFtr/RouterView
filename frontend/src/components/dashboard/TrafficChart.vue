@@ -17,8 +17,16 @@ import { fetchTrafficHistory, type TrafficHistoryResponse } from '@/api/index';
 
 const dashboardStore = useDashboardStore();
 const themeStore = useThemeStore();
-const { trafficPoints, trafficTimeRange, totalDownloadBps, totalUploadBps } =
-  storeToRefs(dashboardStore);
+const {
+  trafficPoints,
+  trafficTimeRange,
+  totalDownloadBps,
+  totalUploadBps,
+  hasMultipleWans,
+  wanNames,
+  selectedWan,
+  wanTrafficPoints,
+} = storeToRefs(dashboardStore);
 
 const isDark = computed(() => themeStore.mode === 'dark');
 const { chartRef, initChart, updateOption, dispose } = useECharts(isDark);
@@ -35,11 +43,13 @@ async function loadHistory(range: TimeRange) {
   try {
     const endMs = Date.now();
     const startMs = endMs - timeRangeToMs(range);
-    const resp: TrafficHistoryResponse = await fetchTrafficHistory(startMs, endMs);
+    const wanName = selectedWan.value ?? undefined;
+    const resp: TrafficHistoryResponse = await fetchTrafficHistory(startMs, endMs, wanName);
     historyPoints.value = resp.points.map((p) => ({
       timestamp: new Date(p.timestamp_ms).toISOString(),
       download_bps: p.download_bps,
       upload_bps: p.upload_bps,
+      wan_name: p.wan_name ?? undefined,
     }));
   } catch {
     // API unavailable — fall back to WS-only data
@@ -49,9 +59,14 @@ async function loadHistory(range: TimeRange) {
 }
 
 // Merge WS live data with API history. WS timestamps take priority.
+// When a specific WAN is selected, uses per-WAN traffic; otherwise aggregate.
 const mergedPoints = computed<TrafficChartData[]>(() => {
+  const livePoints = selectedWan.value
+    ? wanTrafficPoints.value
+    : trafficPoints.value;
+
   const wsMap = new Map<string, TrafficChartData>();
-  for (const p of trafficPoints.value) {
+  for (const p of livePoints) {
     wsMap.set(p.timestamp, p);
   }
   const merged = new Map<string, TrafficChartData>();
@@ -103,8 +118,8 @@ watch(isDark, () => {
   });
 });
 
-// Reload history when range changes
-watch(trafficTimeRange, (range) => {
+// Reload history when range or WAN selection changes
+watch([trafficTimeRange, selectedWan], ([range]) => {
   loadHistory(range);
 });
 
@@ -140,17 +155,29 @@ onMounted(() => {
         </div>
       </div>
 
-      <!-- Time Range Switcher -->
-      <div class="time-range-switcher">
-        <button
-          v-for="opt in TIME_RANGE_OPTIONS"
-          :key="opt.key"
-          class="time-btn"
-          :class="{ active: trafficTimeRange === opt.key }"
-          @click="selectTimeRange(opt.key)"
+      <!-- Right controls: WAN selector + time range -->
+      <div class="chart-controls-right">
+        <select
+          v-if="hasMultipleWans"
+          class="wan-select"
+          :value="selectedWan ?? ''"
+          @change="dashboardStore.selectWan($event.target ? ($event.target as HTMLSelectElement).value || null : null)"
         >
-          {{ opt.label }}
-        </button>
+          <option value="">全部 (合计)</option>
+          <option v-for="name in wanNames" :key="name" :value="name">{{ name }}</option>
+        </select>
+
+        <div class="time-range-switcher">
+          <button
+            v-for="opt in TIME_RANGE_OPTIONS"
+            :key="opt.key"
+            class="time-btn"
+            :class="{ active: trafficTimeRange === opt.key }"
+            @click="selectTimeRange(opt.key)"
+          >
+            {{ opt.label }}
+          </button>
+        </div>
       </div>
     </div>
 
@@ -230,6 +257,31 @@ onMounted(() => {
 
 .rate-value {
   font-weight: 600;
+}
+
+.chart-controls-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.wan-select {
+  padding: 4px 8px;
+  font-size: 0.75rem;
+  font-weight: 500;
+  font-family: var(--font-sans);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--border-radius-sm);
+  background: var(--color-bg-input);
+  color: var(--color-text-primary);
+  cursor: pointer;
+  outline: none;
+  transition: border-color var(--transition-fast);
+}
+
+.wan-select:focus {
+  border-color: var(--color-accent);
 }
 
 .time-range-switcher {

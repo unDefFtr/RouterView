@@ -34,6 +34,8 @@ pub struct PollEngine {
     first_poll: bool,
     /// Accumulated traffic history for snapshot initialization.
     traffic_history: Vec<TrafficPoint>,
+    /// Per-WAN traffic history buffers, keyed by WAN interface name.
+    wan_traffic_history: HashMap<String, Vec<TrafficPoint>>,
     /// Latency probe targets.
     probe_targets: Vec<(String, String, String)>,
     /// Latency probe results from last probe cycle.
@@ -105,6 +107,7 @@ impl PollEngine {
             prev_snapshot: None,
             first_poll: true,
             traffic_history: Vec::with_capacity(7200),
+            wan_traffic_history: HashMap::new(),
             probe_targets,
             last_probe_results,
             stability_history: Vec::with_capacity(30),
@@ -232,15 +235,12 @@ impl PollEngine {
                 let latest_pt = {
                     snapshot.traffic.points.first().cloned()
                 };
-                if let Some(pt) = latest_pt {
-                    // DB persist before the in-memory vec gets replaced
-                    let ts_ms = chrono::DateTime::parse_from_rfc3339(&pt.timestamp)
-                        .ok()
-                        .map(|dt| dt.timestamp_millis())
-                        .unwrap_or(0);
-                    self.traffic_db.insert(ts_ms, pt.download_bps, pt.upload_bps);
+                if let Some(ref pt) = latest_pt {
+                    // DB persist aggregate traffic
+                    let ts_ms = timestamp_to_ms(&pt.timestamp);
+                    self.traffic_db.insert(ts_ms, pt.download_bps, pt.upload_bps, None);
 
-                    self.traffic_history.push(pt);
+                    self.traffic_history.push(pt.clone());
                     let cutoff = chrono::Utc::now() - chrono::Duration::hours(6);
                     self.traffic_history.retain(|p| {
                         chrono::DateTime::parse_from_rfc3339(&p.timestamp)
@@ -248,6 +248,31 @@ impl PollEngine {
                             .unwrap_or(false)
                     });
                     snapshot.traffic.points = self.traffic_history.clone();
+                }
+
+                // ── Per-WAN traffic history ──────────────────────
+                for wan_pt in &snapshot.wan_traffic_points {
+                    if let Some(ref wan_name) = wan_pt.wan_name {
+                        let ts_ms = timestamp_to_ms(&wan_pt.timestamp);
+                        self.traffic_db.insert(
+                            ts_ms,
+                            wan_pt.download_bps,
+                            wan_pt.upload_bps,
+                            Some(wan_name),
+                        );
+
+                        let buffer = self
+                            .wan_traffic_history
+                            .entry(wan_name.clone())
+                            .or_insert_with(|| Vec::with_capacity(7200));
+                        buffer.push(wan_pt.clone());
+                        let cutoff = chrono::Utc::now() - chrono::Duration::hours(6);
+                        buffer.retain(|p| {
+                            chrono::DateTime::parse_from_rfc3339(&p.timestamp)
+                                .map(|ts| ts.with_timezone(&chrono::Utc) >= cutoff)
+                                .unwrap_or(false)
+                        });
+                    }
                 }
 
                 // Periodic DB maintenance: aggregate + prune every 60 polls
@@ -445,6 +470,21 @@ impl PollEngine {
                 None
             },
             timestamp: current.timestamp.clone(),
+            wans: if prev.wans != current.wans {
+                Some(current.wans.clone())
+            } else {
+                None
+            },
+            wans_isp: if prev.wans_isp != current.wans_isp {
+                Some(current.wans_isp.clone())
+            } else {
+                None
+            },
+            wan_traffic_points: if !current.wan_traffic_points.is_empty() {
+                Some(current.wan_traffic_points.clone())
+            } else {
+                None
+            },
         }
     }
 
@@ -459,6 +499,9 @@ impl PollEngine {
             || update.wifi.is_some()
             || update.stability.is_some()
             || update.interface_statuses.is_some()
+            || update.wans.is_some()
+            || update.wans_isp.is_some()
+            || update.wan_traffic_points.is_some()
     }
 
     /// Build ISP stability from rolling history.
@@ -630,6 +673,14 @@ async fn resolve_host(host: &str) -> Option<IpAddr> {
             None
         }
     }
+}
+
+/// Parse an ISO 8601 timestamp to unix milliseconds.
+fn timestamp_to_ms(ts: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+        .unwrap_or(0)
 }
 
 /// Classify RTT into a status label for the frontend's color coding.

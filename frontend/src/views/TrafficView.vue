@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, ref, watch, onMounted, nextTick } from 'vue';
 import { useThemeStore } from '@/stores/theme';
+import { useDashboardStore } from '@/stores/dashboard';
+import { storeToRefs } from 'pinia';
 import { useECharts } from '@/composables/useECharts';
 import FeatherIcon from '@/components/shared/FeatherIcon.vue';
 import {
@@ -15,6 +17,8 @@ import {
 import { fetchTrafficHistory, type TrafficHistoryResponse } from '@/api/index';
 
 const themeStore = useThemeStore();
+const dashboardStore = useDashboardStore();
+const { hasMultipleWans, wanNames, selectedWan } = storeToRefs(dashboardStore);
 const isDark = computed(() => themeStore.mode === 'dark');
 const { chartRef, initChart, updateOption, dispose } = useECharts(isDark);
 
@@ -59,7 +63,11 @@ async function loadHistory(range: TimeRange | 'custom') {
   }
 
   try {
-    const resp: TrafficHistoryResponse = await fetchTrafficHistory(startMs, endMs);
+    const resp: TrafficHistoryResponse = await fetchTrafficHistory(
+      startMs,
+      endMs,
+      selectedWan.value ?? undefined,
+    );
 
     chartData.value = resp.points.map((p) => ({
       timestamp: new Date(p.timestamp_ms).toISOString(),
@@ -135,6 +143,11 @@ watch(isDark, () => {
   });
 });
 
+// Re-fetch when WAN selection changes
+watch(selectedWan, () => {
+  loadHistory(selectedRange.value);
+});
+
 onMounted(() => {
   loadHistory(selectedRange.value);
 });
@@ -151,25 +164,37 @@ onMounted(() => {
         </div>
         <!-- Time range presets -->
         <div class="range-controls">
-          <div class="time-range-switcher">
-            <button
-              v-for="opt in HISTORY_TIME_RANGE_OPTIONS"
-              :key="opt.key"
-              class="time-btn"
-              :class="{ active: selectedRange === opt.key }"
-              :disabled="loading"
-              @click="selectRange(opt.key)"
+          <div class="range-controls-top">
+            <select
+              v-if="hasMultipleWans"
+              class="wan-select"
+              :value="selectedWan ?? ''"
+              @change="dashboardStore.selectWan($event.target ? ($event.target as HTMLSelectElement).value || null : null)"
             >
-              {{ opt.label }}
-            </button>
-            <button
-              class="time-btn"
-              :class="{ active: selectedRange === 'custom' }"
-              :disabled="loading"
-              @click="selectCustom"
-            >
-              自定义
-            </button>
+              <option value="">全部 (合计)</option>
+              <option v-for="name in wanNames" :key="name" :value="name">{{ name }}</option>
+            </select>
+
+            <div class="time-range-switcher">
+              <button
+                v-for="opt in HISTORY_TIME_RANGE_OPTIONS"
+                :key="opt.key"
+                class="time-btn"
+                :class="{ active: selectedRange === opt.key }"
+                :disabled="loading"
+                @click="selectRange(opt.key)"
+              >
+                {{ opt.label }}
+              </button>
+              <button
+                class="time-btn"
+                :class="{ active: selectedRange === 'custom' }"
+                :disabled="loading"
+                @click="selectCustom"
+              >
+                自定义
+              </button>
+            </div>
           </div>
 
           <!-- Custom date range inputs -->
@@ -291,6 +316,30 @@ onMounted(() => {
   flex-direction: column;
   gap: 8px;
   align-items: flex-end;
+}
+
+.range-controls-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.wan-select {
+  padding: 5px 8px;
+  font-size: 0.75rem;
+  font-weight: 500;
+  font-family: var(--font-sans);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--border-radius-sm);
+  background: var(--color-bg-input);
+  color: var(--color-text-primary);
+  cursor: pointer;
+  outline: none;
+  transition: border-color var(--transition-fast);
+}
+
+.wan-select:focus {
+  border-color: var(--color-accent);
 }
 
 .time-range-switcher {
