@@ -1,0 +1,285 @@
+<script setup lang="ts">
+import { computed, ref, watch, onUnmounted } from 'vue';
+import { useDashboardStore } from '@/stores/dashboard';
+import { storeToRefs } from 'pinia';
+import StatusBadge from '@/components/shared/StatusBadge.vue';
+import RateDisplay from '@/components/shared/RateDisplay.vue';
+import FeatherIcon from '@/components/shared/FeatherIcon.vue';
+
+const store = useDashboardStore();
+const { isp, latencyProbes } = storeToRefs(store);
+
+const latStatusColor = (status: string): string => {
+  switch (status) {
+    case 'good': return 'var(--color-success)';
+    case 'moderate': return 'var(--color-warning)';
+    case 'poor': return 'var(--color-danger)';
+    default: return 'var(--color-text-muted)';
+  }
+};
+
+const latStatusLabel = (status: string): string => {
+  switch (status) {
+    case 'good': return '低延迟';
+    case 'moderate': return '一般';
+    case 'poor': return '高延迟';
+    default: return '未知';
+  }
+};
+
+const latDisplay = (ms: number | null): string => {
+  if (ms === null) return '—';
+  return ms < 1 ? `${(ms * 1000).toFixed(0)}µs` : `${ms.toFixed(0)}ms`;
+};
+
+const probesByCategory = computed(() => {
+  const cats: Record<string, typeof latencyProbes.value> = {};
+  for (const probe of latencyProbes.value) {
+    if (!cats[probe.category]) cats[probe.category] = [];
+    cats[probe.category].push(probe);
+  }
+  return cats;
+});
+
+const categoryNames: Record<string, string> = {
+  isp: '运营商',
+  dns: '公共 DNS',
+  cloud: '云服务',
+  cdn: 'CDN',
+  repo: '仓库源',
+};
+
+// Capture client time when probes arrive, then tick locally.
+// Avoids clock-skew issues with server timestamps.
+const lastProbeAt = ref(Date.now());
+watch(latencyProbes, () => { lastProbeAt.value = Date.now(); });
+
+const now = ref(Date.now());
+const clockTimer = setInterval(() => { now.value = Date.now(); }, 1000);
+onUnmounted(() => clearInterval(clockTimer));
+
+const secondsSinceLastProbe = computed(() => {
+  if (latencyProbes.value.length === 0) return null;
+  return Math.floor((now.value - lastProbeAt.value) / 1000);
+});
+
+const probeCount = computed(() => latencyProbes.value.length);
+const goodProbes = computed(() => latencyProbes.value.filter(p => p.status === 'good').length);
+</script>
+
+<template>
+  <div class="card isp-probe-card">
+    <!-- ISP Header -->
+    <div class="isp-header">
+      <div class="isp-name-row">
+        <span class="isp-name">{{ isp.name }}</span>
+        <StatusBadge :status="isp.online ? 'online' : 'offline'" :pulse="true" />
+      </div>
+      <div class="isp-usage">
+        <span class="usage-label">本月用量</span>
+        <span class="usage-value">{{ isp.monthly_usage_gb.toFixed(0) }} GB</span>
+      </div>
+    </div>
+
+    <!-- Real-time rates -->
+    <div class="isp-rates">
+      <RateDisplay :download-bps="isp.download_bps" :upload-bps="isp.upload_bps" />
+    </div>
+
+    <!-- Latency Probes -->
+    <div class="probes-section">
+      <div class="probes-header">
+        <span>网络延迟探测</span>
+        <span class="probes-summary">
+          {{ goodProbes }}/{{ probeCount }} 正常
+        </span>
+      </div>
+
+      <div
+        v-for="(probes, cat) in probesByCategory"
+        :key="cat"
+        class="probe-category"
+      >
+        <div class="probe-cat-label">{{ categoryNames[cat] || cat }}</div>
+        <div class="probe-list">
+          <div
+            v-for="probe in probes"
+            :key="probe.target"
+            class="probe-item"
+          >
+            <div class="probe-target">
+              <span class="probe-name">{{ probe.target }}</span>
+              <span class="probe-host mono">{{ probe.host }}</span>
+            </div>
+            <div class="probe-result" :style="{ color: latStatusColor(probe.status) }">
+              <span class="probe-latency mono">{{ latDisplay(probe.latency_ms) }}</span>
+              <span class="probe-status">{{ latStatusLabel(probe.status) }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Update info -->
+    <div class="probe-footer">
+      <FeatherIcon name="clock" :size="12" />
+      <span>每 1 分钟探测一次{{ secondsSinceLastProbe !== null ? `，上次探测于 ${secondsSinceLastProbe}秒前` : '' }}</span>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.isp-probe-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  overflow: hidden;
+  flex: 1;
+  min-height: 0;
+}
+
+.isp-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  flex-shrink: 0;
+}
+
+.isp-name-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.isp-name {
+  font-weight: 600;
+  font-size: 1rem;
+  color: var(--color-text-primary);
+}
+
+.isp-usage {
+  text-align: right;
+}
+
+.usage-label {
+  display: block;
+  font-size: 0.65rem;
+  color: var(--color-text-muted);
+}
+
+.usage-value {
+  font-size: 0.95rem;
+  font-weight: 700;
+  font-family: var(--font-mono);
+  color: var(--color-text-primary);
+}
+
+.isp-rates {
+  padding: 10px 12px;
+  background: var(--color-bg-input);
+  border-radius: var(--border-radius-sm);
+  border: 1px solid var(--color-border-light);
+  flex-shrink: 0;
+}
+
+.probes-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.probes-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+
+.probes-summary {
+  font-size: 0.7rem;
+  color: var(--color-success);
+  font-weight: 500;
+}
+
+.probe-category {
+  margin-top: 2px;
+}
+
+.probe-cat-label {
+  font-size: 0.65rem;
+  font-weight: 600;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 4px;
+  padding-bottom: 2px;
+  border-bottom: 1px solid var(--color-border-light);
+}
+
+.probe-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.probe-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 6px;
+  border-radius: 4px;
+  transition: background var(--transition-fast);
+}
+
+.probe-item:hover {
+  background: var(--color-bg-hover);
+}
+
+.probe-target {
+  display: flex;
+  flex-direction: column;
+}
+
+.probe-name {
+  font-size: 0.78rem;
+  color: var(--color-text-primary);
+}
+
+.probe-host {
+  font-size: 0.65rem;
+  color: var(--color-text-muted);
+}
+
+.probe-result {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+
+.probe-latency {
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.probe-status {
+  font-size: 0.6rem;
+  opacity: 0.8;
+}
+
+.probe-footer {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.65rem;
+  color: var(--color-text-muted);
+  padding-top: 6px;
+  border-top: 1px solid var(--color-border-light);
+  flex-shrink: 0;
+}
+</style>

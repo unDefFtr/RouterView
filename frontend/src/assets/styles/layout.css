@@ -1,0 +1,229 @@
+/* ═══════════════════════════════════════════════════════════════════
+   Main Layout Grid System
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* ── Top-level app shell ─────────────────────── */
+
+.app-shell {
+  display: grid;
+  grid-template-areas:
+    "sidebar navbar"
+    "sidebar content";
+  grid-template-columns: var(--sidebar-width) 1fr;
+  grid-template-rows: var(--navbar-height) 1fr;
+  height: 100vh;
+  width: 100vw;
+  overflow: hidden;
+}
+
+.app-navbar {
+  grid-area: navbar;
+  height: var(--navbar-height);
+  background: var(--color-bg-navbar);
+  border-bottom: 1px solid var(--color-border-light);
+  display: flex;
+  align-items: center;
+  padding: 0 20px;
+  z-index: 100;
+  box-shadow: var(--shadow-navbar);
+}
+
+.app-sidebar {
+  grid-area: sidebar;
+  width: var(--sidebar-width);
+  background: var(--color-bg-sidebar);
+  border-right: 1px solid var(--color-border-light);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 12px 0;
+  z-index: 200;
+  box-shadow: var(--shadow-sidebar);
+}
+
+.app-content {
+  grid-area: content;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* ── Bottom navigation bar (portrait only) ─────── */
+
+.app-bottom-bar {
+  grid-area: bottom;
+  height: var(--bottom-bar-height);
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 200;
+  background: var(--color-bg-sidebar);
+  border-top: 1px solid var(--color-border-light);
+  box-shadow: 0 -1px 6px rgba(0, 0, 0, 0.08);
+}
+
+/* With bottom bar: content area leaves room for the bar */
+.app-shell.has-bottom-bar {
+  grid-template-areas:
+    "navbar"
+    "content";
+  grid-template-columns: 1fr;
+  grid-template-rows: var(--navbar-height) 1fr;
+}
+
+.app-shell.has-bottom-bar .app-content {
+  padding-bottom: var(--bottom-bar-height);
+}
+
+/* ── 2-Column Dashboard Layout ───────────────── */
+
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: 30% 1fr;
+  gap: var(--content-gap);
+  padding: var(--content-gap);
+  height: calc(100vh - var(--navbar-height));
+  overflow: hidden;
+}
+
+.dashboard-left {
+  display: flex;
+  flex-direction: column;
+  gap: var(--content-gap);
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.dashboard-right {
+  display: flex;
+  flex-direction: column;
+  gap: var(--content-gap);
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* ── Right Column Stacked Areas ──────────────── */
+
+.dashboard-right > *:nth-child(1) {
+  flex: 0 0 auto;
+  min-height: 300px;
+}
+
+.dashboard-right > *:nth-child(2) {
+  flex: 0 0 auto;
+}
+
+.dashboard-right > *:nth-child(3) {
+  flex: 1 1 0;
+  min-height: 0;
+}
+
+/* ── Two-Card Row ────────────────────────────── */
+
+.two-card-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: 1fr;
+  gap: var(--content-gap);
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* ── Navbar Layout ────────────────────────────── */
+
+.navbar-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 0 0 auto;
+}
+
+.navbar-center {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1 1 auto;
+}
+
+.navbar-right {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex: 0 0 auto;
+}
+
+/* ── Sidebar Navigation ──────────────────────── */
+
+.sidebar-nav {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  flex: 1 1 auto;
+  width: 100%;
+  padding: 0 8px;
+}
+
+.sidebar-bottom {
+  margin-top: auto;
+  width: 100%;
+  display: flex;
+  justify-content: center;
+  padding: 8px;
+}
+
+/* ── Responsive (aspect-ratio driven) ─────────── */
+
+/* Portrait: single-column, let .app-content scroll handle overflow */
+@media (orientation: portrait) {
+  .dashboard-grid {
+    grid-template-columns: 1fr;
+    height: auto;
+    min-height: calc(100vh - var(--navbar-height) - var(--bottom-bar-height));
+    overflow: visible;
+  }
+
+  .dashboard-left {
+    order: 2;
+    /* Reset flex sizing from landscape — each child sizes to content */
+  }
+
+  .dashboard-right {
+    order: 1;
+  }
+
+  /* Traffic chart doesn't need a fat min-height in portrait */
+  .dashboard-right > *:nth-child(1) {
+    min-height: 240px;
+  }
+
+  /* 3rd child (two-card-row) — give it a ceiling so long lists don't dominate */
+  .dashboard-right > *:nth-child(3) {
+    flex: none;
+    min-height: 200px;
+    max-height: 100vh;
+  }
+
+  /* Two-card row also becomes a single column, each card gets half */
+  .two-card-row {
+    grid-template-columns: 1fr;
+    grid-template-rows: 1fr 1fr;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  /* Account for bottom bar in viewport-relative heights */
+  .app-shell.has-bottom-bar .traffic-view,
+  .app-shell.has-bottom-bar .devices-grid {
+    height: calc(100vh - var(--navbar-height) - var(--bottom-bar-height));
+  }
+}
+
+/* Narrow portrait: stack the two-card row */
+@media (max-aspect-ratio: 3/4) {
+  .two-card-row {
+    grid-template-columns: 1fr;
+  }
+}
