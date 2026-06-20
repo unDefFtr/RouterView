@@ -199,6 +199,8 @@ function formatRate(bps: number): string {
 .device-icon {
   width: 44px;
   height: 44px;
+  aspect-ratio: 1;
+  flex-shrink: 0;
   border-radius: var(--border-radius-sm);
   background: var(--color-accent-subtle);
   color: var(--color-accent);

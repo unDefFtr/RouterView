@@ -168,9 +168,9 @@ onMounted(() => {
         <div class="theme-options">
           <label
             v-for="opt in [
-              { value: 'system' as ThemePreference, label: '💻 跟随系统', desc: '自动匹配系统亮暗模式' },
-              { value: 'dark' as ThemePreference, label: '🌙 暗色', desc: '深色界面，适合低光环境' },
-              { value: 'light' as ThemePreference, label: '☀️ 亮色', desc: '浅色界面，适合明亮环境' },
+              { value: 'system' as ThemePreference, label: '跟随系统', desc: '自动匹配系统亮暗模式', icon: 'monitor' },
+              { value: 'dark' as ThemePreference, label: '暗色', desc: '深色界面，适合低光环境', icon: 'moon' },
+              { value: 'light' as ThemePreference, label: '亮色', desc: '浅色界面，适合明亮环境', icon: 'sun' },
             ]"
             :key="opt.value"
             class="theme-option"
@@ -184,7 +184,10 @@ onMounted(() => {
               @change="onThemeChange(opt.value)"
             />
             <div class="theme-option-content">
-              <span class="theme-option-label">{{ opt.label }}</span>
+              <div class="theme-option-header">
+                <FeatherIcon :name="opt.icon" :size="16" />
+                <span class="theme-option-label">{{ opt.label }}</span>
+              </div>
               <span class="theme-option-desc">{{ opt.desc }}</span>
             </div>
           </label>
@@ -553,6 +556,12 @@ onMounted(() => {
   gap: 2px;
 }
 
+.theme-option-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .theme-option-label {
   font-size: 0.9rem;
   font-weight: 500;
@@ -700,6 +709,8 @@ onMounted(() => {
 .toggle-vis-btn {
   width: 32px;
   height: 32px;
+  aspect-ratio: 1;
+  flex-shrink: 0;
   border: 1px solid var(--color-border-light);
   border-radius: var(--border-radius-sm);
   background: var(--color-bg-elevated, var(--color-bg-input));

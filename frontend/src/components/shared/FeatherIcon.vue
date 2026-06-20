@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { computed } from 'vue';
 import feather from 'feather-icons';
 
 const props = withDefaults(
@@ -13,20 +14,22 @@ const props = withDefaults(
   },
 );
 
-const icon = feather.icons[props.name] ?? null;
+const icon = computed(() => feather.icons[props.name] ?? null);
 </script>
 
 <template>
   <span
     v-if="icon"
     class="feather-icon"
-    :style="{ display: 'inline-flex', width: size + 'px', height: size + 'px' }"
-    v-html="icon.toSvg({ width: size, height: size, 'stroke-width': strokeWidth })"
+    :style="{ display: 'inline-flex', width: size + 'px', height: size + 'px', flexShrink: 0 }"
+    v-html="icon.toSvg({ width: size, height: size, 'stroke-width': strokeWidth, color: 'currentColor' })"
   />
 </template>
 
 <style>
-/* Ensure all feather icons rendered via v-html inherit color */
+.feather-icon {
+  color: inherit;
+}
 .feather-icon svg {
   display: block;
 }

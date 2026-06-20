@@ -7,7 +7,7 @@
 .app-shell {
   display: grid;
   grid-template-areas:
-    "sidebar navbar"
+    "navbar  navbar"
     "sidebar content";
   grid-template-columns: var(--sidebar-width) 1fr;
   grid-template-rows: var(--navbar-height) 1fr;
@@ -25,7 +25,6 @@
   align-items: center;
   padding: 0 20px;
   z-index: 100;
-  box-shadow: var(--shadow-navbar);
 }
 
 .app-sidebar {
@@ -36,9 +35,8 @@
   display: flex;
   flex-direction: column;
   align-items: center;
-  padding: 12px 0;
+  padding: 8px 0;
   z-index: 200;
-  box-shadow: var(--shadow-sidebar);
 }
 
 .app-content {
@@ -59,7 +57,6 @@
   z-index: 200;
   background: var(--color-bg-sidebar);
   border-top: 1px solid var(--color-border-light);
-  box-shadow: 0 -1px 6px rgba(0, 0, 0, 0.08);
 }
 
 /* With bottom bar: content area leaves room for the bar */
@@ -160,7 +157,7 @@
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 4px;
+  gap: 8px;
   flex: 1 1 auto;
   width: 100%;
   padding: 0 8px;

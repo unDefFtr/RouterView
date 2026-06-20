@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, ref, watch } from 'vue';
 import type { Device } from '@/types/dashboard';
 import { useDashboardStore } from '@/stores/dashboard';
 import FeatherIcon from '@/components/shared/FeatherIcon.vue';
@@ -10,9 +10,11 @@ import {
   signalLabel,
   dhcpStatusLabel,
 } from '@/composables/useDeviceHelpers';
+import { useMacVendor } from '@/composables/useMacVendor';
 import { useDeviceOverrides } from '@/composables/useDeviceOverrides';
 
 const { displayName, displayType } = useDeviceOverrides();
+const { vendorCached, vendorFor } = useMacVendor();
 
 const props = defineProps<{
   devices: Device[];
@@ -25,6 +27,22 @@ const emit = defineEmits<{
 
 const store = useDashboardStore();
 const searchQuery = ref('');
+
+// ── Preload vendor lookups when device list changes ──────
+watch(
+  () => props.devices,
+  (devices) => {
+    const seen = new Set<string>();
+    for (const d of devices) {
+      const pf = d.mac.replace(/[^0-9a-fA-F]/g, '').substring(0, 6).toUpperCase();
+      if (!seen.has(pf)) {
+        seen.add(pf);
+        vendorFor(d.mac); // fire-and-forget; batched in composable
+      }
+    }
+  },
+  { immediate: true },
+);
 
 // Group devices by type, filter by search.
 const groupedDevices = computed(() => {
@@ -116,14 +134,30 @@ function onClick(device: Device) {
           @click="onClick(device)"
         >
           <div class="device-left">
-            <span class="device-emoji">{{ deviceIcon(displayType(device)) }}</span>
+            <FeatherIcon :name="deviceIcon(displayType(device))" :size="18" />
             <div class="device-info">
               <span class="device-hostname">{{ displayName(device) }}</span>
-              <span class="device-ip mono">{{ device.ip }}</span>
+              <span class="device-mac mono">{{ device.mac }}</span>
             </div>
           </div>
+
+          <!-- Inline detail grid: IP | Vendor | Interface -->
+          <div class="device-detail-row">
+            <div class="detail-col col-ip">
+              <span class="detail-label">IP</span>
+              <span class="detail-value detail-ip mono">{{ device.ip }}</span>
+            </div>
+            <div class="detail-col col-vendor">
+              <span class="detail-label">供应商</span>
+              <span class="detail-value mono">{{ vendorCached(device.mac) || '—' }}</span>
+            </div>
+            <div class="detail-col col-iface">
+              <span class="detail-label">接口</span>
+              <span class="detail-value mono">{{ device.interface || '—' }}</span>
+            </div>
+          </div>
+
           <div class="device-right">
-            <!-- Signal or wired indicator -->
             <span
               v-if="device.signal != null"
               class="device-signal mono"
@@ -132,7 +166,6 @@ function onClick(device: Device) {
               {{ signalLabel(device.signal) }}
             </span>
             <span v-else class="device-wired">有线</span>
-            <!-- DHCP status pill -->
             <span
               class="dhcp-pill"
               :class="dhcpStatusLabel(device.dhcp_status).type"
@@ -263,13 +296,15 @@ function onClick(device: Device) {
 
 .device-row {
   display: flex;
-  justify-content: space-between;
   align-items: center;
-  padding: 6px 8px;
-  border-radius: 6px;
+  gap: 8px;
+  padding: 8px 8px;
+  border-radius: 0;
   cursor: pointer;
   transition: background var(--transition-fast);
   border: 1px solid transparent;
+  border-bottom: 1px solid var(--color-border-light);
+  flex-wrap: wrap;
 }
 
 .device-row:hover {
@@ -286,17 +321,15 @@ function onClick(device: Device) {
   align-items: center;
   gap: 10px;
   min-width: 0;
-}
-
-.device-emoji {
-  font-size: 1.1rem;
   flex-shrink: 0;
+  width: 220px;
 }
 
 .device-info {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  overflow: hidden;
 }
 
 .device-hostname {
@@ -306,12 +339,12 @@ function onClick(device: Device) {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  max-width: 150px;
 }
 
-.device-ip {
-  font-size: 0.68rem;
+.device-mac {
+  font-size: 0.66rem;
   color: var(--color-text-muted);
+  letter-spacing: 0.02em;
 }
 
 .device-right {
@@ -329,6 +362,47 @@ function onClick(device: Device) {
 .device-wired {
   font-size: 0.65rem;
   color: var(--color-text-muted);
+}
+
+.device-detail-row {
+  display: grid;
+  grid-template-columns: 1fr 2fr 1fr;
+  gap: 6px;
+  flex: 1 1 180px;
+  min-width: 140px;
+}
+
+.detail-col {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.col-ip { min-width: 0; }
+.col-vendor { min-width: 0; }
+.col-iface { min-width: 0; }
+
+.detail-label {
+  font-size: 0.58rem;
+  font-weight: 600;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-family: var(--font-sans);
+}
+
+.detail-value {
+  font-size: 0.68rem;
+  color: var(--color-text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.detail-ip {
+  color: var(--color-accent);
+  font-weight: 500;
 }
 
 .dhcp-pill {

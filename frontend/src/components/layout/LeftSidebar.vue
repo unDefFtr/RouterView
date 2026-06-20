@@ -55,6 +55,8 @@ const navItems = items.filter(i => i.id !== 'settings');
 .nav-item {
   width: 44px;
   height: 44px;
+  aspect-ratio: 1;
+  flex-shrink: 0;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -102,6 +104,8 @@ const navItems = items.filter(i => i.id !== 'settings');
 .settings-btn {
   width: 40px;
   height: 40px;
+  aspect-ratio: 1;
+  flex-shrink: 0;
   border: 1px solid transparent;
   border-radius: var(--border-radius-sm);
   background: transparent;

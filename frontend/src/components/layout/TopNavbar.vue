@@ -12,8 +12,8 @@ const route = useRoute();
 
 const isLive = computed(() => dashboardStore.routerosConnected);
 const themeIcon = computed(() => {
-  if (themeStore.preference === 'system') return '💻';
-  return themeStore.mode === 'dark' ? '🌙' : '☀️';
+  if (themeStore.preference === 'system') return 'monitor';
+  return themeStore.mode === 'dark' ? 'moon' : 'sun';
 });
 const themeLabel = computed(() => {
   if (themeStore.preference === 'system') return '跟随系统';
@@ -51,7 +51,7 @@ const pageTitle = computed(() => {
       <LiveIndicator :connected="isLive" />
 
       <button class="theme-toggle" @click="themeStore.toggle()" :title="themeLabel">
-        {{ themeIcon }}
+        <FeatherIcon :name="themeIcon" :size="18" />
       </button>
 
       <button class="icon-btn" title="通知">
@@ -92,11 +92,13 @@ const pageTitle = computed(() => {
 .theme-toggle {
   width: 32px;
   height: 32px;
+  aspect-ratio: 1;
+  flex-shrink: 0;
   border: none;
   border-radius: var(--border-radius-sm);
   background: transparent;
   cursor: pointer;
-  font-size: 1rem;
+  color: var(--color-text-secondary);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -110,6 +112,8 @@ const pageTitle = computed(() => {
 .icon-btn {
   width: 36px;
   height: 36px;
+  aspect-ratio: 1;
+  flex-shrink: 0;
   border: none;
   border-radius: var(--border-radius-sm);
   background: transparent;
@@ -129,6 +133,8 @@ const pageTitle = computed(() => {
 .avatar {
   width: 32px;
   height: 32px;
+  aspect-ratio: 1;
+  flex-shrink: 0;
   border-radius: 50%;
   background: var(--color-accent);
   color: var(--color-text-inverse);

@@ -2,6 +2,7 @@ mod config;
 mod config_store;
 mod db;
 mod error;
+mod oui;
 mod router;
 mod state;
 

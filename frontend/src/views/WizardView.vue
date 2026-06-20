@@ -79,10 +79,10 @@ const showPassword = ref(false);
 
 // ── Theme options ───────────────────────────────────────
 
-const themeOptions: { value: ThemePreference; label: string; desc: string }[] = [
-  { value: 'system', label: '💻 跟随系统', desc: '自动匹配系统亮暗模式' },
-  { value: 'dark', label: '🌙 暗色', desc: '深色界面，适合低光环境' },
-  { value: 'light', label: '☀️ 亮色', desc: '浅色界面，适合明亮环境' },
+const themeOptions: { value: ThemePreference; label: string; desc: string; icon: string }[] = [
+  { value: 'system', label: '跟随系统', desc: '自动匹配系统亮暗模式', icon: 'monitor' },
+  { value: 'dark', label: '暗色', desc: '深色界面，适合低光环境', icon: 'moon' },
+  { value: 'light', label: '亮色', desc: '浅色界面，适合明亮环境', icon: 'sun' },
 ];
 
 function onThemeChange(pref: ThemePreference) {
@@ -138,7 +138,7 @@ const canProceedFromStep1 = computed(() => connectionVerified.value);
       <!-- Header -->
       <div class="wizard-header">
         <div class="wizard-brand">
-          <span class="brand-icon">📡</span>
+          <FeatherIcon name="wifi" :size="28" :stroke-width="1.5" />
           <span class="brand-name">RouterView</span>
         </div>
         <h1 class="wizard-title">欢迎使用 RouterView</h1>
@@ -327,7 +327,10 @@ const canProceedFromStep1 = computed(() => connectionVerified.value);
                 @change="onThemeChange(opt.value)"
               />
               <div class="theme-option-content">
-                <span class="theme-option-label">{{ opt.label }}</span>
+                <div class="theme-option-header">
+                  <FeatherIcon :name="opt.icon" :size="16" />
+                  <span class="theme-option-label">{{ opt.label }}</span>
+                </div>
                 <span class="theme-option-desc">{{ opt.desc }}</span>
               </div>
             </label>
@@ -463,7 +466,6 @@ const canProceedFromStep1 = computed(() => connectionVerified.value);
   border: 1px solid var(--color-border-light);
   border-radius: var(--card-radius);
   padding: 36px 40px 28px;
-  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.08);
 }
 
 .portrait .wizard-card {
@@ -483,10 +485,6 @@ const canProceedFromStep1 = computed(() => connectionVerified.value);
   justify-content: center;
   gap: 8px;
   margin-bottom: 16px;
-}
-
-.brand-icon {
-  font-size: 1.5rem;
 }
 
 .brand-name {
@@ -529,6 +527,8 @@ const canProceedFromStep1 = computed(() => connectionVerified.value);
 .step-dot {
   width: 28px;
   height: 28px;
+  aspect-ratio: 1;
+  flex-shrink: 0;
   border-radius: 50%;
   display: flex;
   align-items: center;
@@ -733,6 +733,8 @@ const canProceedFromStep1 = computed(() => connectionVerified.value);
 .toggle-vis-btn {
   width: 32px;
   height: 32px;
+  aspect-ratio: 1;
+  flex-shrink: 0;
   border: 1px solid var(--color-border-light);
   border-radius: var(--border-radius-sm);
   background: var(--color-bg-elevated, var(--color-bg-input));
@@ -838,6 +840,12 @@ const canProceedFromStep1 = computed(() => connectionVerified.value);
   display: flex;
   flex-direction: column;
   gap: 2px;
+}
+
+.theme-option-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .theme-option-label {

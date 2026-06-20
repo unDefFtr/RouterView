@@ -20,6 +20,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/config", get(api::system::config_info).put(api::system::update_config))
         .route("/api/config/test-connection", post(api::system::test_connection))
         .route("/api/traffic", get(api::traffic::query_traffic))
+        .route("/api/oui/lookup", get(api::oui::lookup_oui))
         .route("/api/devices", get(api::devices::list_overrides))
         .route("/api/devices/{mac}", put(api::devices::update_override))
         .route("/ws", get(crate::ws::handler::ws_upgrade))

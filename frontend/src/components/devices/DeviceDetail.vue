@@ -119,7 +119,7 @@ function signalWidth(dbm: number | null | undefined): string {
 
     <!-- Device header -->
     <div class="detail-header">
-      <span class="detail-icon">{{ deviceIcon(displayType(device)) }}</span>
+      <FeatherIcon :name="deviceIcon(displayType(device))" :size="22" />
       <div class="detail-header-info">
         <div class="detail-hostname-row">
           <span class="detail-hostname">{{ displayName(device) }}</span>
@@ -326,11 +326,6 @@ function signalWidth(dbm: number | null | undefined): string {
   flex-shrink: 0;
 }
 
-.detail-icon {
-  font-size: 2rem;
-  flex-shrink: 0;
-}
-
 .detail-header-info {
   display: flex;
   flex-direction: column;
@@ -499,12 +494,13 @@ function signalWidth(dbm: number | null | undefined): string {
   justify-content: center;
   width: 28px;
   height: 28px;
+  aspect-ratio: 1;
+  flex-shrink: 0;
   border: none;
   border-radius: 6px;
   background: transparent;
   color: var(--color-text-muted);
   cursor: pointer;
-  flex-shrink: 0;
   transition: all var(--transition-fast);
 }
 

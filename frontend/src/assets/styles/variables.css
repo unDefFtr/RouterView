@@ -43,15 +43,15 @@
   --color-chart-upload-area: rgba(34, 197, 94, 0.15);
 
   /* ── Borders ───────────────────────────────── */
-  --color-border: #2a2e3f;
-  --color-border-light: #1e2235;
+  --color-border: #363b50;
+  --color-border-light: #262b3a;
   --color-border-accent: rgba(79, 140, 255, 0.4);
 
   /* ── Shadows ───────────────────────────────── */
-  --shadow-card: 0 2px 8px rgba(0, 0, 0, 0.3);
+  --shadow-card: none;
   --shadow-elevated: 0 8px 24px rgba(0, 0, 0, 0.4);
-  --shadow-navbar: 0 1px 0 rgba(255, 255, 255, 0.04);
-  --shadow-sidebar: 1px 0 0 rgba(255, 255, 255, 0.04);
+  --shadow-navbar: none;
+  --shadow-sidebar: none;
 
   /* ── Scrollbar ─────────────────────────────── */
   --color-scrollbar-track: transparent;
@@ -61,13 +61,13 @@
 
 [data-theme="light"] {
   /* ── Surfaces ──────────────────────────────── */
-  --color-bg-primary: #f4f5f9;
-  --color-bg-secondary: #ffffff;
+  --color-bg-primary: #ffffff;
+  --color-bg-secondary: #fafafa;
   --color-bg-card: #ffffff;
-  --color-bg-card-hover: #f6f7fb;
+  --color-bg-card-hover: #f9fafb;
   --color-bg-input: #f4f5f9;
-  --color-bg-hover: #eef0f6;
-  --color-bg-sidebar: #f8f9fc;
+  --color-bg-hover: #f4f5f9;
+  --color-bg-sidebar: #ffffff;
   --color-bg-navbar: #ffffff;
 
   /* ── Text ──────────────────────────────────── */
@@ -99,15 +99,15 @@
   --color-chart-upload-area: rgba(22, 163, 74, 0.12);
 
   /* ── Borders ───────────────────────────────── */
-  --color-border: #e2e8f0;
-  --color-border-light: #f1f5f9;
+  --color-border: #d4d4d8;
+  --color-border-light: #e5e7eb;
   --color-border-accent: rgba(37, 99, 235, 0.3);
 
   /* ── Shadows ───────────────────────────────── */
-  --shadow-card: 0 2px 8px rgba(0, 0, 0, 0.06);
+  --shadow-card: none;
   --shadow-elevated: 0 8px 24px rgba(0, 0, 0, 0.08);
-  --shadow-navbar: 0 1px 0 rgba(0, 0, 0, 0.06);
-  --shadow-sidebar: 1px 0 0 rgba(0, 0, 0, 0.06);
+  --shadow-navbar: none;
+  --shadow-sidebar: none;
 
   /* ── Scrollbar ─────────────────────────────── */
   --color-scrollbar-track: transparent;
@@ -122,9 +122,9 @@
   --bottom-bar-height: 56px;
   --left-col-ratio: 0.30;
   --right-col-ratio: 0.70;
-  --content-gap: 16px;
+  --content-gap: 8px;
   --card-padding: 20px;
-  --card-radius: 10px;
+  --card-radius: 8px;
   --border-radius-sm: 6px;
   --border-radius-md: 8px;
   --border-radius-lg: 12px;

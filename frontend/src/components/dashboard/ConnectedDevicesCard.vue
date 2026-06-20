@@ -55,7 +55,7 @@ const totalDevices = computed(() => wifi.value.devices.length);
           :title="`${device.hostname}\n${device.ip}\n${device.mac}`"
         >
           <div class="device-left">
-            <span class="device-emoji">{{ deviceIcon(displayType(device)) }}</span>
+            <FeatherIcon :name="deviceIcon(displayType(device))" :size="16" />
             <div class="device-info">
               <span class="device-hostname">{{ displayName(device) }}</span>
               <span class="device-ip mono">{{ device.ip }}</span>
@@ -156,11 +156,6 @@ const totalDevices = computed(() => wifi.value.devices.length);
   align-items: center;
   gap: 8px;
   min-width: 0;
-}
-
-.device-emoji {
-  font-size: 1rem;
-  flex-shrink: 0;
 }
 
 .device-info {

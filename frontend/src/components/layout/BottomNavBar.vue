@@ -41,7 +41,6 @@ const { items, activeId, navigate } = useNavigation();
   background: var(--color-bg-sidebar);
   border-top: 1px solid var(--color-border-light);
   padding: 0 env(safe-area-inset-bottom, 0);
-  box-shadow: 0 -1px 6px rgba(0, 0, 0, 0.08);
 }
 
 .bottom-nav-item {

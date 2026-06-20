@@ -5,18 +5,18 @@
 
 export function deviceIcon(type: string): string {
   switch (type) {
-    case 'phone': return '📱';
-    case 'tablet': return '📋';
-    case 'laptop': return '💻';
-    case 'desktop': return '🖥️';
-    case 'iot': return '🔌';
-    case 'router': return '📡';
-    case 'switch': return '🔀';
-    case 'apple': return '🍎';
-    case 'media': return '📺';
-    case 'camera': return '📷';
-    case 'printer': return '🖨️';
-    default: return '🖥️';
+    case 'phone': return 'smartphone';
+    case 'tablet': return 'tablet';
+    case 'laptop': return 'monitor';
+    case 'desktop': return 'monitor';
+    case 'iot': return 'cpu';
+    case 'router': return 'wifi';
+    case 'switch': return 'server';
+    case 'apple': return 'monitor';
+    case 'media': return 'tv';
+    case 'camera': return 'camera';
+    case 'printer': return 'printer';
+    default: return 'monitor';
   }
 }
 
