@@ -352,6 +352,11 @@ impl PollEngine {
     async fn fetch_and_transform(&mut self) -> Result<DashboardSnapshot, AppError> {
         let client = self.client.as_ref().expect("client must be Some when fetch_and_transform is called");
 
+        let poll_interval_secs = {
+            let cfg = self.config.read().await;
+            cfg.poll_interval_secs as f64
+        };
+
         // Fetch all endpoints in parallel
         let (
             sys_result,
@@ -409,6 +414,8 @@ impl PollEngine {
                 online_rate: 100.0,
                 segments: vec![],
             },
+            &self.traffic_db,
+            poll_interval_secs,
         )?;
 
         // Update IP allocations in gateway info

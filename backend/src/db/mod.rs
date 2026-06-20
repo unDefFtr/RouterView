@@ -1,3 +1,4 @@
+use chrono::{Datelike, Timelike};
 use rusqlite::{Connection, params};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -430,6 +431,86 @@ impl TrafficDb {
             }
             Err(e) => warn!("TrafficDB prune failed: {e}"),
         }
+    }
+
+    // ── Monthly usage ────────────────────────────────────────────
+
+    /// Calendar-month data usage (download + upload) in GB — actual measured
+    /// bytes, not an extrapolation.
+    ///
+    /// Raw samples (`traffic_points`) are taken every `poll_interval_secs`
+    /// seconds; each contributes `bps × interval / 8` bytes.
+    /// Aggregated buckets (`traffic_1m`) each cover 60 seconds; each
+    /// contributes `avg_bps × 60 / 8` bytes.
+    ///
+    /// Only aggregate traffic (`wan_name = ''`) is counted.
+    /// Returns `(dl_gb, ul_gb)`.
+    pub fn monthly_usage_gb(&self, poll_interval_secs: f64) -> (f64, f64) {
+        let conn = match self.conn.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("TrafficDB lock poisoned during monthly_usage: {e}");
+                return (0.0, 0.0);
+            }
+        };
+
+        let now = chrono::Utc::now();
+        let month_start = match now
+            .with_day(1)
+            .and_then(|d| d.with_hour(0))
+            .and_then(|d| d.with_minute(0))
+            .and_then(|d| d.with_second(0))
+            .and_then(|d| d.with_nanosecond(0))
+        {
+            Some(dt) => dt,
+            None => return (0.0, 0.0),
+        };
+
+        let now_ms = now.timestamp_millis();
+        let month_start_ms = month_start.timestamp_millis();
+        if month_start_ms >= now_ms {
+            return (0.0, 0.0);
+        }
+
+        let raw_cutoff = now_ms - 7 * 86400 * 1000;
+
+        // ── Raw samples: sum(bps) × interval → bits, then convert to GB ──
+        let raw_start = month_start_ms.max(raw_cutoff);
+        let (raw_dl_sum, raw_ul_sum): (f64, f64) = conn
+            .query_row(
+                "SELECT COALESCE(SUM(download_bps), 0.0), COALESCE(SUM(upload_bps), 0.0)
+                 FROM traffic_points
+                 WHERE ts >= ?1 AND ts < ?2 AND wan_name = ''",
+                rusqlite::params![raw_start, now_ms],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap_or((0.0, 0.0));
+
+        let raw_dl_gb = raw_dl_sum * poll_interval_secs / 8.0 / 1_000_000_000.0;
+        let raw_ul_gb = raw_ul_sum * poll_interval_secs / 8.0 / 1_000_000_000.0;
+
+        // ── Aggregated 1m buckets: sum(avg_bps) × 60s → bits → GB ──
+        let (agg_dl_gb, agg_ul_gb) = if month_start_ms < raw_cutoff {
+            let agg_end = raw_cutoff.min(now_ms);
+            let (agg_dl, agg_ul): (f64, f64) = conn
+                .query_row(
+                    "SELECT COALESCE(SUM(download_avg), 0.0), COALESCE(SUM(upload_avg), 0.0)
+                     FROM traffic_1m
+                     WHERE bucket >= ?1 AND bucket < ?2 AND wan_name = ''",
+                    rusqlite::params![month_start_ms, agg_end],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap_or((0.0, 0.0));
+
+            (
+                agg_dl * 60.0 / 8.0 / 1_000_000_000.0,
+                agg_ul * 60.0 / 8.0 / 1_000_000_000.0,
+            )
+        } else {
+            (0.0, 0.0)
+        };
+
+        (raw_dl_gb + agg_dl_gb, raw_ul_gb + agg_ul_gb)
     }
 
     // ── Device Overrides ─────────────────────────────────────────

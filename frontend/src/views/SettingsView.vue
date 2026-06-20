@@ -126,8 +126,6 @@ onMounted(() => {
 <template>
   <div class="settings-view">
     <div class="settings-scroll">
-      <h1 class="settings-page-title">设置</h1>
-
       <div class="settings-grid" :class="{ portrait: isPortrait }">
         <div class="settings-col">
 
@@ -417,13 +415,6 @@ onMounted(() => {
   padding-bottom: calc(var(--content-gap) + var(--bottom-bar-height, 0px));
 }
 
-.settings-page-title {
-  font-size: 1.3rem;
-  font-weight: 700;
-  color: var(--color-text-primary);
-  margin-bottom: 20px;
-}
-
 /* ── Two-column grid (landscape only) ────────────────── */
 
 .settings-grid {
@@ -440,7 +431,7 @@ onMounted(() => {
 .settings-col {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 8px;
   min-width: 0;
 }
 
@@ -457,7 +448,7 @@ onMounted(() => {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 16px;
+  margin-bottom: 8px;
   color: var(--color-text-secondary);
 }
 

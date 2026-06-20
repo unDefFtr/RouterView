@@ -3,6 +3,7 @@ use std::net::IpAddr;
 
 use tracing::debug;
 
+use crate::db::TrafficDb;
 use crate::error::AppError;
 use crate::routeros::models::*;
 use crate::ws::protocol::*;
@@ -30,6 +31,8 @@ pub fn to_dashboard_snapshot(
     prev_counters: Option<&HashMap<String, (u64, u64)>>, // (rx_bytes, tx_bytes) from last tick
     latency_results: Vec<LatencyProbe>,
     stability: IspStability,
+    traffic_db: &TrafficDb,
+    poll_interval_secs: f64,
 ) -> Result<DashboardSnapshot, AppError> {
     let now = chrono::Utc::now().to_rfc3339();
 
@@ -50,7 +53,7 @@ pub fn to_dashboard_snapshot(
     let interface_summary = extract_interface_summary(&interfaces, &arp);
 
     // ── ISP Info (primary + per-WAN) ──────────────────────
-    let isp = extract_isp(&identity, &primary_wan, &all_wans, prev_counters);
+    let isp = extract_isp(&identity, &primary_wan, &all_wans, prev_counters, traffic_db, poll_interval_secs);
 
     // ── Traffic (aggregate + per-WAN points) ───────────────
     let traffic = extract_traffic(&all_wans, prev_counters, &now);
@@ -383,6 +386,8 @@ fn extract_isp(
     primary: &WanInfo,
     all_wans: &[WanInfo],
     prev_counters: Option<&HashMap<String, (u64, u64)>>,
+    traffic_db: &TrafficDb,
+    poll_interval_secs: f64,
 ) -> IspInfo {
     let isp_name = if identity.name.is_empty() {
         "Unknown ISP".to_string()
@@ -394,10 +399,13 @@ fn extract_isp(
     let (download_bps, upload_bps) = compute_wan_rate(primary, prev_counters)
         .unwrap_or((0.0, 0.0));
 
+    // Accumulated month-to-date usage from stored traffic history
+    let (dl_gb, ul_gb) = traffic_db.monthly_usage_gb(poll_interval_secs);
+
     IspInfo {
         name: isp_name,
         online: primary.online,
-        monthly_usage_gb: 0.0,
+        monthly_usage_gb: dl_gb + ul_gb,
         download_bps,
         upload_bps,
         wans: build_wan_isp_entries(all_wans, identity),

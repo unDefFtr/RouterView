@@ -88,7 +88,7 @@ const goodProbes = computed(() => latencyProbes.value.filter(p => p.status === '
   <div class="card isp-probe-card">
     <!-- ISP Header -->
     <div class="isp-header">
-      <div class="isp-name-row">
+      <div class="isp-name-col">
         <span class="isp-name">{{ currentIspName }}</span>
         <StatusBadge :status="currentIspOnline ? 'online' : 'offline'" :pulse="true" />
       </div>
@@ -174,10 +174,10 @@ const goodProbes = computed(() => latencyProbes.value.filter(p => p.status === '
   flex-shrink: 0;
 }
 
-.isp-name-row {
+.isp-name-col {
   display: flex;
-  align-items: center;
-  gap: 8px;
+  flex-direction: column;
+  gap: 4px;
 }
 
 .isp-name {
@@ -192,12 +192,12 @@ const goodProbes = computed(() => latencyProbes.value.filter(p => p.status === '
 
 .usage-label {
   display: block;
-  font-size: 0.65rem;
+  font-size: 0.85rem;
   color: var(--color-text-muted);
 }
 
 .usage-value {
-  font-size: 0.95rem;
+  font-size: 1.2rem;
   font-weight: 700;
   font-family: var(--font-mono);
   color: var(--color-text-primary);

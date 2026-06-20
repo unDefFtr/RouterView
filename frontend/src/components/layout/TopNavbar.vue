@@ -145,4 +145,14 @@ const pageTitle = computed(() => {
   font-weight: 600;
   cursor: pointer;
 }
+
+/* Hide brand when navbar is narrow — title shifts left */
+@media (max-width: 640px) {
+  .navbar-left {
+    display: none;
+  }
+  .navbar-center {
+    justify-content: flex-start;
+  }
+}
 </style>
