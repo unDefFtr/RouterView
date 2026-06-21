@@ -236,3 +236,89 @@ pub struct ConnectionEntry {
     #[serde(rename = ".id")]
     pub id: String,
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// IPv6 models — mirroring the IPv4 structures above
+// ═══════════════════════════════════════════════════════════════════
+
+/// Raw response from `/rest/ipv6/address`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Ipv6Address {
+    #[serde(rename = ".id")]
+    pub id: String,
+    #[serde(default)]
+    pub address: String,
+    #[serde(default)]
+    pub network: String,
+    #[serde(default)]
+    pub interface: String,
+    #[serde(default)]
+    pub actual_interface: String,
+    #[serde(default)]
+    pub disabled: String,
+    #[serde(default)]
+    pub dynamic: String,
+    #[serde(default)]
+    pub comment: String,
+    #[serde(default)]
+    pub advertise: String,
+    #[serde(default, rename = "eui-64")]
+    pub eui_64: String,
+    #[serde(default, rename = "from-pool")]
+    pub from_pool: String,
+    #[serde(default, rename = "no-dad")]
+    pub no_dad: String,
+}
+
+/// Raw response from `/rest/ipv6/route`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Ipv6Route {
+    #[serde(rename = ".id")]
+    pub id: String,
+    #[serde(default, rename = "dst-address")]
+    pub dst_address: String,
+    #[serde(default)]
+    pub gateway: String,
+    #[serde(default, rename = "gateway-status")]
+    pub gateway_status: String,
+    #[serde(default)]
+    pub interface: String,
+    #[serde(default)]
+    pub active: String,
+    #[serde(default)]
+    pub disabled: String,
+    #[serde(default)]
+    pub distance: String,
+    #[serde(default)]
+    pub comment: String,
+}
+
+/// Raw response from `/rest/ipv6/neighbor`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Ipv6Neighbor {
+    #[serde(rename = ".id")]
+    pub id: String,
+    #[serde(default)]
+    pub address: String,
+    #[serde(default, rename = "mac-address")]
+    pub mac_address: String,
+    #[serde(default)]
+    pub interface: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub dynamic: String,
+    #[serde(default)]
+    pub disabled: String,
+    #[serde(default)]
+    pub comment: String,
+}
+
+/// Raw response from `/rest/ipv6/firewall/connection`.
+///
+/// Minimal representation — we only count the entries for the dashboard.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Ipv6ConnectionEntry {
+    #[serde(rename = ".id")]
+    pub id: String,
+}

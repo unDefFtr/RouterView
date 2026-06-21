@@ -120,6 +120,12 @@ pub struct GatewayInfo {
     /// All WAN entries (multi-WAN support)
     #[serde(default)]
     pub wans: Vec<WanEntry>,
+    /// IPv6 address on the primary WAN interface
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wan_ipv6: Option<String>,
+    /// IPv6 gateway for the primary WAN
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_ipv6: Option<String>,
 }
 
 /// Per-WAN gateway status entry for multi-WAN deployments.
@@ -139,6 +145,12 @@ pub struct WanEntry {
     pub upload_bps: f64,
     /// Whether this is the primary (lowest-distance) default route
     pub is_primary: bool,
+    /// IPv6 address on this WAN interface
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wan_ipv6: Option<String>,
+    /// IPv6 gateway for this WAN
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_ipv6: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -170,6 +182,9 @@ pub struct IspInfo {
     /// Number of active firewall connection tracking entries.
     #[serde(default)]
     pub connection_count: u32,
+    /// Number of active IPv6 firewall connection tracking entries.
+    #[serde(default)]
+    pub connection_count_ipv6: u32,
     /// Per-WAN ISP info (multi-WAN support)
     #[serde(default)]
     pub wans: Vec<WanIspInfo>,

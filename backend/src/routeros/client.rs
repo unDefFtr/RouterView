@@ -65,7 +65,9 @@ impl RouterOsClient {
         let test_url = format!("{}/system/resource", base_url);
         match http_client
             .get(&test_url)
-            .header(AUTHORIZATION, HeaderValue::from_str(&auth_header).unwrap())
+            .header(AUTHORIZATION, HeaderValue::from_str(&auth_header).map_err(|e| {
+                AppError::InvalidData(format!("Invalid auth header: {e}"))
+            })?)
             .send()
             .await
         {
@@ -240,6 +242,61 @@ impl RouterOsClient {
             Ok(conns) => Ok(conns),
             Err(e) => {
                 debug!("Firewall connection tracking not available: {e}");
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    // ── IPv6 Endpoint Methods ─────────────────────────────────
+
+    /// Fetch all IPv6 addresses: `/rest/ipv6/address`
+    ///
+    /// Returns an empty Vec if the endpoint is unavailable (e.g., IPv6
+    /// package not enabled on the router).
+    pub async fn ipv6_addresses(&self) -> Result<Vec<Ipv6Address>, AppError> {
+        match self.get::<Ipv6Address>("/ipv6/address").await {
+            Ok(addrs) => Ok(addrs),
+            Err(e) => {
+                debug!("IPv6 addresses not available: {e}");
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// Fetch all IPv6 routes: `/rest/ipv6/route`
+    ///
+    /// Returns an empty Vec if the endpoint is unavailable.
+    pub async fn ipv6_routes(&self) -> Result<Vec<Ipv6Route>, AppError> {
+        match self.get::<Ipv6Route>("/ipv6/route").await {
+            Ok(routes) => Ok(routes),
+            Err(e) => {
+                debug!("IPv6 routes not available: {e}");
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// Fetch IPv6 neighbors: `/rest/ipv6/neighbor`
+    ///
+    /// Returns an empty Vec if the endpoint is unavailable.
+    pub async fn ipv6_neighbors(&self) -> Result<Vec<Ipv6Neighbor>, AppError> {
+        match self.get::<Ipv6Neighbor>("/ipv6/neighbor").await {
+            Ok(neighbors) => Ok(neighbors),
+            Err(e) => {
+                debug!("IPv6 neighbors not available: {e}");
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// Fetch IPv6 firewall connections: `/rest/ipv6/firewall/connection`
+    ///
+    /// Returns an empty Vec if the endpoint is unavailable.
+    pub async fn ipv6_firewall_connections(&self) -> Result<Vec<Ipv6ConnectionEntry>, AppError> {
+        match self.get::<Ipv6ConnectionEntry>("/ipv6/firewall/connection").await {
+            Ok(conns) => Ok(conns),
+            Err(e) => {
+                debug!("IPv6 firewall connection tracking not available: {e}");
                 Ok(Vec::new())
             }
         }

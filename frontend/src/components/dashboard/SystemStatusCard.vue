@@ -124,6 +124,8 @@ function formatRate(bps: number): string {
             <span class="wan-detail">
               <span class="wan-ip">{{ wan.wan_ip }}</span>
               <span class="wan-gw">→ {{ wan.gateway_ip }}</span>
+              <span v-if="wan.wan_ipv6 || wan.gateway_ipv6" class="wan-ip wan-ipv6">{{ wan.wan_ipv6 || '—' }}</span>
+              <span v-if="wan.wan_ipv6 || wan.gateway_ipv6" class="wan-gw wan-gwv6">→ {{ wan.gateway_ipv6 || '—' }}</span>
             </span>
           </div>
         </div>
@@ -149,6 +151,14 @@ function formatRate(bps: number): string {
       <div class="metric-item">
         <span class="metric-label">网关</span>
         <span class="metric-value mono">{{ gateway.gateway_ip }}</span>
+      </div>
+      <div v-if="gateway.wan_ipv6 || gateway.gateway_ipv6" class="metric-item">
+        <span class="metric-label">WAN IPv6</span>
+        <span class="metric-value mono wan-ip">{{ gateway.wan_ipv6 || '—' }}</span>
+      </div>
+      <div v-if="gateway.wan_ipv6 || gateway.gateway_ipv6" class="metric-item">
+        <span class="metric-label">IPv6 网关</span>
+        <span class="metric-value mono">{{ gateway.gateway_ipv6 || '—' }}</span>
       </div>
     </div>
 
@@ -392,6 +402,18 @@ function formatRate(bps: number): string {
 
 .wan-gw {
   opacity: 0.7;
+}
+
+.wan-ipv6 {
+  margin-left: 4px;
+  color: var(--color-text-secondary);
+  font-size: 0.85em;
+}
+
+.wan-gwv6 {
+  margin-left: 4px;
+  color: var(--color-text-muted);
+  font-size: 0.85em;
 }
 
 .wan-right {

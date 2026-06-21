@@ -139,7 +139,12 @@ const goodProbes = computed(() => latencyProbes.value.filter(p => p.status === '
       <div class="rate-item connections">
         <FeatherIcon name="link" :size="14" :stroke-width="2.5" />
         <span class="rate-value">{{ (isp.connection_count || 0).toLocaleString() }}</span>
-        <span class="rate-unit">连接</span>
+        <span class="rate-unit">v4连接</span>
+      </div>
+      <div v-if="isp.connection_count_ipv6 !== undefined" class="rate-item connections">
+        <FeatherIcon name="link" :size="14" :stroke-width="2.5" />
+        <span class="rate-value">{{ isp.connection_count_ipv6.toLocaleString() }}</span>
+        <span class="rate-unit">v6连接</span>
       </div>
     </div>
 

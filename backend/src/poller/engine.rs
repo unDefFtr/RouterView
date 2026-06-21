@@ -410,7 +410,7 @@ impl PollEngine {
             cfg.poll_interval_secs as f64
         };
 
-        // Fetch all endpoints in parallel
+        // Fetch all IPv4 endpoints in parallel
         let (
             sys_result,
             identity_result,
@@ -434,6 +434,21 @@ impl PollEngine {
             client.routes(),
             client.firewall_connections(),
         )?;
+
+        // ── Fetch IPv6 endpoints in a separate parallel batch ──────
+        // IPv6 methods use graceful degradation (return Ok(empty) on error),
+        // so we unwrap_or_default to get the Vec directly.
+        let (ipv6_ips_result, ipv6_routes_result, ipv6_neighbors_result, ipv6_connections_result) =
+            tokio::join!(
+                client.ipv6_addresses(),
+                client.ipv6_routes(),
+                client.ipv6_neighbors(),
+                client.ipv6_firewall_connections(),
+            );
+        let ipv6_ips_result = ipv6_ips_result.unwrap_or_default();
+        let ipv6_routes_result = ipv6_routes_result.unwrap_or_default();
+        let ipv6_neighbors_result = ipv6_neighbors_result.unwrap_or_default();
+        let ipv6_connections_result = ipv6_connections_result.unwrap_or_default();
 
         // ── Snapshot current byte counters for next tick's rate calculation ──
         let current_counters: HashMap<String, (u64, u64)> = interfaces_result
@@ -464,6 +479,10 @@ impl PollEngine {
             wireless_result,
             routes_result,
             connections_result,
+            ipv6_ips_result,
+            ipv6_routes_result,
+            ipv6_neighbors_result,
+            ipv6_connections_result,
             Some(&prev),
             Vec::new(),  // Will be filled in poll_tick
             IspStability {

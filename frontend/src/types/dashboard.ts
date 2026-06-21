@@ -24,6 +24,8 @@ export interface WanEntry {
   download_bps: number;
   upload_bps: number;
   is_primary: boolean;
+  wan_ipv6?: string;
+  gateway_ipv6?: string;
 }
 
 export interface WanIspInfo {
@@ -41,6 +43,8 @@ export interface GatewayInfo {
   wan_online: boolean;
   ip_allocations: number;
   wans: WanEntry[];
+  wan_ipv6?: string;
+  gateway_ipv6?: string;
 }
 
 export interface InterfaceSummary {
@@ -58,6 +62,7 @@ export interface IspInfo {
   upload_bps: number;
   connection_count: number;
   wans: WanIspInfo[];
+  connection_count_ipv6?: number;
 }
 
 export interface InterfaceStatus {
