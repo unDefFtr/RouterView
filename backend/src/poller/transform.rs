@@ -60,7 +60,16 @@ pub fn to_dashboard_snapshot(
 
     // ── ISP Info (primary + per-WAN) ──────────────────────
     let total_connection_count = connections.len() as u32 + ipv6_connections.len() as u32;
-    let isp = extract_isp(&identity, &primary_wan, &all_wans, prev_counters, traffic_db, poll_interval_secs, total_connection_count, ipv6_connections.len() as u32);
+    let ipv6_conn_count = ipv6_connections.len() as u32;
+    // Only surface the v6 connection count when the primary WAN actually has a GUA.
+    // If the WAN only has ULA (or no IPv6 at all), treat the egress as v6-incapable
+    // and hide the v6 connection counter from the UI.
+    let connection_count_ipv6 = if primary_wan.ipv6_address.is_some() {
+        Some(ipv6_conn_count)
+    } else {
+        None
+    };
+    let isp = extract_isp(&identity, &primary_wan, &all_wans, prev_counters, traffic_db, poll_interval_secs, total_connection_count, connection_count_ipv6);
 
     // ── Traffic (aggregate + per-WAN points) ───────────────
     let traffic = extract_traffic(&all_wans, prev_counters, &now, poll_interval_secs);
@@ -201,11 +210,13 @@ fn resolve_all_wans(
 
         // ── IPv6: look up address and gateway for this interface ──
         let ipv6_address = route_ipv6_addr(&route_iface_name, &ipv6_addr_map);
-        let ipv6_gateway = if ipv6_default_ifaces.contains(&route_iface_name) {
-            resolve_ipv6_gateway(&route_iface_name, ipv6_routes)
-        } else {
-            None
-        };
+        let ipv6_gateway = ipv6_address.as_ref().and_then(|_| {
+            if ipv6_default_ifaces.contains(&route_iface_name) {
+                resolve_ipv6_gateway(&route_iface_name, ipv6_routes)
+            } else {
+                None
+            }
+        });
 
         wans.push(WanInfo {
             interface_name: route_iface_name,
@@ -244,12 +255,14 @@ fn resolve_all_wans(
         }
 
         let ipv6_address = route_ipv6_addr(&iface_name, &ipv6_addr_map);
-        let ipv6_gateway = Some(if v6route.gateway.parse::<IpAddr>().is_ok() {
-            v6route.gateway.clone()
-        } else {
-            // PPPoE-style: gateway IS the interface name, the actual next-hop
-            // isn't visible in the route table. Use the gateway field as-is.
-            v6route.gateway.clone()
+        let ipv6_gateway = ipv6_address.as_ref().map(|_| {
+            if v6route.gateway.parse::<IpAddr>().is_ok() {
+                v6route.gateway.clone()
+            } else {
+                // PPPoE-style: gateway IS the interface name, the actual next-hop
+                // isn't visible in the route table. Use the gateway field as-is.
+                v6route.gateway.clone()
+            }
         });
 
         let iface = interfaces
@@ -512,7 +525,7 @@ fn extract_isp(
     traffic_db: &TrafficDb,
     poll_interval_secs: f64,
     connection_count: u32,
-    connection_count_ipv6: u32,
+    connection_count_ipv6: Option<u32>,
 ) -> IspInfo {
     let isp_name = if identity.name.is_empty() {
         "Unknown ISP".to_string()
@@ -1024,8 +1037,9 @@ pub fn default_latency_probe_targets(dns_servers: &[String]) -> Vec<(String, Str
 
 /// Build a HashMap of interface_name → best IPv6 address.
 ///
-/// Filters out disabled addresses and link-local (`fe80::`). When multiple
-/// addresses exist on the same interface, prefers global unicast over ULA.
+/// Filters out disabled, link-local (`fe80::`), and ULA addresses
+/// (`fc00::/7`, `fd00::/8`).  Only global unicast (2000::/3) is kept — if an
+/// interface has no GUA the egress is treated as having no public IPv6.
 fn build_ipv6_addr_map(ipv6_ips: &[Ipv6Address]) -> HashMap<String, String> {
     let mut map: HashMap<String, String> = HashMap::new();
     for a in ipv6_ips.iter().filter(|a| a.disabled != "true") {
@@ -1035,20 +1049,14 @@ fn build_ipv6_addr_map(ipv6_ips: &[Ipv6Address]) -> HashMap<String, String> {
             &a.actual_interface
         };
         let ip = extract_ip_from_cidr(&a.address);
-        // Skip link-local addresses — they aren't routable WAN IPs
         if ip.to_lowercase().starts_with("fe80:") {
             continue;
         }
-        // Prefer global unicast (2000::/3) over ULA (fc00::/7, fd00::/8)
-        let is_gua = ip.starts_with('2') || ip.starts_with('3');
-        map.entry(ifname.to_string())
-            .and_modify(|existing| {
-                let existing_is_gua = existing.starts_with('2') || existing.starts_with('3');
-                if is_gua && !existing_is_gua {
-                    *existing = ip.clone();
-                }
-            })
-            .or_insert(ip);
+        // Only keep global unicast (2000::/3)
+        if !ip.starts_with('2') && !ip.starts_with('3') {
+            continue;
+        }
+        map.entry(ifname.to_string()).or_insert(ip);
     }
     map
 }
@@ -1081,8 +1089,18 @@ fn resolve_ipv6_route_iface(route: &Ipv6Route) -> String {
 }
 
 /// Look up the IPv6 address for a given interface from the pre-built map.
+/// If the WAN interface has no GUA (common with PPPoE where the GUA is only on
+/// the LAN bridge), falls back to the first GUA found on any LAN interface.
 fn route_ipv6_addr(iface_name: &str, map: &HashMap<String, String>) -> Option<String> {
-    map.get(iface_name).cloned()
+    // Direct match on the WAN interface
+    if let Some(addr) = map.get(iface_name) {
+        return Some(addr.clone());
+    }
+    // Fallback: pick the first GUA from any other interface (typically the LAN bridge)
+    map.iter()
+        .filter(|(name, _)| *name != iface_name)
+        .map(|(_, addr)| addr.clone())
+        .next()
 }
 
 /// Resolve the IPv6 gateway for a given interface from IPv6 default routes.

@@ -183,8 +183,9 @@ pub struct IspInfo {
     #[serde(default)]
     pub connection_count: u32,
     /// Number of active IPv6 firewall connection tracking entries.
-    #[serde(default)]
-    pub connection_count_ipv6: u32,
+    /// `None` when the WAN has no global unicast IPv6 address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_count_ipv6: Option<u32>,
     /// Per-WAN ISP info (multi-WAN support)
     #[serde(default)]
     pub wans: Vec<WanIspInfo>,
