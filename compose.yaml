@@ -1,0 +1,113 @@
+name: routerview
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: backend-runtime
+    image: ${ROUTERVIEW_BACKEND_IMAGE:-routerview-backend:local}
+    restart: unless-stopped
+    environment:
+      DB_PATH: /var/lib/routerview/routerview.db
+      SERVER_PORT: "3001"
+      SETUP_TOKEN_FILE: /tmp/routerview-setup-token
+      RUST_LOG: ${RUST_LOG:-info}
+      PUBLIC_ORIGIN: https://${ROUTERVIEW_DOMAIN:-routerview.local}
+      ROUTERVIEW_MASTER_KEY_FILE: /run/secrets/routerview_master_key
+      ROUTER_MANAGEMENT_CIDRS: ${ROUTER_MANAGEMENT_CIDRS:-192.168.88.0/24}
+      ALLOW_INSECURE_ROUTER_HTTP: ${ALLOW_INSECURE_ROUTER_HTTP:-false}
+      ROUTER_TYPE: ${ROUTER_TYPE:-routeros}
+      ROUTER_HOST: ${ROUTER_HOST:-192.168.88.1}
+      ROUTER_PORT: ${ROUTER_PORT:-443}
+      ROUTER_SCHEME: ${ROUTER_SCHEME:-https}
+      ROUTER_USERNAME: ${ROUTER_USERNAME:-admin}
+      ROUTER_INSECURE_TLS: ${ROUTER_INSECURE_TLS:-false}
+      POLL_INTERVAL_SECS: ${POLL_INTERVAL_SECS:-3}
+      PROBE_INTERVAL_SECS: ${PROBE_INTERVAL_SECS:-60}
+      DB_RAW_RETENTION_DAYS: ${DB_RAW_RETENTION_DAYS:-7}
+      DB_TOTAL_RETENTION_DAYS: ${DB_TOTAL_RETENTION_DAYS:-90}
+    secrets:
+      - source: routerview_master_key
+        target: routerview_master_key
+    volumes:
+      - routerview_data:/var/lib/routerview
+      - routerview_backups:/var/backups/routerview
+    networks:
+      - app
+      - router_access
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,uid=10001,gid=10001,mode=0700
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_RAW
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - curl -fsS http://127.0.0.1:3001/api/health
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    stop_grace_period: 30s
+
+  caddy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: caddy-runtime
+    image: ${ROUTERVIEW_CADDY_IMAGE:-routerview-caddy:local}
+    restart: unless-stopped
+    environment:
+      ROUTERVIEW_DOMAIN: ${ROUTERVIEW_DOMAIN:-routerview.local}
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${ROUTERVIEW_HTTP_BIND:-0.0.0.0}:80:80"
+      - "${ROUTERVIEW_HTTPS_BIND:-0.0.0.0}:443:443"
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - app
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,uid=10001,gid=10001,mode=0700
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: "0"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          wget --no-check-certificate -q --spider
+          --header="Host: $${ROUTERVIEW_DOMAIN}" https://127.0.0.1/api/health
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    stop_grace_period: 10s
+
+networks:
+  app:
+    internal: true
+  router_access:
+    driver: bridge
+
+volumes:
+  routerview_data:
+  routerview_backups:
+  caddy_data:
+  caddy_config:
+
+secrets:
+  routerview_master_key:
+    file: ${ROUTERVIEW_MASTER_KEY_SOURCE:-./secrets/routerview_master_key}
