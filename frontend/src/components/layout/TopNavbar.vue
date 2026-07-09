@@ -10,7 +10,7 @@ const dashboardStore = useDashboardStore();
 const themeStore = useThemeStore();
 const route = useRoute();
 
-const isLive = computed(() => dashboardStore.routerosConnected);
+const isLive = computed(() => dashboardStore.isLive);
 const themeIcon = computed(() => {
   if (themeStore.preference === 'system') return 'monitor';
   return themeStore.mode === 'dark' ? 'moon' : 'sun';
@@ -50,15 +50,15 @@ const pageTitle = computed(() => {
     <div class="navbar-right">
       <LiveIndicator :connected="isLive" />
 
-      <button class="theme-toggle" @click="themeStore.toggle()" :title="themeLabel">
+      <button class="theme-toggle" type="button" @click="themeStore.toggle()" :title="themeLabel" :aria-label="themeLabel">
         <FeatherIcon :name="themeIcon" :size="18" />
       </button>
 
-      <button class="icon-btn" title="通知">
+      <button class="icon-btn" type="button" title="通知" aria-label="通知">
         <FeatherIcon name="bell" :size="20" />
       </button>
 
-      <div class="avatar">
+      <div class="avatar" aria-label="当前用户">
         <span>A</span>
       </div>
     </div>

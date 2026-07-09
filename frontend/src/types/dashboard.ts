@@ -105,8 +105,8 @@ export interface Device {
   dhcp_expires: string | null;
   interface: string | null;
   arp_status: string | null;
-  custom_name?: string;
-  custom_type?: string;
+  custom_name?: string | null;
+  custom_type?: string | null;
 }
 
 /** @deprecated Use Device instead */

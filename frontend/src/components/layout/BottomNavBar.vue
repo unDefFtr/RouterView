@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { useNavigation } from '@/composables/useNavigation';
+import { RouterLink } from 'vue-router';
 import FeatherIcon from '@/components/shared/FeatherIcon.vue';
 
 const iconNameMap: Record<string, string> = {
@@ -13,21 +14,22 @@ function featherName(icon: string): string {
   return iconNameMap[icon] || icon;
 }
 
-const { items, activeId, navigate } = useNavigation();
+const { items, activeId } = useNavigation();
 </script>
 
 <template>
   <nav class="bottom-nav">
-    <button
+    <RouterLink
       v-for="item in items"
       :key="item.id"
       class="bottom-nav-item"
       :class="{ active: activeId === item.id }"
-      @click="navigate(item)"
+      :to="item.route"
+      :aria-current="activeId === item.id ? 'page' : undefined"
     >
       <FeatherIcon :name="featherName(item.icon)" :size="20" :stroke-width="1.8" />
       <span class="bottom-nav-label">{{ item.label }}</span>
-    </button>
+    </RouterLink>
   </nav>
 </template>
 
@@ -37,10 +39,10 @@ const { items, activeId, navigate } = useNavigation();
   align-items: center;
   justify-content: space-around;
   width: 100%;
-  height: var(--bottom-bar-height);
+  min-height: calc(var(--bottom-bar-height) + env(safe-area-inset-bottom, 0px));
   background: var(--color-bg-sidebar);
   border-top: 1px solid var(--color-border-light);
-  padding: 0 env(safe-area-inset-bottom, 0);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
 }
 
 .bottom-nav-item {

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue';
+import { storeToRefs } from 'pinia';
 import { useThemeStore, type ThemePreference } from '@/stores/theme';
 import { useDashboardStore } from '@/stores/dashboard';
 import { useViewport } from '@/composables/useViewport';
@@ -16,12 +17,12 @@ import {
 
 const themeStore = useThemeStore();
 const dashboardStore = useDashboardStore();
+const { routerosConnected } = storeToRefs(dashboardStore);
 const { isPortrait } = useViewport();
 
 // ── Connection status ─────────────────────────────────────
 
 const health = ref<HealthResponse | null>(null);
-const routerosConnected = ref(false);
 
 async function loadHealth() {
   try {
@@ -120,7 +121,6 @@ function debounceSave(key: string, value: unknown, ms = 600) {
 onMounted(() => {
   loadHealth();
   loadConfig();
-  routerosConnected.value = dashboardStore.routerosConnected;
 });
 </script>
 
@@ -148,8 +148,8 @@ onMounted(() => {
             </span>
           </div>
           <div class="status-item">
-            <span class="status-label">WebSocket 连接数</span>
-            <span class="status-value mono">{{ health?.ws_connections ?? '—' }}</span>
+            <span class="status-label">后端状态</span>
+            <span class="status-value mono">{{ health?.status ?? '—' }}</span>
           </div>
           <div class="status-item">
             <span class="status-label">后端版本</span>
@@ -439,7 +439,8 @@ onMounted(() => {
 
 <style scoped>
 .settings-view {
-  height: calc(100vh - var(--navbar-height));
+  height: 100%;
+  min-height: 600px;
   overflow: hidden;
 }
 
@@ -555,6 +556,7 @@ onMounted(() => {
 }
 
 .theme-option {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 12px;
@@ -574,7 +576,17 @@ onMounted(() => {
   background: var(--color-accent-subtle);
 }
 
-.theme-option input { display: none; }
+.theme-option input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}
+
+.theme-option:focus-within {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
 
 .theme-option-content {
   display: flex;
@@ -670,7 +682,13 @@ onMounted(() => {
 }
 
 .toggle input {
-  display: none;
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
 }
 
 .toggle-slider {
@@ -700,6 +718,11 @@ onMounted(() => {
 .toggle input:checked + .toggle-slider::after {
   left: 21px;
   background: #fff;
+}
+
+.toggle input:focus-visible + .toggle-slider {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
 }
 
 /* ── Save badge ───────────────────────────────────────── */
@@ -823,7 +846,7 @@ onMounted(() => {
 
 /* ── Responsive ───────────────────────────────────────── */
 
-@media (orientation: portrait) {
+@media (max-width: 820px), (max-height: 520px) and (pointer: coarse) {
   .status-grid {
     grid-template-columns: 1fr 1fr;
   }

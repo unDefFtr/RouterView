@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, watch, ref, nextTick, onMounted } from 'vue';
+import { computed, watch, ref, nextTick, onMounted, onUnmounted } from 'vue';
 import { useDashboardStore } from '@/stores/dashboard';
 import { useThemeStore } from '@/stores/theme';
 import { storeToRefs } from 'pinia';
@@ -20,8 +20,8 @@ const themeStore = useThemeStore();
 const {
   trafficPoints,
   trafficTimeRange,
-  totalDownloadBps,
-  totalUploadBps,
+  currentDownloadBps,
+  currentUploadBps,
   hasMultipleWans,
   wanNames,
   selectedWan,
@@ -29,32 +29,53 @@ const {
 } = storeToRefs(dashboardStore);
 
 const isDark = computed(() => themeStore.mode === 'dark');
-const { chartRef, initChart, updateOption, dispose } = useECharts(isDark);
+const { chartRef, initChart, updateOption, hasInstance } = useECharts(isDark);
 
-const downloadRateStr = computed(() => formatBitrate(totalDownloadBps.value));
-const uploadRateStr = computed(() => formatBitrate(totalUploadBps.value));
+const downloadRateStr = computed(() => formatBitrate(currentDownloadBps.value));
+const uploadRateStr = computed(() => formatBitrate(currentUploadBps.value));
 
 // Historical backfill from API — survives server restarts
 const historyPoints = ref<TrafficChartData[]>([]);
 const historyLoading = ref(false);
+const historyError = ref<string | null>(null);
+let historyController: AbortController | null = null;
+let historyGeneration = 0;
+let loadedHistoryKey: string | null = null;
 
 async function loadHistory(range: TimeRange) {
+  historyController?.abort();
+  const controller = new AbortController();
+  historyController = controller;
+  const generation = ++historyGeneration;
+  const wanName = selectedWan.value ?? undefined;
+  const historyKey = `${range}\u0000${wanName ?? ''}`;
   historyLoading.value = true;
+  historyError.value = null;
+  if (loadedHistoryKey !== historyKey) historyPoints.value = [];
   try {
     const endMs = Date.now();
     const startMs = endMs - timeRangeToMs(range);
-    const wanName = selectedWan.value ?? undefined;
-    const resp: TrafficHistoryResponse = await fetchTrafficHistory(startMs, endMs, wanName);
+    const resp: TrafficHistoryResponse = await fetchTrafficHistory(
+      startMs,
+      endMs,
+      wanName,
+      controller.signal,
+    );
+    if (generation !== historyGeneration) return;
     historyPoints.value = resp.points.map((p) => ({
       timestamp: new Date(p.timestamp_ms).toISOString(),
       download_bps: p.download_bps,
       upload_bps: p.upload_bps,
       wan_name: p.wan_name ?? undefined,
     }));
-  } catch {
-    // API unavailable — fall back to WS-only data
+    loadedHistoryKey = historyKey;
+  } catch (error: unknown) {
+    if (controller.signal.aborted || generation !== historyGeneration) return;
+    historyError.value = error instanceof Error
+      ? error.message
+      : '历史数据加载失败';
   } finally {
-    historyLoading.value = false;
+    if (generation === historyGeneration) historyLoading.value = false;
   }
 }
 
@@ -65,22 +86,21 @@ const mergedPoints = computed<TrafficChartData[]>(() => {
     ? wanTrafficPoints.value
     : trafficPoints.value;
 
-  const wsMap = new Map<string, TrafficChartData>();
-  for (const p of livePoints) {
-    wsMap.set(p.timestamp, p);
-  }
-  const merged = new Map<string, TrafficChartData>();
+  const merged = new Map<number, TrafficChartData>();
+  const cutoff = Date.now() - timeRangeToMs(trafficTimeRange.value);
   // API history first (base layer)
   for (const p of historyPoints.value) {
-    merged.set(p.timestamp, p);
+    const timestamp = Date.parse(p.timestamp);
+    if (Number.isFinite(timestamp) && timestamp >= cutoff) merged.set(timestamp, p);
   }
   // WS data overwrites (more real-time)
-  for (const [ts, p] of wsMap) {
-    merged.set(ts, p);
+  for (const p of livePoints) {
+    const timestamp = Date.parse(p.timestamp);
+    if (Number.isFinite(timestamp) && timestamp >= cutoff) merged.set(timestamp, p);
   }
-  return Array.from(merged.values()).sort(
-    (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
-  );
+  return Array.from(merged.entries())
+    .sort(([a], [b]) => a - b)
+    .map(([, point]) => point);
 });
 
 // Build & update chart when data or theme changes
@@ -90,11 +110,7 @@ function renderChart() {
     isDark.value,
     trafficTimeRange.value,
   );
-  if (!chartRef.value) return;
-
-  const chartEl = chartRef.value as HTMLElement;
-  const existing = (chartEl as any).__echart_instance;
-  if (existing) {
+  if (hasInstance()) {
     updateOption(option, false);
   } else {
     initChart(option);
@@ -103,20 +119,12 @@ function renderChart() {
 
 // Watch for data changes
 watch(
-  () => [mergedPoints.value.length, isDark.value, trafficTimeRange.value],
+  [mergedPoints, isDark, trafficTimeRange],
   () => {
     nextTick(renderChart);
   },
-  { deep: false },
+  { deep: true },
 );
-
-// Watch for theme changes
-watch(isDark, () => {
-  nextTick(() => {
-    dispose();
-    nextTick(renderChart);
-  });
-});
 
 // Reload history when range or WAN selection changes
 watch([trafficTimeRange, selectedWan], ([range]) => {
@@ -129,6 +137,11 @@ function selectTimeRange(range: TimeRange) {
 
 onMounted(() => {
   loadHistory(trafficTimeRange.value);
+});
+
+onUnmounted(() => {
+  historyGeneration++;
+  historyController?.abort();
 });
 </script>
 
@@ -160,6 +173,7 @@ onMounted(() => {
         <select
           v-if="hasMultipleWans"
           class="wan-select"
+          aria-label="选择 WAN 接口"
           :value="selectedWan ?? ''"
           @change="dashboardStore.selectWan($event.target ? ($event.target as HTMLSelectElement).value || null : null)"
         >
@@ -172,6 +186,8 @@ onMounted(() => {
             v-for="opt in TIME_RANGE_OPTIONS"
             :key="opt.key"
             class="time-btn"
+            type="button"
+            :aria-pressed="trafficTimeRange === opt.key"
             :class="{ active: trafficTimeRange === opt.key }"
             @click="selectTimeRange(opt.key)"
           >
@@ -182,7 +198,12 @@ onMounted(() => {
     </div>
 
     <!-- Chart Area -->
-    <div class="chart-container">
+      <div class="chart-container">
+      <div v-if="historyError" class="history-warning" role="status">
+        <FeatherIcon name="alert-triangle" :size="13" />
+        <span>历史数据更新失败，正在显示可用的实时或缓存数据</span>
+        <button type="button" @click="loadHistory(trafficTimeRange)">重试</button>
+      </div>
       <div
         v-if="mergedPoints.length === 0"
         class="chart-placeholder"
@@ -337,5 +358,31 @@ onMounted(() => {
   gap: 12px;
   color: var(--color-text-muted);
   font-size: 0.85rem;
+}
+
+.history-warning {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: calc(100% - 8px);
+  padding: 5px 8px;
+  border: 1px solid color-mix(in srgb, var(--color-warning) 35%, transparent);
+  border-radius: var(--border-radius-sm);
+  background: var(--color-bg-card);
+  color: var(--color-warning);
+  font-size: 0.68rem;
+}
+
+.history-warning button {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
 }
 </style>

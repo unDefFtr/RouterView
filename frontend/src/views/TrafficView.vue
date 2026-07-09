@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch, onMounted, nextTick } from 'vue';
+import { computed, ref, watch, onMounted, onUnmounted, nextTick } from 'vue';
 import { useThemeStore } from '@/stores/theme';
 import { useDashboardStore } from '@/stores/dashboard';
 import { storeToRefs } from 'pinia';
@@ -8,19 +8,23 @@ import FeatherIcon from '@/components/shared/FeatherIcon.vue';
 import {
   buildTrafficChartOption,
   formatBitrate,
-  formatBytes,
   HISTORY_TIME_RANGE_OPTIONS,
   timeRangeToMs,
   type TimeRange,
   type TrafficChartData,
 } from '@/types/charts';
 import { fetchTrafficHistory, type TrafficHistoryResponse } from '@/api/index';
+import {
+  formatByteCount,
+  isAbortError,
+  resolveTrafficTotals,
+} from '@/utils/trafficHistory';
 
 const themeStore = useThemeStore();
 const dashboardStore = useDashboardStore();
 const { hasMultipleWans, wanNames, selectedWan } = storeToRefs(dashboardStore);
 const isDark = computed(() => themeStore.mode === 'dark');
-const { chartRef, initChart, updateOption, dispose } = useECharts(isDark);
+const { chartRef, initChart, updateOption, hasInstance } = useECharts(isDark);
 
 const selectedRange = ref<TimeRange | 'custom'>('6H');
 const customStart = ref('');
@@ -28,9 +32,33 @@ const customEnd = ref('');
 const loading = ref(false);
 const error = ref<string | null>(null);
 const chartData = ref<TrafficChartData[]>([]);
-const intervalSecs = ref(5);
-const totalDownload = ref(0);
-const totalUpload = ref(0);
+const intervalSecs = ref<number | null>(null);
+const totalDownload = ref(0n);
+const totalUpload = ref(0n);
+const exactDownload = ref<bigint | null>(null);
+const exactUpload = ref<bigint | null>(null);
+const estimatedDownload = ref<bigint | null>(null);
+const estimatedUpload = ref<bigint | null>(null);
+const totalsEstimated = ref(false);
+const totalsComplete = ref(true);
+const coverageRatio = ref<number | null>(null);
+let requestController: AbortController | null = null;
+let requestGeneration = 0;
+
+const intervalLabel = computed(() =>
+  intervalSecs.value === null ? '逐点' : `${intervalSecs.value}s`,
+);
+const staleError = computed(() => error.value !== null && chartData.value.length > 0);
+const hasTotalsBreakdown = computed(() =>
+  exactDownload.value !== null
+  || exactUpload.value !== null
+  || estimatedDownload.value !== null
+  || estimatedUpload.value !== null,
+);
+
+function formatOptionalByteCount(value: bigint | null): string {
+  return value === null ? '—' : formatByteCount(value);
+}
 
 function rangeLabel(range: TimeRange | 'custom'): string {
   if (range === 'custom') return '自定义';
@@ -39,22 +67,22 @@ function rangeLabel(range: TimeRange | 'custom'): string {
 }
 
 async function loadHistory(range: TimeRange | 'custom') {
-  loading.value = true;
-  error.value = null;
+  requestGeneration++;
+  requestController?.abort();
+  requestController = null;
+  loading.value = false;
 
   let startMs: number;
   let endMs: number;
 
   if (range === 'custom') {
     if (!customStart.value || !customEnd.value) {
-      loading.value = false;
       return;
     }
     startMs = new Date(customStart.value).getTime();
     endMs = new Date(customEnd.value).getTime();
-    if (endMs <= startMs) {
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
       error.value = '结束时间必须大于开始时间';
-      loading.value = false;
       return;
     }
   } else {
@@ -62,36 +90,47 @@ async function loadHistory(range: TimeRange | 'custom') {
     startMs = endMs - timeRangeToMs(range);
   }
 
+  const controller = new AbortController();
+  requestController = controller;
+  const generation = requestGeneration;
+  loading.value = true;
+  error.value = null;
+
   try {
     const resp: TrafficHistoryResponse = await fetchTrafficHistory(
       startMs,
       endMs,
       selectedWan.value ?? undefined,
+      controller.signal,
     );
+    if (generation !== requestGeneration) return;
 
     chartData.value = resp.points.map((p) => ({
       timestamp: new Date(p.timestamp_ms).toISOString(),
       download_bps: p.download_bps,
       upload_bps: p.upload_bps,
     }));
-    intervalSecs.value = resp.interval_secs;
-
-    // Compute totals from the raw data
-    let dlTotal = 0;
-    let ulTotal = 0;
-    for (const p of resp.points) {
-      dlTotal += p.download_bps * resp.interval_secs;
-      ulTotal += p.upload_bps * resp.interval_secs;
-    }
-    totalDownload.value = dlTotal;
-    totalUpload.value = ulTotal;
+    intervalSecs.value = resp.interval_secs ?? null;
+    const totals = resolveTrafficTotals(resp);
+    totalDownload.value = totals.downloadBytes;
+    totalUpload.value = totals.uploadBytes;
+    exactDownload.value = totals.exactDownloadBytes;
+    exactUpload.value = totals.exactUploadBytes;
+    estimatedDownload.value = totals.estimatedDownloadBytes;
+    estimatedUpload.value = totals.estimatedUploadBytes;
+    totalsEstimated.value = totals.estimated;
+    totalsComplete.value = totals.complete;
+    coverageRatio.value = totals.coverageRatio;
 
     await nextTick();
     renderChart();
-  } catch (e: any) {
-    error.value = e.message || '加载失败';
+  } catch (caught: unknown) {
+    if (controller.signal.aborted || generation !== requestGeneration || isAbortError(caught)) {
+      return;
+    }
+    error.value = caught instanceof Error ? caught.message : '加载失败';
   } finally {
-    loading.value = false;
+    if (generation === requestGeneration) loading.value = false;
   }
 }
 
@@ -103,8 +142,7 @@ function renderChart() {
     selectedRange.value === 'custom' ? '7D' : selectedRange.value,
     { dataZoom: true },
   );
-  const el = chartRef.value as HTMLElement;
-  if ((el as any).__echart_instance) {
+  if (hasInstance()) {
     updateOption(option, false);
   } else {
     initChart(option);
@@ -135,13 +173,7 @@ function applyCustom() {
   loadHistory('custom');
 }
 
-// Re-render on theme change
-watch(isDark, () => {
-  nextTick(() => {
-    dispose();
-    nextTick(renderChart);
-  });
-});
+watch([chartData, isDark], () => nextTick(renderChart), { deep: true });
 
 // Re-fetch when WAN selection changes
 watch(selectedWan, () => {
@@ -150,6 +182,11 @@ watch(selectedWan, () => {
 
 onMounted(() => {
   loadHistory(selectedRange.value);
+});
+
+onUnmounted(() => {
+  requestGeneration++;
+  requestController?.abort();
 });
 </script>
 
@@ -168,6 +205,7 @@ onMounted(() => {
             <select
               v-if="hasMultipleWans"
               class="wan-select"
+              aria-label="选择 WAN 接口"
               :value="selectedWan ?? ''"
               @change="dashboardStore.selectWan($event.target ? ($event.target as HTMLSelectElement).value || null : null)"
             >
@@ -180,6 +218,8 @@ onMounted(() => {
                 v-for="opt in HISTORY_TIME_RANGE_OPTIONS"
                 :key="opt.key"
                 class="time-btn"
+                type="button"
+                :aria-pressed="selectedRange === opt.key"
                 :class="{ active: selectedRange === opt.key }"
                 :disabled="loading"
                 @click="selectRange(opt.key)"
@@ -188,6 +228,8 @@ onMounted(() => {
               </button>
               <button
                 class="time-btn"
+                type="button"
+                :aria-pressed="selectedRange === 'custom'"
                 :class="{ active: selectedRange === 'custom' }"
                 :disabled="loading"
                 @click="selectCustom"
@@ -200,6 +242,7 @@ onMounted(() => {
           <!-- Custom date range inputs -->
           <div v-if="selectedRange === 'custom'" class="custom-range">
             <input
+              aria-label="开始时间"
               type="datetime-local"
               class="date-input"
               v-model="customStart"
@@ -207,12 +250,13 @@ onMounted(() => {
             />
             <span class="date-sep">—</span>
             <input
+              aria-label="结束时间"
               type="datetime-local"
               class="date-input"
               v-model="customEnd"
               :min="customStart"
             />
-            <button class="apply-btn" :disabled="loading" @click="applyCustom">
+            <button class="apply-btn" type="button" :disabled="loading" @click="applyCustom">
               <FeatherIcon name="search" :size="14" />
               <span>查询</span>
             </button>
@@ -226,24 +270,45 @@ onMounted(() => {
           <FeatherIcon name="download" :size="14" />
           <div class="summary-text">
             <span class="summary-label">总下载</span>
-            <span class="summary-value mono">{{ formatBytes(totalDownload) }}</span>
+            <span class="summary-value mono" :title="`${totalDownload.toString()} bytes`">
+              {{ totalsEstimated ? '≈' : '' }}{{ formatByteCount(totalDownload) }}
+            </span>
           </div>
         </div>
         <div class="summary-item upload">
           <FeatherIcon name="upload" :size="14" />
           <div class="summary-text">
             <span class="summary-label">总上传</span>
-            <span class="summary-value mono">{{ formatBytes(totalUpload) }}</span>
+            <span class="summary-value mono" :title="`${totalUpload.toString()} bytes`">
+              {{ totalsEstimated ? '≈' : '' }}{{ formatByteCount(totalUpload) }}
+            </span>
           </div>
         </div>
         <div class="summary-item meta">
           <span class="summary-label">数据间隔</span>
-          <span class="summary-value mono">{{ intervalSecs }}s</span>
+          <span class="summary-value mono">{{ intervalLabel }}</span>
+        </div>
+        <div v-if="!totalsComplete" class="summary-item coverage" role="status">
+          <FeatherIcon name="alert-triangle" :size="13" />
+          <span>数据不完整{{ coverageRatio !== null ? ` (${(coverageRatio * 100).toFixed(0)}%)` : '' }}</span>
+        </div>
+        <div v-if="hasTotalsBreakdown" class="summary-breakdown" role="status">
+          <span v-if="exactDownload !== null || exactUpload !== null">
+            精确：下载 {{ formatOptionalByteCount(exactDownload) }} / 上传 {{ formatOptionalByteCount(exactUpload) }}
+          </span>
+          <span v-if="estimatedDownload !== null || estimatedUpload !== null">
+            估算：下载 {{ formatOptionalByteCount(estimatedDownload) }} / 上传 {{ formatOptionalByteCount(estimatedUpload) }}
+          </span>
         </div>
       </div>
 
       <!-- Chart -->
       <div class="chart-body">
+        <div v-if="staleError" class="stale-warning" role="alert">
+          <FeatherIcon name="alert-triangle" :size="14" />
+          <span>更新失败，当前显示上次成功加载的数据：{{ error }}</span>
+          <button type="button" @click="loadHistory(selectedRange)">重试</button>
+        </div>
         <!-- Loading -->
         <div v-if="loading && chartData.length === 0" class="chart-state">
           <span class="spinner" />
@@ -277,7 +342,8 @@ onMounted(() => {
 <style scoped>
 .traffic-view {
   padding: var(--content-gap);
-  height: calc(100vh - var(--navbar-height));
+  height: 100%;
+  min-height: 620px;
   overflow: hidden;
 }
 
@@ -452,6 +518,20 @@ onMounted(() => {
 .summary-item.download { color: var(--color-accent); }
 .summary-item.upload { color: var(--color-success); }
 .summary-item.meta { color: var(--color-text-muted); margin-left: auto; }
+.summary-item.coverage {
+  width: 100%;
+  color: var(--color-warning);
+  font-size: 0.72rem;
+}
+
+.summary-breakdown {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  width: 100%;
+  color: var(--color-text-muted);
+  font-size: 0.68rem;
+}
 
 .summary-text {
   display: flex;
@@ -499,6 +579,40 @@ onMounted(() => {
   color: var(--color-danger);
 }
 
+.stale-warning {
+  position: absolute;
+  top: 4px;
+  left: 50%;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  max-width: calc(100% - 16px);
+  padding: 6px 9px;
+  transform: translateX(-50%);
+  border: 1px solid color-mix(in srgb, var(--color-warning) 35%, transparent);
+  border-radius: var(--border-radius-sm);
+  background: var(--color-bg-card);
+  color: var(--color-warning);
+  font-size: 0.72rem;
+}
+
+.stale-warning span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stale-warning button {
+  flex-shrink: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+}
+
 .retry-btn {
   padding: 6px 16px;
   border: 1px solid var(--color-border);
@@ -530,7 +644,16 @@ onMounted(() => {
 }
 
 /* Portrait adjustments */
-@media (orientation: portrait) {
+@media (max-width: 820px), (max-height: 520px) and (pointer: coarse) {
+  .range-controls,
+  .range-controls-top {
+    width: 100%;
+  }
+
+  .range-controls-top {
+    flex-wrap: wrap;
+  }
+
   .time-range-switcher {
     width: 100%;
     justify-content: center;
@@ -544,6 +667,24 @@ onMounted(() => {
 
   .traffic-summary {
     gap: 12px;
+  }
+}
+
+@media (max-width: 560px) {
+  .custom-range {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+    width: 100%;
+  }
+
+  .date-input {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .apply-btn {
+    grid-column: 1 / -1;
+    justify-content: center;
   }
 }
 </style>

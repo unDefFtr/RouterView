@@ -5,8 +5,8 @@
 
 const API_BASE = '/api';
 
-async function request<T>(url: string): Promise<T> {
-  const res = await fetch(`${API_BASE}${url}`);
+async function request<T>(url: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(`${API_BASE}${url}`, init);
   if (!res.ok) {
     throw new Error(`API error: ${res.status} ${res.statusText}`);
   }
@@ -14,9 +14,7 @@ async function request<T>(url: string): Promise<T> {
 }
 
 export interface HealthResponse {
-  status: string;
-  uptime: string;
-  ws_connections: number;
+  status: 'ok';
   version: string;
 }
 
@@ -41,24 +39,47 @@ export interface TrafficHistoryPoint {
   download_bps: number;
   upload_bps: number;
   wan_name?: string | null;
+  duration_ms?: number;
+  /** Exact byte counters are serialized as decimal strings. */
+  download_bytes?: string;
+  upload_bytes?: string;
+  estimated?: boolean;
+  complete?: boolean;
+}
+
+export interface TrafficHistoryTotals {
+  /** Legacy aliases may still be JSON numbers during the v0.2 transition. */
+  download_bytes?: number | string;
+  upload_bytes?: number | string;
+  total_download_bytes?: string;
+  total_upload_bytes?: string;
+  exact_download_bytes?: string;
+  exact_upload_bytes?: string;
+  estimated_download_bytes?: string;
+  estimated_upload_bytes?: string;
+  estimated?: boolean;
+  complete?: boolean;
+  coverage_ratio?: number;
 }
 
 export interface TrafficHistoryResponse {
   points: TrafficHistoryPoint[];
-  interval_secs: number;
+  interval_secs?: number;
   wan_names?: string[];
+  totals?: TrafficHistoryTotals;
 }
 
 export async function fetchTrafficHistory(
   start: number,
   end: number,
   wanName?: string,
+  signal?: AbortSignal,
 ): Promise<TrafficHistoryResponse> {
   let url = `/traffic?start=${start}&end=${end}`;
   if (wanName) {
     url += `&wan_name=${encodeURIComponent(wanName)}`;
   }
-  return request<TrafficHistoryResponse>(url);
+  return request<TrafficHistoryResponse>(url, { signal });
 }
 
 // ── Device Overrides ─────────────────────────────────────────

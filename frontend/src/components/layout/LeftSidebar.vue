@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { useNavigation } from '@/composables/useNavigation';
-import { useRouter } from 'vue-router';
+import { RouterLink } from 'vue-router';
 import FeatherIcon from '@/components/shared/FeatherIcon.vue';
 
 const iconNameMap: Record<string, string> = {
@@ -14,8 +14,7 @@ function featherName(icon: string): string {
   return iconNameMap[icon] || icon;
 }
 
-const { items, activeId, navigate } = useNavigation();
-const router = useRouter();
+const { items, activeId } = useNavigation();
 
 // Settings lives in the bottom gear slot, not in the main nav strip
 const navItems = items.filter(i => i.id !== 'settings');
@@ -23,31 +22,33 @@ const navItems = items.filter(i => i.id !== 'settings');
 
 <template>
   <nav class="sidebar-nav">
-    <div
+    <RouterLink
       v-for="item in navItems"
       :key="item.id"
       class="nav-item"
       :class="{ active: activeId === item.id }"
-      @click="navigate(item)"
+      :to="item.route"
+      :aria-current="activeId === item.id ? 'page' : undefined"
       :title="item.label"
     >
 
       <FeatherIcon :name="featherName(item.icon)" :size="22" :stroke-width="1.8" />
 
       <span class="nav-label">{{ item.label }}</span>
-    </div>
+    </RouterLink>
   </nav>
 
   <!-- Settings gear at bottom -->
   <div class="sidebar-bottom">
-    <button
+    <RouterLink
       class="settings-btn"
       :class="{ active: activeId === 'settings' }"
       title="设置"
-      @click="router.push('/settings')"
+      to="/settings"
+      :aria-current="activeId === 'settings' ? 'page' : undefined"
     >
       <FeatherIcon name="settings" :size="20" :stroke-width="1.8" />
-    </button>
+    </RouterLink>
   </div>
 </template>
 

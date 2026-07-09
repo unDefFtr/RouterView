@@ -14,8 +14,9 @@ const dashboardStore = useDashboardStore();
 const wsStore = useWebSocketStore();
 
 const connectionLabel = computed(() => {
-  if (!dashboardStore.routerosConnected) return 'RouterOS 未连接';
   if (!dashboardStore.wsConnected) return 'WebSocket 未连接';
+  if (!dashboardStore.routerosConnected) return 'RouterOS 未连接';
+  if (!dashboardStore.isLive) return '实时数据已过期';
   return null;
 });
 </script>
