@@ -1,317 +1,418 @@
-use axum::{extract::State, http::StatusCode, Json};
-use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::sync::Arc;
 
+use axum::{extract::State, http::StatusCode, Json};
+use serde::Deserialize;
+use serde_json::{json, Value};
+
 use crate::backends::{RouterBackend, RouterConnectionConfig, RouterType};
-use crate::config_store::ConfigStore;
-use crate::error::AppError;
+use crate::error::{ApiJson, AppError};
 use crate::state::AppState;
 
-/// Health check endpoint — returns server status.
-pub async fn health_check(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let connections = state
-        .connection_count
-        .load(std::sync::atomic::Ordering::Relaxed);
-
+pub async fn health_check() -> Json<Value> {
     Json(json!({
         "status": "ok",
-        "uptime": "running",
-        "ws_connections": connections,
         "version": env!("CARGO_PKG_VERSION"),
     }))
 }
 
-/// GET /api/config — returns current configuration including credentials
-/// for the settings page. Password is returned as a masked placeholder if set.
-///
-/// Emits `routeros_*` keys for frontend backward compatibility alongside
-/// new `router_type` and `router_*` fields.
-pub async fn config_info(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
-    let cfg = state.config.read().await;
-    let password_hint = if cfg.router_password.is_empty() {
-        ""
-    } else {
-        "••••••••"
-    };
-
-    let wizard_completed = state
-        .traffic_db
-        .get_all_config()
-        .get("wizard_completed")
-        .map(|v| v == "true")
-        .unwrap_or(false);
-
-    let body = json!({
-        "router_type": cfg.router_type,
-        // Backward-compat keys for frontend:
-        "routeros_host": cfg.router_host,
-        "routeros_port": cfg.router_port,
-        "routeros_scheme": cfg.router_scheme,
-        "routeros_username": cfg.router_username,
-        "routeros_password": password_hint,
-        "accept_invalid_certs": cfg.accept_invalid_certs,
-        "poll_interval_secs": cfg.poll_interval_secs,
-        "probe_interval_secs": cfg.probe_interval_secs,
-        "db_raw_retention_days": cfg.db_raw_retention_days,
-        "db_total_retention_days": cfg.db_total_retention_days,
-        "latency_good_ms": cfg.latency_good_ms,
-        "latency_poor_ms": cfg.latency_poor_ms,
-        "theme": cfg.theme,
-        "routeros_configured": cfg.has_connection_config(),
-        "wizard_completed": wizard_completed,
-    });
-    (StatusCode::OK, Json(body))
-}
-
-/// PUT /api/config — partial config update.
-///
-/// Accepts a flat JSON object of key/value pairs. Keys matching known config
-/// fields are written to the database. Returns two lists:
-/// - `saved`: keys that were persisted
-/// - `requires_restart`: keys that were saved but take effect on next restart
-///
-/// Supports both new `router_*` and legacy `routeros_*` key names.
-pub async fn update_config(
+pub async fn config_info(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<HashMap<String, serde_json::Value>>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
-    let known_keys: &[&str] = &[
-        "router_type",
-        "router_host",
-        "routeros_host",
-        "router_port",
-        "routeros_port",
-        "router_scheme",
-        "routeros_scheme",
-        "router_username",
-        "routeros_username",
-        "router_password",
-        "routeros_password",
-        "accept_invalid_certs",
-        "poll_interval_secs",
-        "probe_interval_secs",
-        "server_port",
-        "db_raw_retention_days",
-        "db_total_retention_days",
-        "latency_good_ms",
-        "latency_poor_ms",
-        "theme",
-        "wizard_completed",
-    ];
-
-    let requires_restart: &[&str] = &["server_port"];
-
-    let mut saved: Vec<String> = Vec::new();
-    let mut restart: Vec<String> = Vec::new();
-
-    for (key, val) in &body {
-        if !known_keys.contains(&key.as_str()) {
-            continue;
-        }
-        let val_str = match val {
-            serde_json::Value::String(s) => s.clone(),
-            other => other.to_string(),
-        };
-        ConfigStore::save(&state.traffic_db, key, &val_str);
-        saved.push(key.clone());
-        if requires_restart.contains(&key.as_str()) {
-            restart.push(key.clone());
-        }
-    }
-
-    // Hot-apply all saved keys to the in-memory config.
-    {
-        let mut cfg = state.config.write().await;
-        for key in &saved {
-            // Build a ResolvedBody that normalizes both new and legacy keys
-            let val = ResolvedBody { body: &body, key };
-
-            match key.as_str() {
-                "router_type" => {
-                    if let Some(v) = val.as_str() {
-                        cfg.router_type = match v.to_lowercase().as_str() {
-                            "routeros" => RouterType::RouterOs,
-                            _ => continue,
-                        };
-                    }
-                }
-                "router_host" | "routeros_host" => {
-                    if let Some(v) = val.as_str() {
-                        cfg.router_host = v.to_string();
-                    }
-                }
-                "router_port" | "routeros_port" => {
-                    if let Some(v) = val.as_u64() {
-                        cfg.router_port = v as u16;
-                    }
-                }
-                "router_scheme" | "routeros_scheme" => {
-                    if let Some(v) = val.as_str() {
-                        let s = v.to_lowercase();
-                        if s == "http" || s == "https" {
-                            cfg.router_scheme = s;
-                        }
-                    }
-                }
-                "accept_invalid_certs" => {
-                    if let Some(v) = val.as_bool() {
-                        cfg.accept_invalid_certs = v;
-                    }
-                }
-                "router_username" | "routeros_username" => {
-                    if let Some(v) = val.as_str() {
-                        cfg.router_username = v.to_string();
-                    }
-                }
-                "router_password" | "routeros_password" => {
-                    if let Some(v) = val.as_str() {
-                        cfg.router_password = v.to_string();
-                    }
-                }
-                "poll_interval_secs" => {
-                    if let Some(n) = val.as_u64() {
-                        cfg.poll_interval_secs = n;
-                    }
-                }
-                "probe_interval_secs" => {
-                    if let Some(n) = val.as_u64() {
-                        cfg.probe_interval_secs = n;
-                    }
-                }
-                "db_raw_retention_days" => {
-                    if let Some(n) = val.as_u64() {
-                        cfg.db_raw_retention_days = n;
-                    }
-                }
-                "db_total_retention_days" => {
-                    if let Some(n) = val.as_u64() {
-                        cfg.db_total_retention_days = n;
-                    }
-                }
-                "latency_good_ms" => {
-                    if let Some(n) = val.as_u64() {
-                        cfg.latency_good_ms = n;
-                    }
-                }
-                "latency_poor_ms" => {
-                    if let Some(n) = val.as_u64() {
-                        cfg.latency_poor_ms = n;
-                    }
-                }
-                "theme" => {
-                    if let Some(v) = val.as_str() {
-                        cfg.theme = v.to_string();
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
+    let cfg = state.config.read().await;
+    let values = state.traffic_db.get_all_config()?;
+    let wizard_completed = values
+        .get("wizard_completed")
+        .is_some_and(|value| value == "true");
+    let password_set = cfg.has_connection_config();
+    let password_hint = password_set.then_some("********").unwrap_or("");
     Ok((
         StatusCode::OK,
         Json(json!({
-            "saved": saved,
-            "requires_restart": restart,
+            "router_type": cfg.router_type,
+            "revision": cfg.revision,
+            "router_host": cfg.router_host,
+            "router_port": cfg.router_port,
+            "router_scheme": cfg.router_scheme,
+            "router_username": cfg.router_username,
+            "password_set": password_set,
+            "router_configured": password_set,
+            "routeros_host": cfg.router_host,
+            "routeros_port": cfg.router_port,
+            "routeros_scheme": cfg.router_scheme,
+            "routeros_username": cfg.router_username,
+            "routeros_password": password_hint,
+            "routeros_configured": password_set,
+            "accept_invalid_certs": cfg.accept_invalid_certs,
+            "poll_interval_secs": cfg.poll_interval_secs,
+            "probe_interval_secs": cfg.probe_interval_secs,
+            "db_raw_retention_days": cfg.db_raw_retention_days,
+            "db_total_retention_days": cfg.db_total_retention_days,
+            "latency_good_ms": cfg.latency_good_ms,
+            "latency_poor_ms": cfg.latency_poor_ms,
+            "theme": cfg.theme,
+            "wizard_completed": wizard_completed,
         })),
     ))
 }
 
-/// Helper to extract values from the request body, trying the actual key first,
-/// then falling back to a related legacy key when applicable.
-struct ResolvedBody<'a> {
-    body: &'a HashMap<String, serde_json::Value>,
-    key: &'a str,
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum PasswordMode {
+    Keep,
+    Replace,
+    Clear,
 }
 
-impl<'a> ResolvedBody<'a> {
-    fn as_str(&self) -> Option<&str> {
-        self.body.get(self.key).and_then(|v| v.as_str())
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum BoolValue {
+    Bool(bool),
+    Text(String),
+}
+
+impl BoolValue {
+    fn get(&self, field: &str) -> Result<bool, AppError> {
+        match self {
+            Self::Bool(value) => Ok(*value),
+            Self::Text(value) if value == "true" || value == "1" => Ok(true),
+            Self::Text(value) if value == "false" || value == "0" => Ok(false),
+            _ => Err(AppError::InvalidData(format!("{field} must be a boolean"))),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigUpdateRequest {
+    expected_revision: Option<u64>,
+    router_type: Option<RouterType>,
+    #[serde(alias = "routeros_host")]
+    router_host: Option<String>,
+    #[serde(alias = "routeros_port")]
+    router_port: Option<u16>,
+    #[serde(alias = "routeros_scheme")]
+    router_scheme: Option<String>,
+    #[serde(alias = "routeros_username")]
+    router_username: Option<String>,
+    #[serde(alias = "routeros_password")]
+    router_password: Option<String>,
+    password_mode: Option<PasswordMode>,
+    accept_invalid_certs: Option<BoolValue>,
+    poll_interval_secs: Option<u64>,
+    probe_interval_secs: Option<u64>,
+    db_raw_retention_days: Option<u64>,
+    db_total_retention_days: Option<u64>,
+    latency_good_ms: Option<u64>,
+    latency_poor_ms: Option<u64>,
+    theme: Option<String>,
+    wizard_completed: Option<BoolValue>,
+}
+
+pub async fn update_config(
+    State(state): State<Arc<AppState>>,
+    ApiJson(body): ApiJson<ConfigUpdateRequest>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    let current = state.config.read().await.clone();
+    let expected_revision = body.expected_revision.ok_or_else(|| {
+        AppError::InvalidData("expected_revision is required for configuration updates".into())
+    })?;
+    if expected_revision != current.revision {
+        return Err(AppError::Conflict(format!(
+            "configuration revision changed (expected {expected_revision}, current {})",
+            current.revision
+        )));
+    }
+    let mut next = current.clone();
+    let mut saved = Vec::new();
+
+    if let Some(value) = body.router_type {
+        next.router_type = value;
+        saved.push("router_type");
+    }
+    if let Some(value) = body.router_host.as_deref() {
+        next.router_host = value.trim().to_string();
+        saved.push("router_host");
+    }
+    if let Some(value) = body.router_port {
+        next.router_port = value;
+        saved.push("router_port");
+    }
+    if let Some(value) = body.router_scheme.as_deref() {
+        next.router_scheme = value.to_ascii_lowercase();
+        saved.push("router_scheme");
+    }
+    if let Some(value) = body.router_username.as_deref() {
+        next.router_username = value.trim().to_string();
+        saved.push("router_username");
+    }
+    if let Some(value) = body.accept_invalid_certs.as_ref() {
+        next.accept_invalid_certs = value.get("accept_invalid_certs")?;
+        saved.push("accept_invalid_certs");
+    }
+    if let Some(value) = body.poll_interval_secs {
+        next.poll_interval_secs = value;
+        saved.push("poll_interval_secs");
+    }
+    if let Some(value) = body.probe_interval_secs {
+        next.probe_interval_secs = value;
+        saved.push("probe_interval_secs");
+    }
+    if let Some(value) = body.db_raw_retention_days {
+        next.db_raw_retention_days = value;
+        saved.push("db_raw_retention_days");
+    }
+    if let Some(value) = body.db_total_retention_days {
+        next.db_total_retention_days = value;
+        saved.push("db_total_retention_days");
+    }
+    if let Some(value) = body.latency_good_ms {
+        next.latency_good_ms = value;
+        saved.push("latency_good_ms");
+    }
+    if let Some(value) = body.latency_poor_ms {
+        next.latency_poor_ms = value;
+        saved.push("latency_poor_ms");
+    }
+    if let Some(value) = body.theme.as_deref() {
+        next.theme = value.to_ascii_lowercase();
+        saved.push("theme");
     }
 
-    fn as_u64(&self) -> Option<u64> {
-        self.body.get(self.key).and_then(|v| v.as_u64())
-    }
+    let connection_changed = next.router_type != current.router_type
+        || next.router_host != current.router_host
+        || next.router_port != current.router_port
+        || next.router_scheme != current.router_scheme
+        || next.router_username != current.router_username
+        || next.accept_invalid_certs != current.accept_invalid_certs;
+    let password_mode = body.password_mode.unwrap_or_else(|| {
+        if body
+            .router_password
+            .as_deref()
+            .is_some_and(|value| !value.is_empty() && value != "********")
+        {
+            PasswordMode::Replace
+        } else {
+            PasswordMode::Keep
+        }
+    });
 
-    fn as_bool(&self) -> Option<bool> {
-        self.body.get(self.key).and_then(|v| {
-            if v.is_boolean() {
-                v.as_bool()
-            } else if let Some(s) = v.as_str() {
-                Some(s == "true" || s == "1")
-            } else {
-                None
+    let mut encrypted_password = None;
+    let mut delete_password = false;
+    match password_mode {
+        PasswordMode::Keep => {
+            if connection_changed {
+                return Err(AppError::InvalidData(
+                    "changing router connection fields requires password_mode=replace and a complete credential"
+                        .into(),
+                ));
             }
-        })
+        }
+        PasswordMode::Replace => {
+            let password = body.router_password.as_deref().ok_or_else(|| {
+                AppError::InvalidData(
+                    "router_password is required when password_mode=replace".into(),
+                )
+            })?;
+            if password.is_empty() || password.len() > 1024 || password == "********" {
+                return Err(AppError::InvalidData(
+                    "router_password must contain 1 to 1024 bytes".into(),
+                ));
+            }
+            next.router_password = password.to_string();
+            encrypted_password = Some(
+                state
+                    .secret_cipher
+                    .encrypt(&state.instance_id, "router_password", password.as_bytes())
+                    .map_err(|error| AppError::Secret(error.to_string()))?,
+            );
+            saved.push("router_password");
+        }
+        PasswordMode::Clear => {
+            next.router_password.clear();
+            delete_password = true;
+            saved.push("router_password");
+        }
+    }
+
+    next.validate()?;
+    let mut persisted = vec![
+        ("router_type".to_string(), "routeros".to_string()),
+        ("router_host".to_string(), next.router_host.clone()),
+        ("router_port".to_string(), next.router_port.to_string()),
+        ("router_scheme".to_string(), next.router_scheme.clone()),
+        ("router_username".to_string(), next.router_username.clone()),
+        (
+            "accept_invalid_certs".to_string(),
+            next.accept_invalid_certs.to_string(),
+        ),
+        (
+            "poll_interval_secs".to_string(),
+            next.poll_interval_secs.to_string(),
+        ),
+        (
+            "probe_interval_secs".to_string(),
+            next.probe_interval_secs.to_string(),
+        ),
+        (
+            "db_raw_retention_days".to_string(),
+            next.db_raw_retention_days.to_string(),
+        ),
+        (
+            "db_total_retention_days".to_string(),
+            next.db_total_retention_days.to_string(),
+        ),
+        (
+            "latency_good_ms".to_string(),
+            next.latency_good_ms.to_string(),
+        ),
+        (
+            "latency_poor_ms".to_string(),
+            next.latency_poor_ms.to_string(),
+        ),
+        ("theme".to_string(), next.theme.clone()),
+    ];
+    if let Some(value) = body.wizard_completed.as_ref() {
+        persisted.push((
+            "wizard_completed".to_string(),
+            value.get("wizard_completed")?.to_string(),
+        ));
+        saved.push("wizard_completed");
+    }
+
+    let saved_transaction = state.traffic_db.save_config_transaction(
+        &persisted,
+        encrypted_password
+            .as_ref()
+            .map(|encrypted| ("router_password", encrypted)),
+        delete_password.then_some("router_password"),
+        Some(expected_revision),
+    )?;
+    if !saved_transaction {
+        return Err(AppError::Conflict(
+            "configuration was modified by another request".into(),
+        ));
+    }
+    next.revision = expected_revision.saturating_add(1);
+    let revision = next.revision;
+    *state.config.write().await = next;
+
+    saved.sort_unstable();
+    saved.dedup();
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "saved": saved,
+            "requires_restart": [],
+            "revision": revision,
+        })),
+    ))
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectionDraft {
+    router_type: Option<RouterType>,
+    #[serde(alias = "routeros_host")]
+    router_host: Option<String>,
+    #[serde(alias = "routeros_port")]
+    router_port: Option<u16>,
+    #[serde(alias = "routeros_scheme")]
+    router_scheme: Option<String>,
+    #[serde(alias = "routeros_username")]
+    router_username: Option<String>,
+    #[serde(alias = "routeros_password")]
+    router_password: Option<String>,
+    accept_invalid_certs: Option<bool>,
+}
+
+impl ConnectionDraft {
+    fn is_empty(&self) -> bool {
+        self.router_type.is_none()
+            && self.router_host.is_none()
+            && self.router_port.is_none()
+            && self.router_scheme.is_none()
+            && self.router_username.is_none()
+            && self.router_password.is_none()
+            && self.accept_invalid_certs.is_none()
     }
 }
 
-/// POST /api/config/test-connection — test router connectivity.
-///
-/// Accepts optional connection params in the body (to test before saving).
-/// If no params provided, uses the current in-memory config.
-/// Supports both new `router_*` and legacy `routeros_*` key names.
 pub async fn test_connection(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<HashMap<String, serde_json::Value>>,
+    ApiJson(body): ApiJson<ConnectionDraft>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     let cfg = state.config.read().await;
-
-    let get_str = |key: &str, legacy_key: &str, fallback: &str| -> String {
-        body.get(key)
-            .and_then(|v| v.as_str())
-            .or_else(|| body.get(legacy_key).and_then(|v| v.as_str()))
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| fallback.to_string())
+    let conn_config = if body.is_empty() {
+        RouterConnectionConfig {
+            router_type: cfg.router_type,
+            host: cfg.router_host.clone(),
+            port: cfg.router_port,
+            scheme: cfg.router_scheme.clone(),
+            username: cfg.router_username.clone(),
+            password: cfg.router_password.clone(),
+            accept_invalid_certs: cfg.accept_invalid_certs,
+            management_cidrs: cfg.router_management_cidrs.clone(),
+            allow_insecure_http: cfg.allow_insecure_router_http,
+        }
+    } else {
+        let required = |value: Option<String>, field: &str| {
+            value
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    AppError::InvalidData(format!(
+                        "{field} is required when testing a connection draft"
+                    ))
+                })
+        };
+        RouterConnectionConfig {
+            router_type: body.router_type.unwrap_or(RouterType::RouterOs),
+            host: required(body.router_host, "router_host")?,
+            port: body.router_port.ok_or_else(|| {
+                AppError::InvalidData(
+                    "router_port is required when testing a connection draft".into(),
+                )
+            })?,
+            scheme: required(body.router_scheme, "router_scheme")?.to_ascii_lowercase(),
+            username: required(body.router_username, "router_username")?,
+            password: required(body.router_password, "router_password")?,
+            accept_invalid_certs: body.accept_invalid_certs.unwrap_or(false),
+            management_cidrs: cfg.router_management_cidrs.clone(),
+            allow_insecure_http: cfg.allow_insecure_router_http,
+        }
     };
+    drop(cfg);
 
-    let router_type = body
-        .get("router_type")
-        .and_then(|v| v.as_str())
-        .map(|s| match s.to_lowercase().as_str() {
-            "routeros" => RouterType::RouterOs,
-            _ => RouterType::default(),
-        })
-        .unwrap_or(cfg.router_type);
-
-    let conn_config = RouterConnectionConfig {
-        router_type,
-        host: get_str("router_host", "routeros_host", &cfg.router_host),
-        port: body
-            .get("router_port")
-            .or_else(|| body.get("routeros_port"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(cfg.router_port as u64) as u16,
-        scheme: get_str("router_scheme", "routeros_scheme", &cfg.router_scheme),
-        username: get_str("router_username", "routeros_username", &cfg.router_username),
-        password: get_str("router_password", "routeros_password", &cfg.router_password),
-        accept_invalid_certs: body
-            .get("accept_invalid_certs")
-            .map(|v| v.as_bool().unwrap_or(false) || v.as_str() == Some("true"))
-            .unwrap_or(cfg.accept_invalid_certs),
-    };
-
-    // Dispatch to the appropriate backend's test_connection
     let result = match conn_config.router_type {
         RouterType::RouterOs => {
             crate::backends::routeros::client::RouterOsClient::test_connection(&conn_config).await?
         }
     };
+    Ok((StatusCode::OK, Json(serde_json::to_value(result)?)))
+}
 
-    let mut response = json!({
-        "success": result.success,
-    });
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    if let Some(model) = &result.model {
-        response["model"] = json!(model);
-    }
-    if let Some(version) = &result.version {
-        response["version"] = json!(version);
-    }
-    if let Some(error) = &result.error {
-        response["error"] = json!(error);
+    #[test]
+    fn legacy_connection_fields_deserialize_into_canonical_draft() {
+        let draft: ConnectionDraft = serde_json::from_value(json!({
+            "routeros_host": "192.168.88.1",
+            "routeros_port": 443,
+            "routeros_scheme": "https",
+            "routeros_username": "admin",
+            "routeros_password": "secret"
+        }))
+        .unwrap();
+        assert_eq!(draft.router_host.as_deref(), Some("192.168.88.1"));
+        assert_eq!(draft.router_port, Some(443));
     }
 
-    Ok((StatusCode::OK, Json(response)))
+    #[test]
+    fn rejects_unknown_config_keys() {
+        let result = serde_json::from_value::<ConfigUpdateRequest>(json!({
+            "server_port": 1
+        }));
+        assert!(result.is_err());
+    }
 }

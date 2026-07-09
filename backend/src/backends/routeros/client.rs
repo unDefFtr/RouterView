@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{net::IpAddr, time::Duration};
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -14,26 +14,34 @@ use crate::error::AppError;
 
 /// HTTP client wrapper for the MikroTik RouterOS REST API.
 ///
-/// Authenticates via token-based auth (POST login) with Basic auth fallback.
+/// Authenticates using RouterOS REST Basic authentication.
 pub struct RouterOsClient {
     base_url: String,
     http_client: reqwest::Client,
     auth_header: String,
 }
 
-/// Response from a token-style login attempt.
-#[derive(Debug, Deserialize)]
-struct TokenResponse {
-    #[serde(default)]
-    token: String,
-    #[serde(default)]
-    ret: Option<String>,
-}
-
 impl RouterOsClient {
     /// Build a new client from a generic `RouterConnectionConfig`.
-    fn base_url(config: &RouterConnectionConfig) -> String {
-        format!("{}://{}:{}/rest", config.scheme, config.host, config.port)
+    fn base_url(config: &RouterConnectionConfig) -> Result<String, AppError> {
+        let host = config.host.trim();
+        let authority = match host.parse::<IpAddr>() {
+            Ok(IpAddr::V6(address)) => format!("[{address}]"),
+            _ => host.to_string(),
+        };
+        let value = format!("{}://{}:{}/rest", config.scheme, authority, config.port);
+        let parsed = url::Url::parse(&value)
+            .map_err(|_| AppError::InvalidData("router target is not a valid host".into()))?;
+        if parsed.username() != ""
+            || parsed.password().is_some()
+            || parsed.host_str().is_none()
+            || parsed.path() != "/rest"
+        {
+            return Err(AppError::InvalidData(
+                "router target must be a hostname or IP address".into(),
+            ));
+        }
+        Ok(value)
     }
 
     /// Generic GET request to a RouterOS REST API path.
@@ -58,8 +66,7 @@ impl RouterOsClient {
 
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            warn!("RouterOS returned {status}: {body}");
+            warn!("RouterOS returned {status} for {path}");
 
             if status.as_u16() == 401 {
                 return Err(AppError::RouterApi(format!(
@@ -68,15 +75,12 @@ impl RouterOsClient {
                 )));
             }
 
-            return Err(AppError::RouterApi(format!(
-                "HTTP {status} from {path}: {body}"
-            )));
+            return Err(AppError::RouterApi(format!("HTTP {status} from {path}")));
         }
 
-        let body_text = resp
-            .text()
-            .await
-            .map_err(|e| AppError::RouterApi(format!("Failed to read response body: {e}")))?;
+        let body_bytes = read_limited_body(resp, 1024 * 1024).await?;
+        let body_text = std::str::from_utf8(&body_bytes)
+            .map_err(|_| AppError::RouterApi("RouterOS returned non-UTF-8 JSON".into()))?;
 
         if body_text.trim().is_empty() {
             return Ok(Vec::new());
@@ -212,24 +216,8 @@ impl RouterOsClient {
 #[async_trait]
 impl RouterBackend for RouterOsClient {
     async fn connect(config: &RouterConnectionConfig) -> Result<Self, AppError> {
-        let base_url = Self::base_url(config);
-        let base_rest = format!("{}://{}:{}", config.scheme, config.host, config.port);
-
-        let http_client = build_http_client(config)?;
-
-        // Strategy 1: Try token-based authentication
-        debug!("Attempting token-based auth...");
-        if let Ok(auth_header) = try_token_auth(&http_client, &base_rest, config).await {
-            info!("RouterOS authenticated via token");
-            return Ok(Self {
-                base_url,
-                http_client,
-                auth_header,
-            });
-        }
-
-        // Strategy 2: Fall back to Basic auth
-        debug!("Token auth unavailable, falling back to Basic auth");
+        let base_url = Self::base_url(config)?;
+        let http_client = build_http_client(config).await?;
         let auth_header = build_basic_auth_header(&config.username, &config.password)?;
 
         // Quick sanity check: does a simple GET work with Basic auth?
@@ -248,14 +236,12 @@ impl RouterBackend for RouterOsClient {
                 info!("RouterOS Basic auth verified");
             }
             Ok(resp) if resp.status().as_u16() == 401 => {
-                let body = resp.text().await.unwrap_or_default();
                 warn!(
                     "RouterOS returned 401 for Basic auth. \
                      Please check:\n  \
                      - The user '{}' has 'rest-api' policy granted\n  \
                      - RouterOS version is 7.1 or newer\n  \
-                     - The www service is enabled: /ip/service/print\n  \
-                     Response: {body}",
+                     - The www service is enabled: /ip/service/print",
                     config.username,
                 );
                 return Err(AppError::RouterApi(format!(
@@ -267,11 +253,14 @@ impl RouterBackend for RouterOsClient {
             }
             Ok(resp) => {
                 let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                warn!("RouterOS test request returned {status}: {body}");
+                warn!("RouterOS test request returned {status}");
+                return Err(AppError::RouterApi(format!(
+                    "RouterOS connection check returned HTTP {status}"
+                )));
             }
             Err(e) => {
                 warn!("RouterOS test request failed: {e}");
+                return Err(AppError::RouterUnreachable);
             }
         }
 
@@ -346,18 +335,12 @@ impl RouterBackend for RouterOsClient {
     ) -> Result<ConnectionTestResult, AppError> {
         let test_url = format!(
             "{}://{}:{}/rest/system/resource",
-            config.scheme, config.host, config.port
+            config.scheme,
+            format_url_host(&config.host),
+            config.port
         );
 
-        let http_client = {
-            let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(10));
-            if config.scheme == "https" {
-                builder = builder.danger_accept_invalid_certs(config.accept_invalid_certs);
-            }
-            builder
-                .build()
-                .map_err(|e| AppError::Internal(e.to_string()))?
-        };
+        let http_client = build_http_client(config).await?;
 
         let auth_header = build_basic_auth_header(&config.username, &config.password)?;
 
@@ -379,7 +362,8 @@ impl RouterBackend for RouterOsClient {
                     #[serde(default)]
                     version: String,
                 }
-                let info = resp.json::<Vec<Resource>>().await.ok();
+                let body = read_limited_body(resp, 64 * 1024).await?;
+                let info = serde_json::from_slice::<Vec<Resource>>(&body).ok();
                 let model = info
                     .as_ref()
                     .and_then(|v| v.first())
@@ -398,19 +382,18 @@ impl RouterBackend for RouterOsClient {
             }
             Ok(resp) => {
                 let status = resp.status().as_u16();
-                let body = resp.text().await.unwrap_or_default();
                 Ok(ConnectionTestResult {
                     success: false,
                     model: None,
                     version: None,
-                    error: Some(format!("HTTP {status}: {body}")),
+                    error: Some(format!("Router returned HTTP {status}")),
                 })
             }
-            Err(e) => Ok(ConnectionTestResult {
+            Err(_) => Ok(ConnectionTestResult {
                 success: false,
                 model: None,
                 version: None,
-                error: Some(e.to_string()),
+                error: Some("Router connection failed".to_string()),
             }),
         }
     }
@@ -424,9 +407,15 @@ impl RouterBackend for RouterOsClient {
 // Auth Helpers
 // ═══════════════════════════════════════════════════════════════════
 
-/// Build the base HTTP client (without auth headers — those are per-request).
-fn build_http_client(config: &RouterConnectionConfig) -> Result<reqwest::Client, AppError> {
-    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(10));
+/// Build a client whose DNS answers are allowlisted and pinned for its lifetime.
+async fn build_http_client(config: &RouterConnectionConfig) -> Result<reqwest::Client, AppError> {
+    let addresses = resolve_management_target(config).await?;
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .resolve_to_addrs(&config.host, &addresses);
 
     if config.scheme == "https" {
         builder = builder.danger_accept_invalid_certs(config.accept_invalid_certs);
@@ -444,67 +433,105 @@ fn build_basic_auth_header(username: &str, password: &str) -> Result<String, App
     Ok(format!("Basic {}", encoded))
 }
 
-/// Attempt token-based authentication against the RouterOS REST API.
-async fn try_token_auth(
-    client: &reqwest::Client,
-    base_rest: &str,
+async fn resolve_management_target(
     config: &RouterConnectionConfig,
-) -> Result<String, AppError> {
-    let body = serde_json::json!({
-        "name": config.username,
-        "password": config.password,
-    });
-
-    // Different RouterOS versions use different token endpoints
-    let candidates = [
-        format!("{}/rest/auth/token", base_rest),
-        format!("{}/rest/auth/login", base_rest),
-        format!("{}/rest/login", base_rest),
-    ];
-
-    for url in &candidates {
-        debug!("Trying token auth at: {}", url);
-        match client.post(url).json(&body).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                let text = resp.text().await.unwrap_or_default();
-                debug!("Token response: {text}");
-
-                if let Ok(tok) = serde_json::from_str::<TokenResponse>(&text) {
-                    if !tok.token.is_empty() {
-                        return Ok(format!("Bearer {}", tok.token));
-                    }
-                }
-
-                return build_basic_auth_header(&config.username, &config.password);
-            }
-            Ok(resp) => {
-                debug!("Token auth at {} returned {}", url, resp.status());
-            }
-            Err(e) => {
-                debug!("Token auth at {} failed: {}", url, e);
-            }
-        }
+) -> Result<Vec<std::net::SocketAddr>, AppError> {
+    if config.scheme != "https" && !(config.scheme == "http" && config.allow_insecure_http) {
+        return Err(AppError::InvalidData(
+            "cleartext RouterOS HTTP is disabled".into(),
+        ));
     }
-
-    // Also try the legacy login style (form-encoded)
-    let legacy_url = format!("{}/rest/auth/basic", base_rest);
-    debug!("Trying legacy auth at: {}", legacy_url);
-    if let Ok(resp) = client
-        .post(&legacy_url)
-        .form(&[
-            ("name", config.username.as_str()),
-            ("password", config.password.as_str()),
-        ])
-        .send()
+    if config.host.trim().is_empty() || config.host != config.host.trim() {
+        return Err(AppError::InvalidData("invalid router host".into()));
+    }
+    let addresses: Vec<_> = tokio::net::lookup_host((config.host.as_str(), config.port))
         .await
+        .map_err(|_| AppError::RouterUnreachable)?
+        .collect();
+    if addresses.is_empty() {
+        return Err(AppError::RouterUnreachable);
+    }
+    for address in &addresses {
+        let ip = address.ip();
+        let forbidden = ip.is_unspecified()
+            || ip.is_loopback()
+            || ip.is_multicast()
+            || match ip {
+                IpAddr::V4(ipv4) => ipv4.is_link_local() || ipv4.is_broadcast(),
+                IpAddr::V6(ipv6) => ipv6.is_unicast_link_local() || ipv6.to_ipv4_mapped().is_some(),
+            };
+        if forbidden
+            || !config
+                .management_cidrs
+                .iter()
+                .any(|network| network.contains(&ip))
+        {
+            return Err(AppError::Forbidden(format!(
+                "router target resolved outside ROUTER_MANAGEMENT_CIDRS ({ip})"
+            )));
+        }
+    }
+    Ok(addresses)
+}
+
+fn format_url_host(host: &str) -> String {
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V6(address)) => format!("[{address}]"),
+        _ => host.to_string(),
+    }
+}
+
+async fn read_limited_body(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, AppError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
     {
-        if resp.status().is_success() {
-            info!("Legacy auth succeeded");
-            return build_basic_auth_header(&config.username, &config.password);
+        return Err(AppError::RouterApi("RouterOS response is too large".into()));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err(AppError::RouterApi("RouterOS response is too large".into()));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(host: &str, cidr: &str) -> RouterConnectionConfig {
+        RouterConnectionConfig {
+            router_type: RouterType::RouterOs,
+            host: host.to_string(),
+            port: 443,
+            scheme: "https".to_string(),
+            username: "admin".to_string(),
+            password: "password".to_string(),
+            accept_invalid_certs: false,
+            management_cidrs: vec![cidr.parse().unwrap()],
+            allow_insecure_http: false,
         }
     }
 
-    Err(AppError::RouterApi(
-        "No token auth endpoint available, will fall back to Basic auth".into(),
-    ))
+    #[tokio::test]
+    async fn rejects_loopback_even_when_cidr_contains_it() {
+        let error = resolve_management_target(&config("127.0.0.1", "127.0.0.0/8"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn accepts_allowlisted_private_address() {
+        let addresses = resolve_management_target(&config("192.168.88.1", "192.168.0.0/16"))
+            .await
+            .unwrap();
+        assert_eq!(addresses[0].ip().to_string(), "192.168.88.1");
+    }
 }

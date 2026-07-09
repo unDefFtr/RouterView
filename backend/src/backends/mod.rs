@@ -204,6 +204,10 @@ pub struct RouterConnectionConfig {
     pub username: String,
     pub password: String,
     pub accept_invalid_certs: bool,
+    /// Deployment allowlist for resolved management addresses.
+    pub management_cidrs: Vec<ipnet::IpNet>,
+    /// Explicit deployment opt-in for cleartext HTTP.
+    pub allow_insecure_http: bool,
 }
 
 /// Result from a connection test, returned by `RouterBackend::test_connection()`.

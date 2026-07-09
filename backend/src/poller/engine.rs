@@ -95,6 +95,8 @@ impl PollEngine {
                 username: cfg.router_username.clone(),
                 password: cfg.router_password.clone(),
                 accept_invalid_certs: cfg.accept_invalid_certs,
+                management_cidrs: cfg.router_management_cidrs.clone(),
+                allow_insecure_http: cfg.allow_insecure_router_http,
             };
             match connect_backend(&conn_config).await {
                 Ok(c) => {
@@ -194,6 +196,8 @@ impl PollEngine {
             username: cfg.router_username.clone(),
             password: cfg.router_password.clone(),
             accept_invalid_certs: cfg.accept_invalid_certs,
+            management_cidrs: cfg.router_management_cidrs.clone(),
+            allow_insecure_http: cfg.allow_insecure_router_http,
         };
         match connect_backend(&conn_config).await {
             Ok(c) => {

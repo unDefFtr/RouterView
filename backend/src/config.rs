@@ -1,5 +1,7 @@
 use std::env;
 
+use ipnet::IpNet;
+
 use crate::backends::RouterType;
 
 /// Application configuration loaded from environment variables.
@@ -23,6 +25,18 @@ pub struct Config {
     pub poll_interval_secs: u64,
     /// Backend server listen port
     pub server_port: u16,
+    /// Loopback-only setup listener port
+    pub setup_port: u16,
+    /// File used to deliver the one-time loopback setup token
+    pub setup_token_file: String,
+    /// Exact browser origin accepted for authenticated mutations
+    pub public_origin: String,
+    /// Path to the 256-bit key used to encrypt RouterOS credentials
+    pub master_key_file: String,
+    /// Networks in which RouterOS management targets may resolve
+    pub router_management_cidrs: Vec<IpNet>,
+    /// Explicit opt-in for cleartext RouterOS management traffic
+    pub allow_insecure_router_http: bool,
     /// Latency probe interval in seconds (separate from main poll)
     pub probe_interval_secs: u64,
     /// Path to the SQLite traffic history database
@@ -75,6 +89,36 @@ impl Config {
             }
         };
 
+        let allow_insecure_router_http = parse_bool_env("ALLOW_INSECURE_ROUTER_HTTP", false)?;
+        if scheme == "http" && !allow_insecure_router_http {
+            return Err(ConfigError::InvalidFormat(
+                "ROUTER_SCHEME=http requires ALLOW_INSECURE_ROUTER_HTTP=true".to_string(),
+            ));
+        }
+
+        let router_management_cidrs = env::var("ROUTER_MANAGEMENT_CIDRS")
+            .unwrap_or_else(|_| "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7".to_string())
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                value.parse::<IpNet>().map_err(|_| {
+                    ConfigError::InvalidFormat(format!(
+                        "ROUTER_MANAGEMENT_CIDRS contains invalid network '{value}'"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if router_management_cidrs.is_empty() {
+            return Err(ConfigError::InvalidFormat(
+                "ROUTER_MANAGEMENT_CIDRS must contain at least one network".to_string(),
+            ));
+        }
+
+        let public_origin = normalize_public_origin(
+            &env::var("PUBLIC_ORIGIN").unwrap_or_else(|_| "https://localhost".to_string()),
+        )?;
+
         Ok(Config {
             router_type,
             router_host: env_host("ROUTER_HOST", "ROUTEROS_HOST")
@@ -89,6 +133,15 @@ impl Config {
                 .unwrap_or(false),
             poll_interval_secs: parse_env::<u64>("POLL_INTERVAL_SECS", 3)?,
             server_port: parse_env::<u16>("SERVER_PORT", 3001)?,
+            setup_port: parse_env::<u16>("SETUP_PORT", 3002)?,
+            setup_token_file: env::var("SETUP_TOKEN_FILE")
+                .unwrap_or_else(|_| "/tmp/routerview-setup-token".to_string()),
+            public_origin,
+            master_key_file: env::var("ROUTERVIEW_MASTER_KEY_FILE").map_err(|_| {
+                ConfigError::MissingRequired("ROUTERVIEW_MASTER_KEY_FILE".to_string())
+            })?,
+            router_management_cidrs,
+            allow_insecure_router_http,
             probe_interval_secs: parse_env::<u64>("PROBE_INTERVAL_SECS", 60)?,
             db_path: env::var("DB_PATH").unwrap_or_else(|_| "traffic.db".to_string()),
             db_raw_retention_days: parse_env::<u64>("DB_RAW_RETENTION_DAYS", 7)?,
@@ -97,6 +150,29 @@ impl Config {
             latency_poor_ms: parse_env::<u64>("LATENCY_POOR_MS", 100)?,
         })
     }
+}
+
+fn normalize_public_origin(value: &str) -> Result<String, ConfigError> {
+    let parsed = url::Url::parse(value)
+        .map_err(|_| ConfigError::InvalidFormat("PUBLIC_ORIGIN must be an absolute URL".into()))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(ConfigError::InvalidFormat(
+            "PUBLIC_ORIGIN must contain only an http(s) scheme and authority".into(),
+        ));
+    }
+    if parsed.scheme() != "https" && parsed.host_str() != Some("localhost") {
+        return Err(ConfigError::InvalidFormat(
+            "PUBLIC_ORIGIN must use HTTPS except for localhost development".into(),
+        ));
+    }
+    Ok(parsed.origin().ascii_serialization())
 }
 
 /// Get an env var, checking the new name first, then the legacy name as fallback.
@@ -136,6 +212,18 @@ fn parse_env<T: std::str::FromStr>(key: &str, default: T) -> Result<T, ConfigErr
     }
 }
 
+fn parse_bool_env(key: &str, default: bool) -> Result<bool, ConfigError> {
+    match env::var(key) {
+        Ok(value) => match value.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" => Ok(true),
+            "0" | "false" | "no" => Ok(false),
+            _ => Err(ConfigError::InvalidFormat(key.to_string())),
+        },
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(ConfigError::EnvError(error)),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("Missing required environment variable: {0}")]
@@ -144,4 +232,32 @@ pub enum ConfigError {
     InvalidFormat(String),
     #[error("Environment variable error: {0}")]
     EnvError(#[from] std::env::VarError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_origin_is_canonicalized() {
+        assert_eq!(
+            normalize_public_origin("HTTPS://Example.COM:443/").unwrap(),
+            "https://example.com"
+        );
+        assert_eq!(
+            normalize_public_origin("https://Example.COM:8443").unwrap(),
+            "https://example.com:8443"
+        );
+        assert_eq!(
+            normalize_public_origin("http://LOCALHOST:80/").unwrap(),
+            "http://localhost"
+        );
+    }
+
+    #[test]
+    fn public_origin_rejects_non_origin_components() {
+        assert!(normalize_public_origin("https://example.com/app").is_err());
+        assert!(normalize_public_origin("https://user@example.com/").is_err());
+        assert!(normalize_public_origin("http://192.168.1.10/").is_err());
+    }
 }

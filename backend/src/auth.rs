@@ -1,0 +1,1119 @@
+use std::{
+    collections::HashMap,
+    fs::OpenOptions,
+    io::Write,
+    net::{IpAddr, SocketAddr},
+    path::Path as FsPath,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
+use argon2::{
+    password_hash::{
+        rand_core::OsRng as PasswordOsRng, PasswordHash, PasswordHasher, PasswordVerifier,
+        SaltString,
+    },
+    Algorithm, Argon2, Params, Version,
+};
+use axum::{
+    extract::{ConnectInfo, Request, State},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    middleware::Next,
+    response::{IntoResponse, Response},
+    Json,
+};
+use base64::Engine;
+use rand::{rngs::OsRng, RngCore};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+use crate::{
+    db::{AdminRecord, AuthSessionRecord, PairingRecord, TrafficDb},
+    error::{ApiJson, ApiPath, AppError},
+    state::AppState,
+};
+
+pub const SESSION_COOKIE: &str = "__Host-routerview_session";
+pub const CSRF_COOKIE: &str = "__Host-routerview_csrf";
+const STANDARD_IDLE_SECS: i64 = 12 * 60 * 60;
+const STANDARD_ABSOLUTE_SECS: i64 = 7 * 24 * 60 * 60;
+const FIXED_VIEWER_SECS: i64 = 180 * 24 * 60 * 60;
+const FIXED_ADMIN_SECS: i64 = 30 * 24 * 60 * 60;
+const PAIRING_SECS: i64 = 10 * 60;
+pub const SETUP_TOKEN_TTL_SECS: u64 = 15 * 60;
+const SETUP_SECS: i64 = SETUP_TOKEN_TTL_SECS as i64;
+const ARGON2_CONCURRENCY: usize = 2;
+const ARGON2_WAIT_TIMEOUT: Duration = Duration::from_millis(250);
+const HTTP_SESSION_TOUCH_SECS: i64 = 5 * 60;
+const LOGIN_FAILURE_CAPACITY: usize = 1_024;
+const LOGIN_FAILURE_TTL: Duration = Duration::from_secs(15 * 60);
+const LOGIN_BACKOFF_MAX_SECS: u64 = 60;
+
+/// Process-wide password verification limits and login timing state.
+pub struct AuthSecurity {
+    argon2_slots: Arc<Semaphore>,
+    dummy_password_hash: String,
+    login_failures: LoginFailureLimiter,
+}
+
+impl AuthSecurity {
+    pub fn new() -> Result<Self, AppError> {
+        Ok(Self {
+            argon2_slots: Arc::new(Semaphore::new(ARGON2_CONCURRENCY)),
+            dummy_password_hash: hash_password_sync(&random_token())?,
+            login_failures: LoginFailureLimiter::default(),
+        })
+    }
+
+    async fn acquire_argon2(&self) -> Result<OwnedSemaphorePermit, AppError> {
+        match tokio::time::timeout(
+            ARGON2_WAIT_TIMEOUT,
+            self.argon2_slots.clone().acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(_)) => Err(AppError::Internal(
+                "password verification semaphore is closed".into(),
+            )),
+            Err(_) => Err(AppError::RateLimited {
+                retry_after_secs: 1,
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum LoginFailureKey {
+    Username(String),
+    Source(IpAddr),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LoginFailureState {
+    failures: u8,
+    blocked_until: Instant,
+    last_seen: Instant,
+}
+
+#[derive(Default)]
+struct LoginFailureLimiter {
+    entries: Mutex<HashMap<LoginFailureKey, LoginFailureState>>,
+}
+
+impl LoginFailureLimiter {
+    fn retry_after(&self, key: &LoginFailureKey, now: Instant) -> Option<u64> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let state = entries.get_mut(key)?;
+        if now.saturating_duration_since(state.last_seen) >= LOGIN_FAILURE_TTL {
+            entries.remove(key);
+            return None;
+        }
+        state.last_seen = now;
+        (state.blocked_until > now).then(|| retry_after_seconds(state.blocked_until, now))
+    }
+
+    fn record_failure(&self, key: LoginFailureKey, now: Instant) -> u64 {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        entries
+            .retain(|_, state| now.saturating_duration_since(state.last_seen) < LOGIN_FAILURE_TTL);
+
+        if !entries.contains_key(&key) && entries.len() >= LOGIN_FAILURE_CAPACITY {
+            if let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, state)| state.last_seen)
+                .map(|(key, _)| key.clone())
+            {
+                entries.remove(&oldest);
+            }
+        }
+
+        let state = entries.entry(key).or_insert(LoginFailureState {
+            failures: 0,
+            blocked_until: now,
+            last_seen: now,
+        });
+        state.failures = state.failures.saturating_add(1).min(7);
+        let backoff_secs = (1_u64 << (state.failures - 1)).min(LOGIN_BACKOFF_MAX_SECS);
+        state.blocked_until = now + Duration::from_secs(backoff_secs);
+        state.last_seen = now;
+        backoff_secs
+    }
+
+    fn clear(&self, key: &LoginFailureKey) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(key);
+    }
+}
+
+fn retry_after_seconds(blocked_until: Instant, now: Instant) -> u64 {
+    let remaining = blocked_until.saturating_duration_since(now);
+    remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0)
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionContext {
+    pub id: String,
+    pub username: String,
+    pub role: String,
+    pub kind: String,
+    pub csrf_hash: Vec<u8>,
+}
+
+impl SessionContext {
+    pub fn is_admin(&self) -> bool {
+        self.role == "admin"
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoginRequest {
+    username: String,
+    password: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetupRequest {
+    token: String,
+    username: String,
+    password: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreatePairingRequest {
+    label: String,
+    role: String,
+    #[serde(default)]
+    password: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PairRequest {
+    code: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuthStatusResponse {
+    pub setup_required: bool,
+    pub authenticated: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MeResponse {
+    pub username: String,
+    pub role: String,
+    pub session_kind: String,
+    pub capabilities: Vec<&'static str>,
+}
+
+pub async fn require_auth(
+    State(state): State<Arc<AppState>>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, AppError> {
+    let session = authenticate_headers(&state.traffic_db, request.headers())?
+        .ok_or(AppError::Unauthorized)?;
+
+    let path = request.uri().path();
+    let is_websocket = path == "/ws";
+    let is_mutation = !matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS
+    );
+    if is_websocket || is_mutation {
+        validate_origin(request.headers(), &state.public_origin)?;
+    }
+    if is_mutation {
+        validate_csrf(request.headers(), &session.csrf_hash)?;
+        if !session.is_admin() && path != "/api/auth/logout" {
+            return Err(AppError::Forbidden(
+                "viewer sessions cannot modify application state".into(),
+            ));
+        }
+    }
+
+    let now = unix_time();
+    let active = if is_websocket {
+        state.traffic_db.session_is_active(
+            &session.id,
+            &session.username,
+            &session.role,
+            &session.kind,
+            now,
+        )?
+    } else {
+        state.traffic_db.touch_session_if_active_throttled(
+            &session.id,
+            &session.username,
+            &session.role,
+            &session.kind,
+            now,
+            HTTP_SESSION_TOUCH_SECS,
+        )?
+    };
+    if !active {
+        return Err(AppError::Unauthorized);
+    }
+    request.extensions_mut().insert(session);
+    Ok(next.run(request).await)
+}
+
+pub fn revalidate_session(db: &TrafficDb, session: &SessionContext) -> Result<bool, AppError> {
+    Ok(db.session_is_active(
+        &session.id,
+        &session.username,
+        &session.role,
+        &session.kind,
+        unix_time(),
+    )?)
+}
+
+pub async fn health() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+pub async fn status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<AuthStatusResponse>, AppError> {
+    Ok(Json(AuthStatusResponse {
+        setup_required: state.traffic_db.admin()?.is_none(),
+        authenticated: authenticate_headers(&state.traffic_db, &headers)?.is_some(),
+    }))
+}
+
+pub async fn login(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(connection): ConnectInfo<SocketAddr>,
+    ApiJson(body): ApiJson<LoginRequest>,
+) -> Result<Response, AppError> {
+    let username = login_key_username(&body.username);
+    let failure_keys = [
+        LoginFailureKey::Username(username.clone()),
+        LoginFailureKey::Source(connection.ip()),
+    ];
+    if let Some(retry_after_secs) = failure_keys
+        .iter()
+        .filter_map(|key| {
+            state
+                .auth_security
+                .login_failures
+                .retry_after(key, Instant::now())
+        })
+        .max()
+    {
+        return Err(AppError::RateLimited { retry_after_secs });
+    }
+
+    let admin = state.traffic_db.admin()?;
+    let (encoded_hash, username_matches) = password_hash_for_login(
+        admin.as_ref(),
+        &username,
+        &state.auth_security.dummy_password_hash,
+    );
+    let permit = state.auth_security.acquire_argon2().await?;
+    let password_is_bounded = body.password.len() <= 128;
+    let password = if password_is_bounded {
+        body.password
+    } else {
+        "invalid-password-input".to_string()
+    };
+    let password_matches = verify_password(password, encoded_hash).await?;
+    drop(permit);
+
+    if !username_matches || !password_matches || !password_is_bounded {
+        for key in failure_keys {
+            state
+                .auth_security
+                .login_failures
+                .record_failure(key, Instant::now());
+        }
+        return Err(AppError::Unauthorized);
+    }
+    let admin = admin.ok_or_else(|| {
+        AppError::Internal("administrator record disappeared during authentication".into())
+    })?;
+
+    let (session, token, csrf) = new_session(
+        &admin.username,
+        "admin",
+        "standard",
+        None,
+        STANDARD_ABSOLUTE_SECS,
+    );
+    if !state
+        .traffic_db
+        .insert_standard_session_if_admin_version(&session, admin.credential_version)?
+    {
+        return Err(AppError::Unauthorized);
+    }
+    for key in &failure_keys {
+        state.auth_security.login_failures.clear(key);
+    }
+    session_response(&session, &token, &csrf)
+}
+
+pub async fn logout(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(session): axum::Extension<SessionContext>,
+) -> Result<Response, AppError> {
+    state.traffic_db.revoke_session(&session.id, unix_time())?;
+    let mut headers = HeaderMap::new();
+    append_clear_cookies(&mut headers)?;
+    Ok((StatusCode::NO_CONTENT, headers).into_response())
+}
+
+pub async fn me(axum::Extension(session): axum::Extension<SessionContext>) -> Json<MeResponse> {
+    Json(me_for(&session))
+}
+
+pub async fn list_sessions(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(session): axum::Extension<SessionContext>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_admin_session(&session)?;
+    let now = unix_time();
+    let sessions: Vec<_> = state
+        .traffic_db
+        .list_sessions()?
+        .into_iter()
+        .map(|session| {
+            serde_json::json!({
+                "id": session.id,
+                "username": session.username,
+                "role": session.role,
+                "session_kind": session.kind,
+                "label": session.label,
+                "created_at": session.created_at,
+                "last_seen_at": session.last_seen_at,
+                "expires_at": session.absolute_expires_at,
+                "active": session.revoked_at.is_none()
+                    && session.absolute_expires_at > now
+                    && session.idle_expires_at.is_none_or(|expiry| expiry > now),
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "sessions": sessions })))
+}
+
+fn require_admin_session(session: &SessionContext) -> Result<(), AppError> {
+    if session.is_admin() {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(
+            "administrator capability is required".into(),
+        ))
+    }
+}
+
+pub async fn revoke_session(
+    State(state): State<Arc<AppState>>,
+    ApiPath(id): ApiPath<String>,
+) -> Result<StatusCode, AppError> {
+    if state.traffic_db.revoke_session(&id, unix_time())? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::InvalidData("unknown or revoked session".into()))
+    }
+}
+
+pub async fn create_pairing(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(session): axum::Extension<SessionContext>,
+    ApiJson(body): ApiJson<CreatePairingRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let label = body.label.trim();
+    if label.is_empty() || label.len() > 80 {
+        return Err(AppError::InvalidData(
+            "pairing label must contain 1 to 80 characters".into(),
+        ));
+    }
+    if !matches!(body.role.as_str(), "viewer" | "admin") {
+        return Err(AppError::InvalidData(
+            "pairing role must be viewer or admin".into(),
+        ));
+    }
+    let expected_credential_version = if body.role == "admin" {
+        let admin = state.traffic_db.admin()?.ok_or(AppError::Unauthorized)?;
+        let password = body.password.ok_or_else(|| {
+            AppError::InvalidData("password is required for an admin pairing".into())
+        })?;
+        if password.len() > 128 {
+            return Err(AppError::Unauthorized);
+        }
+        let permit = state.auth_security.acquire_argon2().await?;
+        let verified = verify_password(password, admin.password_hash).await?;
+        drop(permit);
+        if !verified {
+            return Err(AppError::Unauthorized);
+        }
+        Some(admin.credential_version)
+    } else {
+        None
+    };
+
+    let code = random_token();
+    let now = unix_time();
+    let pairing = PairingRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        role: body.role,
+        label: label.to_string(),
+        expires_at: now + PAIRING_SECS,
+    };
+    let inserted = state.traffic_db.insert_pairing_if_authorized(
+        &pairing,
+        &hash_token(&code),
+        &session.id,
+        &session.username,
+        &session.role,
+        &session.kind,
+        now,
+        expected_credential_version,
+    )?;
+    if !inserted {
+        return Err(AppError::Unauthorized);
+    }
+    Ok(Json(serde_json::json!({
+        "code": code,
+        "expires_at": pairing.expires_at,
+        "role": pairing.role,
+        "label": pairing.label,
+    })))
+}
+
+pub async fn pair(
+    State(state): State<Arc<AppState>>,
+    ApiJson(body): ApiJson<PairRequest>,
+) -> Result<Response, AppError> {
+    let token = random_token();
+    let csrf = random_token();
+    let session = state
+        .traffic_db
+        .consume_pairing_and_insert_session(
+            &hash_token(body.code.trim()),
+            unix_time(),
+            &uuid::Uuid::new_v4().to_string(),
+            &hash_token(&token),
+            &hash_token(&csrf),
+            FIXED_VIEWER_SECS,
+            FIXED_ADMIN_SECS,
+        )?
+        .ok_or(AppError::Unauthorized)?;
+    session_response(&session, &token, &csrf)
+}
+
+pub async fn setup(
+    State(state): State<Arc<AppState>>,
+    ApiJson(body): ApiJson<SetupRequest>,
+) -> Result<StatusCode, AppError> {
+    if state.traffic_db.admin()?.is_some() {
+        return Err(AppError::Conflict(
+            "initial setup has already been completed".into(),
+        ));
+    }
+    let username = normalize_username(&body.username)?;
+    validate_password(&body.password)?;
+    let password_hash = hash_password(body.password).await?;
+    let consumed = state.traffic_db.consume_setup_and_create_admin(
+        &hash_token(body.token.trim()),
+        unix_time(),
+        &username,
+        &password_hash,
+    )?;
+    if !consumed {
+        return Err(AppError::Unauthorized);
+    }
+    if let Err(error) = remove_setup_token_file(&state.setup_token_path) {
+        tracing::error!(%error, "administrator created but setup token cleanup failed");
+    }
+    Ok(StatusCode::CREATED)
+}
+
+pub fn issue_setup_token(db: &TrafficDb, path: &FsPath) -> Result<bool, AppError> {
+    if db.admin()?.is_some() {
+        remove_setup_token_file(path)?;
+        return Ok(false);
+    }
+    let token = random_token();
+    db.store_setup_token(&hash_token(&token), unix_time() + SETUP_SECS)?;
+    write_setup_token_file(path, &token)?;
+    Ok(true)
+}
+
+fn write_setup_token_file(path: &FsPath, token: &str) -> Result<(), AppError> {
+    let parent = path.parent().ok_or_else(|| {
+        AppError::Internal("setup token path must have a parent directory".into())
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| AppError::Internal("setup token path must have a valid file name".into()))?;
+    let temporary_path = parent.join(format!(
+        ".{file_name}.{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+
+    let write_result = (|| -> Result<(), std::io::Error> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temporary_path)?;
+        file.write_all(token.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        std::fs::rename(&temporary_path, path)?;
+        Ok(())
+    })();
+
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&temporary_path);
+        return Err(AppError::Internal(format!(
+            "failed to write setup token file: {error}"
+        )));
+    }
+    Ok(())
+}
+
+pub fn remove_setup_token_file(path: &FsPath) -> Result<(), AppError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(AppError::Internal(format!(
+            "failed to remove setup token file: {error}"
+        ))),
+    }
+}
+
+pub fn create_admin_from_cli(
+    db: &TrafficDb,
+    username: &str,
+    password: &str,
+    replace: bool,
+) -> Result<(), AppError> {
+    let username = normalize_username(username)?;
+    validate_password(password)?;
+    let password_hash = hash_password_sync(password)?;
+    if replace {
+        if db.admin()?.is_none() {
+            return Err(AppError::InvalidData(
+                "cannot reset an administrator before setup".into(),
+            ));
+        }
+        db.replace_admin_password(&username, &password_hash)?;
+    } else {
+        db.create_admin(&username, &password_hash)
+            .map_err(|error| {
+                if matches!(error, rusqlite::Error::SqliteFailure(_, _)) {
+                    AppError::Conflict("an administrator already exists".into())
+                } else {
+                    AppError::Database(error)
+                }
+            })?;
+    }
+    Ok(())
+}
+
+fn authenticate_headers(
+    db: &TrafficDb,
+    headers: &HeaderMap,
+) -> Result<Option<SessionContext>, AppError> {
+    let Some(token) = cookie_value(headers, SESSION_COOKIE) else {
+        return Ok(None);
+    };
+    let Some(session) = db.session_by_token_hash(&hash_token(token))? else {
+        return Ok(None);
+    };
+    let now = unix_time();
+    let expired = session.revoked_at.is_some()
+        || session.absolute_expires_at <= now
+        || session.idle_expires_at.is_some_and(|expiry| expiry <= now);
+    if expired {
+        if session.revoked_at.is_none() {
+            let _ = db.revoke_session(&session.id, now);
+        }
+        return Ok(None);
+    }
+    Ok(Some(SessionContext {
+        id: session.id,
+        username: session.username,
+        role: session.role,
+        kind: session.kind,
+        csrf_hash: session.csrf_hash,
+    }))
+}
+
+fn validate_origin(headers: &HeaderMap, public_origin: &str) -> Result<(), AppError> {
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| AppError::Forbidden("missing Origin header".into()))?;
+    if origin != public_origin {
+        return Err(AppError::Forbidden("request origin is not allowed".into()));
+    }
+    Ok(())
+}
+
+fn validate_csrf(headers: &HeaderMap, expected_hash: &[u8]) -> Result<(), AppError> {
+    let mut header_values = headers.get_all("x-csrf-token").iter();
+    let header_token = header_values
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::Forbidden("missing CSRF token".into()))?;
+    if header_values.next().is_some() {
+        return Err(AppError::Forbidden("invalid CSRF token".into()));
+    }
+
+    let mut cookie_tokens = cookie_values(headers, CSRF_COOKIE);
+    let cookie_token = cookie_tokens
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::Forbidden("missing CSRF cookie".into()))?;
+    if cookie_tokens.next().is_some() {
+        return Err(AppError::Forbidden("invalid CSRF token".into()));
+    }
+
+    let header_hash = hash_token(header_token);
+    let cookie_hash = hash_token(cookie_token);
+    if !constant_time_eq(&header_hash, &cookie_hash)
+        || !constant_time_eq(&header_hash, expected_hash)
+    {
+        return Err(AppError::Forbidden("invalid CSRF token".into()));
+    }
+    Ok(())
+}
+
+fn new_session(
+    username: &str,
+    role: &str,
+    kind: &str,
+    label: Option<String>,
+    lifetime: i64,
+) -> (AuthSessionRecord, String, String) {
+    let token = random_token();
+    let csrf = random_token();
+    let now = unix_time();
+    (
+        AuthSessionRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            token_hash: hash_token(&token),
+            csrf_hash: hash_token(&csrf),
+            username: username.to_string(),
+            role: role.to_string(),
+            kind: kind.to_string(),
+            label,
+            created_at: now,
+            last_seen_at: now,
+            idle_expires_at: (kind == "standard").then_some(now + STANDARD_IDLE_SECS),
+            absolute_expires_at: now + lifetime,
+            revoked_at: None,
+        },
+        token,
+        csrf,
+    )
+}
+
+fn session_response(
+    session: &AuthSessionRecord,
+    token: &str,
+    csrf: &str,
+) -> Result<Response, AppError> {
+    let mut headers = HeaderMap::new();
+    let max_age = session.absolute_expires_at.saturating_sub(unix_time());
+    append_cookie(
+        &mut headers,
+        &format!(
+            "{SESSION_COOKIE}={token}; Path=/; Max-Age={max_age}; Secure; HttpOnly; SameSite=Strict"
+        ),
+    )?;
+    append_cookie(
+        &mut headers,
+        &format!("{CSRF_COOKIE}={csrf}; Path=/; Max-Age={max_age}; Secure; SameSite=Strict"),
+    )?;
+    let context = SessionContext {
+        id: session.id.clone(),
+        username: session.username.clone(),
+        role: session.role.clone(),
+        kind: session.kind.clone(),
+        csrf_hash: session.csrf_hash.clone(),
+    };
+    Ok((headers, Json(me_for(&context))).into_response())
+}
+
+fn me_for(session: &SessionContext) -> MeResponse {
+    let capabilities = if session.is_admin() {
+        vec!["read", "configure", "manage_devices", "manage_sessions"]
+    } else {
+        vec!["read"]
+    };
+    MeResponse {
+        username: session.username.clone(),
+        role: session.role.clone(),
+        session_kind: session.kind.clone(),
+        capabilities,
+    }
+}
+
+fn append_clear_cookies(headers: &mut HeaderMap) -> Result<(), AppError> {
+    append_cookie(
+        headers,
+        &format!("{SESSION_COOKIE}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict"),
+    )?;
+    append_cookie(
+        headers,
+        &format!("{CSRF_COOKIE}=; Path=/; Max-Age=0; Secure; SameSite=Strict"),
+    )
+}
+
+fn append_cookie(headers: &mut HeaderMap, value: &str) -> Result<(), AppError> {
+    headers.append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(value)
+            .map_err(|_| AppError::Internal("failed to create session cookie".into()))?,
+    );
+    Ok(())
+}
+
+fn cookie_value<'a>(headers: &'a HeaderMap, name: &'a str) -> Option<&'a str> {
+    cookie_values(headers, name).next()
+}
+
+fn cookie_values<'a>(headers: &'a HeaderMap, name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|cookie| cookie.trim().split_once('='))
+        .filter_map(move |(key, value)| (key == name).then_some(value))
+}
+
+fn random_token() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn hash_token(token: &str) -> Vec<u8> {
+    Sha256::digest(token.as_bytes()).to_vec()
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = left.len() ^ right.len();
+    for index in 0..left.len().max(right.len()) {
+        let left_byte = left.get(index).copied().unwrap_or(0);
+        let right_byte = right.get(index).copied().unwrap_or(0);
+        difference |= usize::from(left_byte ^ right_byte);
+    }
+    difference == 0
+}
+
+fn login_key_username(value: &str) -> String {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.len() <= 64
+        && normalized.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+        })
+    {
+        normalized
+    } else {
+        let digest = Sha256::digest(normalized.as_bytes());
+        format!(
+            "invalid:{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+        )
+    }
+}
+
+fn password_hash_for_login(
+    admin: Option<&AdminRecord>,
+    username: &str,
+    dummy_password_hash: &str,
+) -> (String, bool) {
+    match admin {
+        Some(admin) if constant_time_eq(admin.username.as_bytes(), username.as_bytes()) => {
+            (admin.password_hash.clone(), true)
+        }
+        _ => (dummy_password_hash.to_string(), false),
+    }
+}
+
+fn argon2() -> Result<Argon2<'static>, AppError> {
+    let params = Params::new(64 * 1024, 3, 1, None)
+        .map_err(|_| AppError::Internal("invalid password hashing parameters".into()))?;
+    Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
+}
+
+fn hash_password_sync(password: &str) -> Result<String, AppError> {
+    let salt = SaltString::generate(&mut PasswordOsRng);
+    argon2()?
+        .hash_password(password.as_bytes(), &salt)
+        .map(|hash| hash.to_string())
+        .map_err(|_| AppError::Internal("password hashing failed".into()))
+}
+
+async fn hash_password(password: String) -> Result<String, AppError> {
+    tokio::task::spawn_blocking(move || hash_password_sync(&password))
+        .await
+        .map_err(|_| AppError::Internal("password hashing task failed".into()))?
+}
+
+async fn verify_password(password: String, encoded: String) -> Result<bool, AppError> {
+    tokio::task::spawn_blocking(move || {
+        let parsed = PasswordHash::new(&encoded)
+            .map_err(|_| AppError::Internal("stored password hash is invalid".into()))?;
+        Ok(argon2()?
+            .verify_password(password.as_bytes(), &parsed)
+            .is_ok())
+    })
+    .await
+    .map_err(|_| AppError::Internal("password verification task failed".into()))?
+}
+
+fn normalize_username(value: &str) -> Result<String, AppError> {
+    let value = value.trim().to_ascii_lowercase();
+    if !(3..=64).contains(&value.len())
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+        })
+    {
+        return Err(AppError::InvalidData(
+            "username must be 3 to 64 lowercase ASCII letters, digits, '.', '_' or '-'".into(),
+        ));
+    }
+    Ok(value)
+}
+
+fn validate_password(value: &str) -> Result<(), AppError> {
+    if !(12..=128).contains(&value.as_bytes().len()) {
+        return Err(AppError::InvalidData(
+            "password must be 12 to 128 UTF-8 bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn unix_time() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn login_key(username: &str) -> LoginFailureKey {
+        LoginFailureKey::Username(username.to_string())
+    }
+
+    #[test]
+    fn validates_admin_identifiers() {
+        assert_eq!(normalize_username(" Admin.User ").unwrap(), "admin.user");
+        assert!(normalize_username("no spaces").is_err());
+        assert!(validate_password("short").is_err());
+        assert!(validate_password("a sufficiently long password").is_ok());
+    }
+
+    #[test]
+    fn cookies_are_parsed_by_exact_name() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("other=x; __Host-routerview_session=abc123"),
+        );
+        assert_eq!(cookie_value(&headers, SESSION_COOKIE), Some("abc123"));
+    }
+
+    #[test]
+    fn csrf_requires_one_matching_header_and_cookie() {
+        let token = "csrf-token";
+        let expected_hash = hash_token(token);
+        let mut valid = HeaderMap::new();
+        valid.insert("x-csrf-token", HeaderValue::from_static(token));
+        valid.insert(
+            header::COOKIE,
+            HeaderValue::from_static("other=x; __Host-routerview_csrf=csrf-token"),
+        );
+        assert!(validate_csrf(&valid, &expected_hash).is_ok());
+
+        let mut missing_header = HeaderMap::new();
+        missing_header.insert(
+            header::COOKIE,
+            HeaderValue::from_static("__Host-routerview_csrf=csrf-token"),
+        );
+        assert!(validate_csrf(&missing_header, &expected_hash).is_err());
+
+        let mut missing_cookie = HeaderMap::new();
+        missing_cookie.insert("x-csrf-token", HeaderValue::from_static(token));
+        assert!(validate_csrf(&missing_cookie, &expected_hash).is_err());
+
+        let mut mismatch = valid.clone();
+        mismatch.insert(
+            header::COOKIE,
+            HeaderValue::from_static("__Host-routerview_csrf=different"),
+        );
+        assert!(validate_csrf(&mismatch, &expected_hash).is_err());
+
+        let mut repeated_header = valid.clone();
+        repeated_header.append("x-csrf-token", HeaderValue::from_static(token));
+        assert!(validate_csrf(&repeated_header, &expected_hash).is_err());
+
+        let mut repeated_cookie = valid;
+        repeated_cookie.insert(
+            header::COOKIE,
+            HeaderValue::from_static(
+                "__Host-routerview_csrf=csrf-token; __Host-routerview_csrf=csrf-token",
+            ),
+        );
+        assert!(validate_csrf(&repeated_cookie, &expected_hash).is_err());
+    }
+
+    #[test]
+    fn login_failures_back_off_and_remain_bounded() {
+        let limiter = LoginFailureLimiter::default();
+        let now = Instant::now();
+        let key = login_key("admin");
+
+        assert_eq!(limiter.retry_after(&key, now), None);
+        assert_eq!(limiter.record_failure(key.clone(), now), 1);
+        assert_eq!(limiter.retry_after(&key, now), Some(1));
+        assert_eq!(
+            limiter.record_failure(key.clone(), now + Duration::from_secs(1)),
+            2
+        );
+        assert_eq!(
+            limiter.retry_after(&key, now + Duration::from_secs(1)),
+            Some(2)
+        );
+
+        for index in 0..(LOGIN_FAILURE_CAPACITY + 25) {
+            limiter.record_failure(login_key(&format!("user-{index}")), now);
+        }
+        assert_eq!(
+            limiter
+                .entries
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .len(),
+            LOGIN_FAILURE_CAPACITY
+        );
+    }
+
+    #[test]
+    fn source_backoff_cannot_be_bypassed_by_rotating_usernames() {
+        let limiter = LoginFailureLimiter::default();
+        let now = Instant::now();
+        let source = LoginFailureKey::Source("192.0.2.10".parse().unwrap());
+        limiter.record_failure(source.clone(), now);
+        assert_eq!(limiter.retry_after(&source, now), Some(1));
+    }
+
+    #[test]
+    fn unknown_username_selects_the_dummy_hash() {
+        let admin = AdminRecord {
+            username: "admin".into(),
+            password_hash: "real-hash".into(),
+            credential_version: 1,
+        };
+        assert_eq!(
+            password_hash_for_login(Some(&admin), "unknown", "dummy-hash"),
+            ("dummy-hash".into(), false)
+        );
+        assert_eq!(
+            password_hash_for_login(Some(&admin), "admin", "dummy-hash"),
+            ("real-hash".into(), true)
+        );
+    }
+
+    #[tokio::test]
+    async fn argon2_gate_waits_fairly_and_bounds_queue_time() {
+        let security = Arc::new(AuthSecurity {
+            argon2_slots: Arc::new(Semaphore::new(ARGON2_CONCURRENCY)),
+            dummy_password_hash: String::new(),
+            login_failures: LoginFailureLimiter::default(),
+        });
+        let first = security.acquire_argon2().await.unwrap();
+        let second = security.acquire_argon2().await.unwrap();
+        let waiting_security = security.clone();
+        let waiter = tokio::spawn(async move { waiting_security.acquire_argon2().await });
+        tokio::task::yield_now().await;
+        drop(first);
+        let third = waiter.await.unwrap().unwrap();
+
+        let started = Instant::now();
+        assert!(matches!(
+            security.acquire_argon2().await,
+            Err(AppError::RateLimited {
+                retry_after_secs: 1
+            })
+        ));
+        assert!(started.elapsed() >= ARGON2_WAIT_TIMEOUT);
+        drop((second, third));
+        assert!(security.acquire_argon2().await.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_token_file_is_private_and_removable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "routerview-setup-token-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        write_setup_token_file(&path, "one-time-secret").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one-time-secret\n");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        remove_setup_token_file(&path).unwrap();
+        assert!(!path.exists());
+        remove_setup_token_file(&path).unwrap();
+    }
+
+    #[test]
+    fn password_hash_uses_argon2id_and_verifies() {
+        let hash = hash_password_sync("correct horse battery staple").unwrap();
+        assert!(hash.starts_with("$argon2id$v=19$m=65536,t=3,p=1$"));
+        let parsed = PasswordHash::new(&hash).unwrap();
+        assert!(argon2()
+            .unwrap()
+            .verify_password(b"correct horse battery staple", &parsed)
+            .is_ok());
+    }
+
+    #[test]
+    fn viewer_cannot_use_administrator_capabilities() {
+        let viewer = SessionContext {
+            id: "viewer-session".into(),
+            username: "admin".into(),
+            role: "viewer".into(),
+            kind: "fixed".into(),
+            csrf_hash: vec![0; 32],
+        };
+        assert!(matches!(
+            require_admin_session(&viewer),
+            Err(AppError::Forbidden(_))
+        ));
+    }
+}

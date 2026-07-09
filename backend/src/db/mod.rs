@@ -1,10 +1,12 @@
 use chrono::{Datelike, Timelike};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tracing::{info, warn};
+
+use crate::secrets::EncryptedSecret;
 
 /// Traffic data point as returned by queries (from either raw or aggregated table).
 #[derive(Debug, Clone)]
@@ -35,6 +37,39 @@ pub struct ProbeTargetRow {
     pub sort_order: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct AdminRecord {
+    pub username: String,
+    pub password_hash: String,
+    pub credential_version: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AuthSessionRecord {
+    pub id: String,
+    #[serde(skip_serializing)]
+    pub token_hash: Vec<u8>,
+    #[serde(skip_serializing)]
+    pub csrf_hash: Vec<u8>,
+    pub username: String,
+    pub role: String,
+    pub kind: String,
+    pub label: Option<String>,
+    pub created_at: i64,
+    pub last_seen_at: i64,
+    pub idle_expires_at: Option<i64>,
+    pub absolute_expires_at: i64,
+    pub revoked_at: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PairingRecord {
+    pub id: String,
+    pub role: String,
+    pub label: String,
+    pub expires_at: i64,
+}
+
 /// A simple SQLite-backed store for traffic history and device overrides.
 ///
 /// Thread-safe via a Mutex — writes are infrequent (every poll tick),
@@ -52,8 +87,15 @@ impl TrafficDb {
 
         let conn = Connection::open(path)?;
 
-        // Enable WAL mode for better concurrent read/write performance.
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+        // Enable WAL mode for better concurrent read/write performance. Secure
+        // deletion is required because legacy releases stored credentials in
+        // the config table.
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA secure_delete=ON;
+             PRAGMA foreign_keys=ON;",
+        )?;
 
         // Raw 5-second data — composite PK (ts, wan_name) so per-WAN
         // and aggregate rows can coexist at the same timestamp.
@@ -94,6 +136,8 @@ impl TrafficDb {
             )",
             [],
         )?;
+
+        migrate_security_schema(&conn)?;
 
         // User-assigned device name/type overrides
         conn.execute(
@@ -727,46 +771,642 @@ impl TrafficDb {
     // ── Config Store ────────────────────────────────────────────
 
     /// Set a config key/value (INSERT OR REPLACE).
-    pub fn set_config(&self, key: &str, value: &str) {
-        let conn = match self.conn.lock() {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("TrafficDB lock poisoned during set_config: {e}");
-                return;
-            }
-        };
-        if let Err(e) = conn.execute(
+    pub fn set_config(&self, key: &str, value: &str) -> Result<(), rusqlite::Error> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        conn.execute(
             "INSERT OR REPLACE INTO config (key, value) VALUES (?1, ?2)",
             params![key, value],
-        ) {
-            warn!("TrafficDB set_config failed: {e}");
-        }
+        )?;
+        Ok(())
     }
 
     /// Get all config entries as a HashMap.
-    pub fn get_all_config(&self) -> HashMap<String, String> {
-        let conn = match self.conn.lock() {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("TrafficDB lock poisoned during get_all_config: {e}");
-                return HashMap::new();
-            }
-        };
-        let mut stmt = match conn.prepare("SELECT key, value FROM config") {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("TrafficDB prepare config query failed: {e}");
-                return HashMap::new();
-            }
-        };
-        stmt.query_map([], |row| {
+    pub fn get_all_config(&self) -> Result<HashMap<String, String>, rusqlite::Error> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let mut stmt = conn.prepare("SELECT key, value FROM config")?;
+        let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .ok()
-        .into_iter()
-        .flat_map(|r| r.filter_map(|x| x.ok()))
-        .collect()
+        })?;
+        rows.collect()
     }
+
+    pub fn instance_id(&self) -> Result<String, rusqlite::Error> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let tx = conn.transaction()?;
+        let existing = tx
+            .query_row(
+                "SELECT value FROM config WHERE key = 'instance_id'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let instance_id = existing.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        tx.execute(
+            "INSERT OR IGNORE INTO config(key, value) VALUES ('instance_id', ?1)",
+            params![instance_id],
+        )?;
+        tx.commit()?;
+        Ok(instance_id)
+    }
+
+    pub fn load_secret(&self, name: &str) -> Result<Option<EncryptedSecret>, rusqlite::Error> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        conn.query_row(
+            "SELECT ciphertext, nonce, key_id FROM encrypted_secrets WHERE name = ?1",
+            params![name],
+            |row| {
+                Ok(EncryptedSecret {
+                    ciphertext: row.get(0)?,
+                    nonce: row.get(1)?,
+                    key_id: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+    }
+
+    pub fn save_config_transaction(
+        &self,
+        values: &[(String, String)],
+        secret: Option<(&str, &EncryptedSecret)>,
+        delete_secret: Option<&str>,
+        expected_revision: Option<u64>,
+    ) -> Result<bool, rusqlite::Error> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let tx = conn.transaction()?;
+        let current_revision = tx
+            .query_row(
+                "SELECT value FROM config WHERE key = 'config_revision'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        if expected_revision.is_some_and(|expected| expected != current_revision) {
+            tx.rollback()?;
+            return Ok(false);
+        }
+        for (key, value) in values {
+            tx.execute(
+                "INSERT OR REPLACE INTO config(key, value) VALUES (?1, ?2)",
+                params![key, value],
+            )?;
+        }
+        if let Some((name, encrypted)) = secret {
+            tx.execute(
+                "INSERT INTO encrypted_secrets(name, ciphertext, nonce, key_id, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, unixepoch())
+                 ON CONFLICT(name) DO UPDATE SET
+                    ciphertext = excluded.ciphertext,
+                    nonce = excluded.nonce,
+                    key_id = excluded.key_id,
+                    updated_at = excluded.updated_at",
+                params![
+                    name,
+                    encrypted.ciphertext,
+                    encrypted.nonce,
+                    encrypted.key_id
+                ],
+            )?;
+        }
+        if let Some(name) = delete_secret {
+            tx.execute(
+                "DELETE FROM encrypted_secrets WHERE name = ?1",
+                params![name],
+            )?;
+        }
+        if expected_revision.is_some() {
+            tx.execute(
+                "INSERT OR REPLACE INTO config(key, value) VALUES ('config_revision', ?1)",
+                params![current_revision.saturating_add(1).to_string()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub fn migrate_plaintext_router_password(
+        &self,
+        encrypted: &EncryptedSecret,
+    ) -> Result<(), rusqlite::Error> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        conn.execute_batch(
+            "PRAGMA wal_checkpoint(TRUNCATE);
+             PRAGMA journal_mode=DELETE;
+             PRAGMA synchronous=FULL;
+             PRAGMA secure_delete=ON;",
+        )?;
+
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO encrypted_secrets(name, ciphertext, nonce, key_id, updated_at)
+             VALUES ('router_password', ?1, ?2, ?3, unixepoch())
+             ON CONFLICT(name) DO UPDATE SET
+                ciphertext = excluded.ciphertext,
+                nonce = excluded.nonce,
+                key_id = excluded.key_id,
+                updated_at = excluded.updated_at",
+            params![encrypted.ciphertext, encrypted.nonce, encrypted.key_id],
+        )?;
+
+        let stored: (Vec<u8>, Vec<u8>, String) = tx.query_row(
+            "SELECT ciphertext, nonce, key_id
+             FROM encrypted_secrets WHERE name = 'router_password'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if stored.0 != encrypted.ciphertext
+            || stored.1 != encrypted.nonce
+            || stored.2 != encrypted.key_id
+        {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+
+        tx.execute(
+            "DELETE FROM config WHERE key IN ('router_password', 'routeros_password')",
+            [],
+        )?;
+        tx.commit()?;
+
+        // DELETE alone leaves recoverable bytes in old WAL frames and free
+        // pages. Compact before the process starts accepting requests.
+        conn.execute_batch(
+            "VACUUM;
+             PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )?;
+        Ok(())
+    }
+
+    pub fn admin(&self) -> Result<Option<AdminRecord>, rusqlite::Error> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        conn.query_row(
+            "SELECT username, password_hash, credential_version FROM admins WHERE id = 1",
+            [],
+            |row| {
+                Ok(AdminRecord {
+                    username: row.get(0)?,
+                    password_hash: row.get(1)?,
+                    credential_version: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+    }
+
+    pub fn create_admin(&self, username: &str, password_hash: &str) -> Result<(), rusqlite::Error> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        conn.execute(
+            "INSERT INTO admins(id, username, password_hash) VALUES (1, ?1, ?2)",
+            params![username, password_hash],
+        )?;
+        Ok(())
+    }
+
+    pub fn replace_admin_password(
+        &self,
+        username: &str,
+        password_hash: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE admins SET username = ?1, password_hash = ?2,
+                 credential_version = credential_version + 1, updated_at = unixepoch()
+             WHERE id = 1",
+            params![username, password_hash],
+        )?;
+        tx.execute(
+            "UPDATE auth_sessions SET revoked_at = unixepoch() WHERE revoked_at IS NULL",
+            [],
+        )?;
+        tx.execute(
+            "UPDATE pairing_codes SET used_at = unixepoch() WHERE used_at IS NULL",
+            [],
+        )?;
+        tx.commit()
+    }
+
+    pub fn store_setup_token(
+        &self,
+        token_hash: &[u8],
+        expires_at: i64,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO setup_tokens(id, token_hash, expires_at, used_at)
+             VALUES (1, ?1, ?2, NULL)",
+            params![token_hash, expires_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn consume_setup_and_create_admin(
+        &self,
+        token_hash: &[u8],
+        now: i64,
+        username: &str,
+        password_hash: &str,
+    ) -> Result<bool, rusqlite::Error> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE setup_tokens SET used_at = ?1
+             WHERE id = 1 AND token_hash = ?2 AND used_at IS NULL AND expires_at > ?1",
+            params![now, token_hash],
+        )?;
+        if changed != 1 {
+            tx.rollback()?;
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO admins(id, username, password_hash) VALUES (1, ?1, ?2)",
+            params![username, password_hash],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub fn insert_session(&self, session: &AuthSessionRecord) -> Result<(), rusqlite::Error> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        insert_session_inner(&conn, session)?;
+        Ok(())
+    }
+
+    pub fn insert_standard_session_if_admin_version(
+        &self,
+        session: &AuthSessionRecord,
+        expected_credential_version: i64,
+    ) -> Result<bool, rusqlite::Error> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let credentials_unchanged: bool = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM admins
+                 WHERE id = 1 AND username = ?1 AND credential_version = ?2
+             )",
+            params![session.username, expected_credential_version],
+            |row| row.get(0),
+        )?;
+        if !credentials_unchanged || session.kind != "standard" || session.role != "admin" {
+            tx.rollback()?;
+            return Ok(false);
+        }
+        insert_session_inner(&tx, session)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub fn session_by_token_hash(
+        &self,
+        token_hash: &[u8],
+    ) -> Result<Option<AuthSessionRecord>, rusqlite::Error> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        conn.query_row(
+            "SELECT id, token_hash, csrf_hash, username, role, kind, label, created_at,
+                    last_seen_at, idle_expires_at, absolute_expires_at, revoked_at
+             FROM auth_sessions WHERE token_hash = ?1",
+            params![token_hash],
+            map_session_row,
+        )
+        .optional()
+    }
+
+    pub fn touch_session_if_active_throttled(
+        &self,
+        id: &str,
+        username: &str,
+        role: &str,
+        kind: &str,
+        now: i64,
+        minimum_interval_secs: i64,
+    ) -> Result<bool, rusqlite::Error> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE auth_sessions SET last_seen_at = ?1,
+                idle_expires_at = CASE WHEN kind = 'standard' THEN ?1 + 43200 ELSE NULL END
+             WHERE id = ?2
+               AND username = ?3
+               AND role = ?4
+               AND kind = ?5
+               AND revoked_at IS NULL
+               AND absolute_expires_at > ?1
+               AND (idle_expires_at IS NULL OR idle_expires_at > ?1)
+               AND last_seen_at <= ?1 - ?6",
+            params![now, id, username, role, kind, minimum_interval_secs],
+        )?;
+        let active = if changed == 1 {
+            true
+        } else {
+            session_is_active_inner(&tx, id, username, role, kind, now)?
+        };
+        tx.commit()?;
+        Ok(active)
+    }
+
+    pub fn session_is_active(
+        &self,
+        id: &str,
+        username: &str,
+        role: &str,
+        kind: &str,
+        now: i64,
+    ) -> Result<bool, rusqlite::Error> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        session_is_active_inner(&conn, id, username, role, kind, now)
+    }
+
+    pub fn list_sessions(&self) -> Result<Vec<AuthSessionRecord>, rusqlite::Error> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, token_hash, csrf_hash, username, role, kind, label, created_at,
+                    last_seen_at, idle_expires_at, absolute_expires_at, revoked_at
+             FROM auth_sessions ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], map_session_row)?;
+        rows.collect()
+    }
+
+    pub fn revoke_session(&self, id: &str, now: i64) -> Result<bool, rusqlite::Error> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let changed = conn.execute(
+            "UPDATE auth_sessions SET revoked_at = ?1 WHERE id = ?2 AND revoked_at IS NULL",
+            params![now, id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_pairing_if_authorized(
+        &self,
+        pairing: &PairingRecord,
+        code_hash: &[u8],
+        creator_session_id: &str,
+        creator_username: &str,
+        creator_role: &str,
+        creator_kind: &str,
+        now: i64,
+        expected_credential_version: Option<i64>,
+    ) -> Result<bool, rusqlite::Error> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let authorized: bool = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM auth_sessions AS session
+                 JOIN admins AS admin ON admin.id = 1
+                 WHERE session.id = ?1
+                   AND session.username = ?2
+                   AND session.role = ?3
+                   AND session.kind = ?4
+                   AND session.role = 'admin'
+                   AND session.username = admin.username
+                   AND session.revoked_at IS NULL
+                   AND session.absolute_expires_at > ?5
+                   AND (session.idle_expires_at IS NULL OR session.idle_expires_at > ?5)
+                   AND (?6 IS NULL OR admin.credential_version = ?6)
+             )",
+            params![
+                creator_session_id,
+                creator_username,
+                creator_role,
+                creator_kind,
+                now,
+                expected_credential_version,
+            ],
+            |row| row.get(0),
+        )?;
+        if !authorized {
+            tx.rollback()?;
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO pairing_codes(
+                id, code_hash, role, label, created_by_session_id, created_at, expires_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                pairing.id,
+                code_hash,
+                pairing.role,
+                pairing.label,
+                creator_session_id,
+                now,
+                pairing.expires_at,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn consume_pairing_and_insert_session(
+        &self,
+        code_hash: &[u8],
+        now: i64,
+        session_id: &str,
+        token_hash: &[u8],
+        csrf_hash: &[u8],
+        viewer_lifetime_secs: i64,
+        admin_lifetime_secs: i64,
+    ) -> Result<Option<AuthSessionRecord>, rusqlite::Error> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let pairing_and_username = tx
+            .query_row(
+                "SELECT pairing.id, pairing.role, pairing.label, pairing.expires_at,
+                        admin.username
+                 FROM pairing_codes AS pairing
+                 JOIN auth_sessions AS creator
+                   ON creator.id = pairing.created_by_session_id
+                 JOIN admins AS admin ON admin.id = 1
+                 WHERE pairing.code_hash = ?1
+                   AND pairing.used_at IS NULL
+                   AND pairing.expires_at > ?2
+                   AND creator.username = admin.username
+                   AND creator.role = 'admin'
+                   AND creator.revoked_at IS NULL
+                   AND creator.absolute_expires_at > ?2
+                   AND (creator.idle_expires_at IS NULL OR creator.idle_expires_at > ?2)",
+                params![code_hash, now],
+                |row| {
+                    Ok((
+                        PairingRecord {
+                            id: row.get(0)?,
+                            role: row.get(1)?,
+                            label: row.get(2)?,
+                            expires_at: row.get(3)?,
+                        },
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((pairing, username)) = pairing_and_username else {
+            tx.rollback()?;
+            return Ok(None);
+        };
+        let lifetime_secs = if pairing.role == "viewer" {
+            viewer_lifetime_secs
+        } else {
+            admin_lifetime_secs
+        };
+        let session = AuthSessionRecord {
+            id: session_id.to_string(),
+            token_hash: token_hash.to_vec(),
+            csrf_hash: csrf_hash.to_vec(),
+            username,
+            role: pairing.role,
+            kind: "fixed".to_string(),
+            label: Some(pairing.label),
+            created_at: now,
+            last_seen_at: now,
+            idle_expires_at: None,
+            absolute_expires_at: now.saturating_add(lifetime_secs),
+            revoked_at: None,
+        };
+        insert_session_inner(&tx, &session)?;
+        let consumed = tx.execute(
+            "UPDATE pairing_codes SET used_at = ?1 WHERE id = ?2 AND used_at IS NULL",
+            params![now, pairing.id],
+        )?;
+        if consumed != 1 {
+            tx.rollback()?;
+            return Ok(None);
+        }
+        tx.commit()?;
+        Ok(Some(session))
+    }
+}
+
+fn insert_session_inner(
+    conn: &rusqlite::Connection,
+    session: &AuthSessionRecord,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT INTO auth_sessions(
+            id, token_hash, csrf_hash, username, role, kind, label, created_at,
+            last_seen_at, idle_expires_at, absolute_expires_at, revoked_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            session.id,
+            session.token_hash,
+            session.csrf_hash,
+            session.username,
+            session.role,
+            session.kind,
+            session.label,
+            session.created_at,
+            session.last_seen_at,
+            session.idle_expires_at,
+            session.absolute_expires_at,
+            session.revoked_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn session_is_active_inner(
+    conn: &rusqlite::Connection,
+    id: &str,
+    username: &str,
+    role: &str,
+    kind: &str,
+    now: i64,
+) -> Result<bool, rusqlite::Error> {
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM auth_sessions
+             WHERE id = ?1
+               AND username = ?2
+               AND role = ?3
+               AND kind = ?4
+               AND revoked_at IS NULL
+               AND absolute_expires_at > ?5
+               AND (idle_expires_at IS NULL OR idle_expires_at > ?5)
+         )",
+        params![id, username, role, kind, now],
+        |row| row.get(0),
+    )
+}
+
+fn map_session_row(row: &rusqlite::Row<'_>) -> Result<AuthSessionRecord, rusqlite::Error> {
+    Ok(AuthSessionRecord {
+        id: row.get(0)?,
+        token_hash: row.get(1)?,
+        csrf_hash: row.get(2)?,
+        username: row.get(3)?,
+        role: row.get(4)?,
+        kind: row.get(5)?,
+        label: row.get(6)?,
+        created_at: row.get(7)?,
+        last_seen_at: row.get(8)?,
+        idle_expires_at: row.get(9)?,
+        absolute_expires_at: row.get(10)?,
+        revoked_at: row.get(11)?,
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -798,6 +1438,93 @@ pub fn apply_device_overrides(wifi: &mut WifiInfo, db: &TrafficDb) {
             }
         }
     }
+}
+
+fn migrate_security_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+         CREATE TABLE IF NOT EXISTS schema_migrations (
+             name       TEXT PRIMARY KEY,
+             applied_at INTEGER NOT NULL DEFAULT (unixepoch())
+         );
+         CREATE TABLE IF NOT EXISTS encrypted_secrets (
+             name       TEXT PRIMARY KEY,
+             ciphertext BLOB NOT NULL,
+             nonce      BLOB NOT NULL,
+             key_id     TEXT NOT NULL,
+             updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+         );
+         CREATE TABLE IF NOT EXISTS admins (
+             id            INTEGER PRIMARY KEY CHECK (id = 1),
+             username      TEXT NOT NULL UNIQUE,
+             password_hash TEXT NOT NULL,
+             credential_version INTEGER NOT NULL DEFAULT 1 CHECK (credential_version > 0),
+             created_at    INTEGER NOT NULL DEFAULT (unixepoch()),
+             updated_at    INTEGER NOT NULL DEFAULT (unixepoch())
+         );
+         CREATE TABLE IF NOT EXISTS auth_sessions (
+             id                  TEXT PRIMARY KEY,
+             token_hash          BLOB NOT NULL UNIQUE,
+             csrf_hash           BLOB NOT NULL,
+             username            TEXT NOT NULL,
+             role                TEXT NOT NULL CHECK (role IN ('viewer', 'admin')),
+             kind                TEXT NOT NULL CHECK (kind IN ('standard', 'fixed')),
+             label               TEXT,
+             created_at          INTEGER NOT NULL,
+             last_seen_at        INTEGER NOT NULL,
+             idle_expires_at     INTEGER,
+             absolute_expires_at INTEGER NOT NULL,
+             revoked_at          INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS idx_auth_sessions_token
+             ON auth_sessions(token_hash);
+         CREATE INDEX IF NOT EXISTS idx_auth_sessions_expiry
+             ON auth_sessions(absolute_expires_at, revoked_at);
+         CREATE TABLE IF NOT EXISTS pairing_codes (
+             id                    TEXT PRIMARY KEY,
+             code_hash             BLOB NOT NULL UNIQUE,
+             role                  TEXT NOT NULL CHECK (role IN ('viewer', 'admin')),
+             label                 TEXT NOT NULL,
+             created_by_session_id TEXT NOT NULL,
+             created_at            INTEGER NOT NULL,
+             expires_at            INTEGER NOT NULL,
+             used_at               INTEGER,
+             FOREIGN KEY(created_by_session_id) REFERENCES auth_sessions(id)
+         );
+         CREATE TABLE IF NOT EXISTS setup_tokens (
+             id         INTEGER PRIMARY KEY CHECK (id = 1),
+             token_hash BLOB NOT NULL,
+             expires_at INTEGER NOT NULL,
+             used_at    INTEGER
+         );
+         INSERT OR IGNORE INTO schema_migrations(name)
+             VALUES ('security_auth_secrets_v1');
+         COMMIT;",
+    )?;
+    let has_credential_version = conn
+        .prepare("SELECT 1 FROM pragma_table_info('admins') WHERE name = 'credential_version'")?
+        .exists([])?;
+    if !has_credential_version {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "ALTER TABLE admins ADD COLUMN credential_version INTEGER NOT NULL DEFAULT 1
+             CHECK (credential_version > 0)",
+            [],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO schema_migrations(name)
+             VALUES ('admin_credential_version_v1')",
+            [],
+        )?;
+        tx.commit()?;
+    } else {
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations(name)
+             VALUES ('admin_credential_version_v1')",
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 /// Migrate old traffic table schemas to the composite-PK layout.
@@ -921,4 +1648,352 @@ fn current_time_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    fn memory_db() -> TrafficDb {
+        TrafficDb::open(&PathBuf::from(":memory:")).unwrap()
+    }
+
+    fn standard_session(id: &str, token_byte: u8, absolute_expires_at: i64) -> AuthSessionRecord {
+        AuthSessionRecord {
+            id: id.into(),
+            token_hash: vec![token_byte; 32],
+            csrf_hash: vec![token_byte.saturating_add(1); 32],
+            username: "admin".into(),
+            role: "admin".into(),
+            kind: "standard".into(),
+            label: None,
+            created_at: 100,
+            last_seen_at: 100,
+            idle_expires_at: Some(43_300),
+            absolute_expires_at,
+            revoked_at: None,
+        }
+    }
+
+    fn pairing(id: &str, role: &str, expires_at: i64) -> PairingRecord {
+        PairingRecord {
+            id: id.into(),
+            role: role.into(),
+            label: format!("{role} display"),
+            expires_at,
+        }
+    }
+
+    fn insert_pairing(
+        db: &TrafficDb,
+        record: &PairingRecord,
+        code_byte: u8,
+        creator: &AuthSessionRecord,
+    ) {
+        assert!(db
+            .insert_pairing_if_authorized(
+                record,
+                &[code_byte; 32],
+                &creator.id,
+                &creator.username,
+                &creator.role,
+                &creator.kind,
+                100,
+                Some(1),
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn http_session_touch_is_throttled_to_five_minutes() {
+        let db = memory_db();
+        let session = standard_session("session-1", 1, 999_999);
+        db.insert_session(&session).unwrap();
+
+        assert!(db
+            .touch_session_if_active_throttled("session-1", "admin", "admin", "standard", 399, 300,)
+            .unwrap());
+        let untouched = db.session_by_token_hash(&[1; 32]).unwrap().unwrap();
+        assert_eq!(untouched.last_seen_at, 100);
+        assert_eq!(untouched.idle_expires_at, Some(43_300));
+
+        assert!(db
+            .touch_session_if_active_throttled("session-1", "admin", "admin", "standard", 400, 300,)
+            .unwrap());
+        let updated = db.session_by_token_hash(&[1; 32]).unwrap().unwrap();
+        assert_eq!(updated.last_seen_at, 400);
+        assert_eq!(updated.idle_expires_at, Some(43_600));
+
+        assert!(db
+            .touch_session_if_active_throttled("session-1", "admin", "admin", "standard", 699, 300,)
+            .unwrap());
+        assert_eq!(
+            db.session_by_token_hash(&[1; 32])
+                .unwrap()
+                .unwrap()
+                .last_seen_at,
+            400
+        );
+    }
+
+    #[test]
+    fn websocket_revalidation_is_read_only_and_rejects_revocation() {
+        let db = memory_db();
+        let session = standard_session("session-1", 1, 999_999);
+        db.insert_session(&session).unwrap();
+        assert!(db
+            .session_is_active("session-1", "admin", "admin", "standard", 200)
+            .unwrap());
+        let unchanged = db.session_by_token_hash(&[1; 32]).unwrap().unwrap();
+        assert_eq!(unchanged.last_seen_at, 100);
+        assert_eq!(unchanged.idle_expires_at, Some(43_300));
+
+        db.revoke_session("session-1", 150).unwrap();
+        assert!(!db
+            .session_is_active("session-1", "admin", "admin", "standard", 200)
+            .unwrap());
+    }
+
+    #[test]
+    fn standard_session_insert_rechecks_credential_version() {
+        let db = memory_db();
+        db.create_admin("admin", "hash-v1").unwrap();
+        let first = standard_session("session-1", 1, 999_999);
+        assert!(db
+            .insert_standard_session_if_admin_version(&first, 1)
+            .unwrap());
+
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE admins SET credential_version = credential_version + 1",
+                [],
+            )
+            .unwrap();
+        let stale = standard_session("session-2", 3, 999_999);
+        assert!(!db
+            .insert_standard_session_if_admin_version(&stale, 1)
+            .unwrap());
+        assert!(db.session_by_token_hash(&[3; 32]).unwrap().is_none());
+    }
+
+    #[test]
+    fn admin_pairing_insert_rechecks_credential_version() {
+        let db = memory_db();
+        db.create_admin("admin", "hash-v1").unwrap();
+        let creator = standard_session("creator", 1, 999_999);
+        db.insert_session(&creator).unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE admins SET credential_version = credential_version + 1",
+                [],
+            )
+            .unwrap();
+
+        assert!(!db
+            .insert_pairing_if_authorized(
+                &pairing("pairing-1", "admin", 1_000),
+                &[9; 32],
+                &creator.id,
+                &creator.username,
+                &creator.role,
+                &creator.kind,
+                100,
+                Some(1),
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn password_reset_revokes_sessions_and_invalidates_pairings() {
+        let db = memory_db();
+        db.create_admin("admin", "hash-v1").unwrap();
+        let creator = standard_session("creator", 1, 999_999);
+        db.insert_session(&creator).unwrap();
+        insert_pairing(&db, &pairing("pairing-1", "viewer", 1_000), 9, &creator);
+
+        db.replace_admin_password("admin", "hash-v2").unwrap();
+        assert_eq!(db.admin().unwrap().unwrap().credential_version, 2);
+        assert!(!db
+            .session_is_active("creator", "admin", "admin", "standard", 200)
+            .unwrap());
+        assert!(db
+            .consume_pairing_and_insert_session(
+                &[9; 32], 200, "fixed", &[10; 32], &[11; 32], 1_000, 1_000,
+            )
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn pairing_consume_rejects_expired_and_revoked_creators() {
+        let expired_db = memory_db();
+        expired_db.create_admin("admin", "hash").unwrap();
+        let expiring_creator = standard_session("expiring", 1, 150);
+        expired_db.insert_session(&expiring_creator).unwrap();
+        insert_pairing(
+            &expired_db,
+            &pairing("pairing-expired", "viewer", 1_000),
+            9,
+            &expiring_creator,
+        );
+        assert!(expired_db
+            .consume_pairing_and_insert_session(
+                &[9; 32],
+                200,
+                "fixed-expired",
+                &[10; 32],
+                &[11; 32],
+                1_000,
+                1_000,
+            )
+            .unwrap()
+            .is_none());
+
+        let revoked_db = memory_db();
+        revoked_db.create_admin("admin", "hash").unwrap();
+        let revoked_creator = standard_session("revoked", 1, 999_999);
+        revoked_db.insert_session(&revoked_creator).unwrap();
+        insert_pairing(
+            &revoked_db,
+            &pairing("pairing-revoked", "viewer", 1_000),
+            9,
+            &revoked_creator,
+        );
+        revoked_db.revoke_session("revoked", 150).unwrap();
+        assert!(revoked_db
+            .consume_pairing_and_insert_session(
+                &[9; 32],
+                200,
+                "fixed-revoked",
+                &[10; 32],
+                &[11; 32],
+                1_000,
+                1_000,
+            )
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn pairing_consume_and_session_insert_rollback_together() {
+        let db = memory_db();
+        db.create_admin("admin", "hash").unwrap();
+        let creator = standard_session("creator", 1, 999_999);
+        db.insert_session(&creator).unwrap();
+        insert_pairing(&db, &pairing("pairing-1", "viewer", 1_000), 9, &creator);
+
+        assert!(db
+            .consume_pairing_and_insert_session(
+                &[9; 32], 200, "creator", &[10; 32], &[11; 32], 1_000, 1_000,
+            )
+            .is_err());
+        let fixed = db
+            .consume_pairing_and_insert_session(
+                &[9; 32], 200, "fixed", &[10; 32], &[11; 32], 1_000, 1_000,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(fixed.role, "viewer");
+        assert!(db
+            .consume_pairing_and_insert_session(
+                &[9; 32], 200, "fixed-2", &[12; 32], &[13; 32], 1_000, 1_000,
+            )
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn security_schema_migrates_existing_admin_credential_version() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE admins (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 username TEXT NOT NULL UNIQUE,
+                 password_hash TEXT NOT NULL,
+                 created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                 updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+             );
+             INSERT INTO admins(id, username, password_hash) VALUES (1, 'admin', 'hash');",
+        )
+        .unwrap();
+
+        migrate_security_schema(&conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT credential_version FROM admins WHERE id = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert!(conn
+            .prepare("SELECT 1 FROM schema_migrations WHERE name = 'admin_credential_version_v1'",)
+            .unwrap()
+            .exists([])
+            .unwrap());
+    }
+
+    #[test]
+    fn config_revision_check_is_atomic() {
+        let db = memory_db();
+        assert!(db
+            .save_config_transaction(&[("theme".into(), "dark".into())], None, None, Some(0),)
+            .unwrap());
+        assert!(!db
+            .save_config_transaction(&[("theme".into(), "light".into())], None, None, Some(0),)
+            .unwrap());
+        let config = db.get_all_config().unwrap();
+        assert_eq!(config.get("theme").map(String::as_str), Some("dark"));
+        assert_eq!(config.get("config_revision").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn plaintext_password_migration_scrubs_database_and_wal_bytes() {
+        let path = std::env::temp_dir().join(format!(
+            "routerview-secret-migration-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let plaintext = b"legacy-router-password-unique-fixture";
+        let db = TrafficDb::open(&path).unwrap();
+        db.set_config("routeros_password", std::str::from_utf8(plaintext).unwrap())
+            .unwrap();
+
+        let encrypted = EncryptedSecret {
+            ciphertext: vec![7; 64],
+            nonce: vec![8; 24],
+            key_id: "fixture-key".into(),
+        };
+        db.migrate_plaintext_router_password(&encrypted).unwrap();
+        assert!(!db
+            .get_all_config()
+            .unwrap()
+            .contains_key("routeros_password"));
+        drop(db);
+
+        let paths = [
+            path.clone(),
+            PathBuf::from(format!("{}-wal", path.display())),
+            PathBuf::from(format!("{}-shm", path.display())),
+            PathBuf::from(format!("{}-journal", path.display())),
+        ];
+        for candidate in &paths {
+            if let Ok(bytes) = std::fs::read(candidate) {
+                assert!(
+                    !bytes
+                        .windows(plaintext.len())
+                        .any(|window| window == plaintext),
+                    "plaintext remained in {}",
+                    candidate.display()
+                );
+            }
+        }
+        for candidate in &paths {
+            let _ = std::fs::remove_file(candidate);
+        }
+    }
 }

@@ -1,12 +1,9 @@
 use std::sync::Arc;
 
-use axum::{
-    extract::{Query, State},
-    Json,
-};
+use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
 
-use crate::error::AppError;
+use crate::error::{ApiQuery, AppError};
 use crate::state::AppState;
 
 /// Query parameters for GET /api/traffic.
@@ -47,7 +44,7 @@ pub struct TrafficResponse {
 /// ~5 seconds (raw); older data is 1-minute averages.
 pub async fn query_traffic(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<TrafficQueryParams>,
+    ApiQuery(params): ApiQuery<TrafficQueryParams>,
 ) -> Result<Json<TrafficResponse>, AppError> {
     // Validate
     if params.end <= params.start {

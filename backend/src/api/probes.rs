@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 use crate::db::ProbeTargetRow;
-use crate::error::AppError;
+use crate::error::{ApiJson, AppError};
 use crate::state::AppState;
 
 /// Serialisable probe target for the API (mirrors ProbeTargetRow but
@@ -40,7 +40,7 @@ pub async fn list_probes(State(state): State<Arc<AppState>>) -> Result<Json<Valu
 /// PUT /api/probes — replace all probe targets.
 pub async fn update_probes(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<Vec<ProbeTargetInput>>,
+    ApiJson(body): ApiJson<Vec<ProbeTargetInput>>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     let rows: Vec<ProbeTargetRow> = body
         .iter()

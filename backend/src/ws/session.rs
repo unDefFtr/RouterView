@@ -1,4 +1,4 @@
-use axum::extract::ws::{Message, WebSocket};
+use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -6,16 +6,33 @@ use tracing::{debug, warn};
 
 use crate::state::AppState;
 use crate::ws::protocol::ServerMessage;
+use crate::{auth, auth::SessionContext};
+
+const SESSION_REVALIDATE_SECS: u64 = 30;
 
 /// Run a single WebSocket client session.
 ///
 /// Subscribes to the broadcast channel and streams messages to the client.
 /// The session ends when the client disconnects or the broadcast channel is closed.
-pub async fn run_session(socket: WebSocket, state: Arc<AppState>) {
+pub async fn run_session(socket: WebSocket, state: Arc<AppState>, auth_session: SessionContext) {
     let (mut sender, mut receiver) = socket.split();
+
+    if !auth::revalidate_session(&state.traffic_db, &auth_session).unwrap_or(false) {
+        let _ = sender
+            .send(Message::Close(Some(CloseFrame {
+                code: 1008,
+                reason: "session expired".into(),
+            })))
+            .await;
+        return;
+    }
 
     // Subscribe to the broadcast channel
     let mut broadcast_rx = state.broadcast_tx.subscribe();
+    let mut session_check =
+        tokio::time::interval(std::time::Duration::from_secs(SESSION_REVALIDATE_SECS));
+    session_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    session_check.tick().await;
 
     // ── Send cached snapshot immediately so the client has full state ──
     if let Some(snapshot) = state.last_snapshot.read().await.as_ref() {
@@ -39,6 +56,18 @@ pub async fn run_session(socket: WebSocket, state: Arc<AppState>) {
 
     loop {
         tokio::select! {
+            _ = session_check.tick() => {
+                if !auth::revalidate_session(&state.traffic_db, &auth_session).unwrap_or(false) {
+                    let _ = sender
+                        .send(Message::Close(Some(CloseFrame {
+                            code: 1008,
+                            reason: "session expired or revoked".into(),
+                        })))
+                        .await;
+                    break;
+                }
+            }
+
             // Incoming broadcast messages from the poll engine
             result = broadcast_rx.recv() => {
                 match result {
@@ -86,14 +115,42 @@ pub async fn run_session(socket: WebSocket, state: Arc<AppState>) {
                         // Respond to pings
                         let _ = sender.send(Message::Pong(data)).await;
                     }
+                    Some(Ok(message)) if is_client_data_message(&message) => {
+                        let _ = sender
+                            .send(Message::Close(Some(CloseFrame {
+                                code: 1008,
+                                reason: "client data messages are not supported".into(),
+                            })))
+                            .await;
+                        break;
+                    }
+                    Some(Ok(Message::Pong(_))) => {}
+                    Some(Ok(_)) => {}
                     Some(Err(e)) => {
                         debug!("WebSocket error: {e}");
                         break;
                     }
-                    // Ignore other client messages
-                    _ => {}
                 }
             }
         }
+    }
+}
+
+fn is_client_data_message(message: &Message) -> bool {
+    matches!(message, Message::Text(_) | Message::Binary(_))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_and_binary_client_messages_are_policy_violations() {
+        assert!(is_client_data_message(&Message::Text("unexpected".into())));
+        assert!(is_client_data_message(&Message::Binary(
+            vec![1, 2, 3].into()
+        )));
+        assert!(!is_client_data_message(&Message::Ping(vec![].into())));
+        assert!(!is_client_data_message(&Message::Pong(vec![].into())));
     }
 }
