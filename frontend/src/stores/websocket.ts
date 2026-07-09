@@ -116,7 +116,7 @@ export const useWebSocketStore = defineStore('websocket', () => {
         dashboardStore.handleUpdate(msg.data);
         break;
       case 'connection_status':
-        dashboardStore.handleConnectionStatus(msg.routeros, msg.lastPoll);
+        dashboardStore.handleConnectionStatus(msg.connected, msg.lastPoll);
         break;
       default:
         console.warn('[WS] Unknown message type:', (msg as any).type);

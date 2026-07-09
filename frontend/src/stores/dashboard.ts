@@ -45,7 +45,7 @@ export const useDashboardStore = defineStore('dashboard', () => {
   const stability = ref<IspStability>({ ...DEFAULT_STABILITY });
   const interfaceStatuses = ref<InterfaceStatus[]>([]);
 
-  const routerosConnected = ref(false);
+  const routerosConnected = ref(false); // retained for backward compat — reflects router connectivity
   const lastPollTimestamp = ref<string | null>(null);
   const wsConnected = ref(false);
 

@@ -171,7 +171,7 @@ export interface DashboardUpdate {
 // ── Connection Status ────────────────────────────────────
 
 export interface ConnectionStatus {
-  routeros: boolean;
+  connected: boolean;
   lastPoll: string | null;
 }
 
@@ -180,7 +180,7 @@ export interface ConnectionStatus {
 export type ServerMessage =
   | { type: 'snapshot'; data: DashboardSnapshot }
   | { type: 'update'; data: DashboardUpdate }
-  | { type: 'connection_status'; routeros: boolean; lastPoll: string | null };
+  | { type: 'connection_status'; connected: boolean; lastPoll: string | null };
 
 // ── Default / Placeholder Values ─────────────────────────
 
