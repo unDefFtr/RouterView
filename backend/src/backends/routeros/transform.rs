@@ -1,12 +1,11 @@
+use crate::backends::routeros::models::*;
 /// Converts raw RouterOS REST API response types into the vendor-neutral
 /// `RouterData` struct used by the transform layer.
 ///
 /// This module handles all RouterOS-specific string → typed parsing
 /// (e.g., `"true"/"false"` → `bool`, numeric strings → `u64`/`f64`).
 /// The main `poller::transform` module then works purely with typed data.
-
 use crate::backends::*;
-use crate::backends::routeros::models::*;
 
 pub fn routeros_to_router_data(
     sys: SystemResource,

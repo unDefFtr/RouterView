@@ -115,12 +115,16 @@ impl PollEngine {
             (cfg.latency_good_ms as f64, cfg.latency_poor_ms as f64)
         };
 
-        let last_probe_results = run_icmp_probes(&probe_targets_snapshot, latency_good_ms, latency_poor_ms).await;
+        let last_probe_results =
+            run_icmp_probes(&probe_targets_snapshot, latency_good_ms, latency_poor_ms).await;
 
         info!(
             "Poll engine: {} probe targets initialized ({}/{} reachable)",
             last_probe_results.len(),
-            last_probe_results.iter().filter(|r| r.latency_ms.is_some()).count(),
+            last_probe_results
+                .iter()
+                .filter(|r| r.latency_ms.is_some())
+                .count(),
             last_probe_results.len(),
         );
 
@@ -280,13 +284,12 @@ impl PollEngine {
                 // ── Traffic history: push latest point, prune to 6h window ──
                 // Clone out the point first to release the immutable borrow on
                 // snapshot.traffic.points before we overwrite it below.
-                let latest_pt = {
-                    snapshot.traffic.points.first().cloned()
-                };
+                let latest_pt = { snapshot.traffic.points.first().cloned() };
                 if let Some(ref pt) = latest_pt {
                     // DB persist aggregate traffic
                     let ts_ms = timestamp_to_ms(&pt.timestamp);
-                    self.traffic_db.insert(ts_ms, pt.download_bps, pt.upload_bps, "");
+                    self.traffic_db
+                        .insert(ts_ms, pt.download_bps, pt.upload_bps, "");
 
                     self.traffic_history.push(pt.clone());
                     let cutoff = chrono::Utc::now() - chrono::Duration::hours(6);
@@ -328,7 +331,10 @@ impl PollEngine {
                 if self.poll_count % 60 == 0 {
                     let (raw_days, total_days) = {
                         let cfg = self.config.read().await;
-                        (cfg.db_raw_retention_days as i64, cfg.db_total_retention_days as i64)
+                        (
+                            cfg.db_raw_retention_days as i64,
+                            cfg.db_total_retention_days as i64,
+                        )
                     };
                     self.traffic_db.aggregate_and_prune(raw_days, total_days);
                 }
@@ -384,10 +390,7 @@ impl PollEngine {
             self.latency_poor_ms = cfg.latency_poor_ms as f64;
         }
 
-        debug!(
-            "Probe tick — pinging {} targets",
-            targets.len()
-        );
+        debug!("Probe tick — pinging {} targets", targets.len());
 
         let results = run_icmp_probes(&targets, self.latency_good_ms, self.latency_poor_ms).await;
 
@@ -418,7 +421,10 @@ impl PollEngine {
     /// Fetch all router data and transform into a snapshot.
     /// Only called when `self.client` is `Some`.
     async fn fetch_and_transform(&mut self) -> Result<DashboardSnapshot, AppError> {
-        let client = self.client.as_ref().expect("client must be Some when fetch_and_transform is called");
+        let client = self
+            .client
+            .as_ref()
+            .expect("client must be Some when fetch_and_transform is called");
 
         let poll_interval_secs = {
             let cfg = self.config.read().await;
@@ -429,19 +435,16 @@ impl PollEngine {
         let data = client.fetch_all().await?;
 
         // ── Snapshot current byte counters for next tick's rate calculation ──
-        let current_counters: HashMap<String, (u64, u64)> = data.interfaces
+        let current_counters: HashMap<String, (u64, u64)> = data
+            .interfaces
             .iter()
-            .map(|iface| {
-                (
-                    iface.name.clone(),
-                    (iface.rx_byte, iface.tx_byte),
-                )
-            })
+            .map(|iface| (iface.name.clone(), (iface.rx_byte, iface.tx_byte)))
             .collect();
         let prev = std::mem::replace(&mut self.prev_counters, current_counters);
 
         // Count DHCP leases for IP allocations
-        let ip_allocations = data.dhcp_leases
+        let ip_allocations = data
+            .dhcp_leases
             .iter()
             .filter(|l| l.status == "bound")
             .count() as u32;
@@ -449,7 +452,7 @@ impl PollEngine {
         let mut snapshot = crate::poller::transform::to_dashboard_snapshot(
             data,
             Some(&prev),
-            Vec::new(),  // Will be filled in poll_tick
+            Vec::new(), // Will be filled in poll_tick
             IspStability {
                 online_rate: 100.0,
                 segments: vec![],
@@ -563,13 +566,11 @@ impl PollEngine {
         if total == 0.0 {
             return IspStability {
                 online_rate: 100.0,
-                segments: vec![
-                    StabilitySegment {
-                        color: "#22c55e".into(),
-                        value: 30.0,
-                        label: Some("100%".into()),
-                    },
-                ],
+                segments: vec![StabilitySegment {
+                    color: "#22c55e".into(),
+                    value: 30.0,
+                    label: Some("100%".into()),
+                }],
                 window_minutes: 30,
             };
         }
@@ -594,8 +595,8 @@ impl PollEngine {
         let online_rate = ((good + degraded) / total) * 100.0;
 
         // Actual time window = history_entries × probe_interval
-        let window_minutes = ((self.stability_history.len() as u64 * probe_interval_secs) / 60)
-            .max(1) as u32;
+        let window_minutes =
+            ((self.stability_history.len() as u64 * probe_interval_secs) / 60).max(1) as u32;
 
         let segments = vec![
             StabilitySegment {
@@ -641,8 +642,7 @@ async fn connect_backend(
         RouterType::RouterOs => {
             let client = RouterOsClient::connect(config).await?;
             Ok(Box::new(client))
-        }
-        // Future backends: add a match arm here
+        } // Future backends: add a match arm here
     }
 }
 
@@ -668,9 +668,7 @@ async fn run_icmp_probes(
             let category = cat.clone();
             let good = latency_good_ms;
             let poor = latency_poor_ms;
-            tokio::spawn(async move {
-                probe_one(&name, &host, &category, good, poor).await
-            })
+            tokio::spawn(async move { probe_one(&name, &host, &category, good, poor).await })
         })
         .collect();
 
@@ -688,10 +686,7 @@ async fn run_icmp_probes(
 ///
 /// Returns a vector of latencies (in ms) for successful pings.
 /// Failed or timed-out pings are omitted.
-async fn send_n_pings(
-    pinger: &mut surge_ping::Pinger,
-    host: &str,
-) -> Vec<f64> {
+async fn send_n_pings(pinger: &mut surge_ping::Pinger, host: &str) -> Vec<f64> {
     let mut latencies = Vec::with_capacity(PING_COUNT);
     for seq in 0..PING_COUNT {
         // First ping fires immediately; subsequent pings are spaced by PING_GAP_MS.
@@ -753,7 +748,9 @@ async fn probe_one(
     // Create ICMP client + pinger — choose ICMP kind based on resolved IP family
     let config = match ip {
         IpAddr::V4(_) => surge_ping::Config::new(),
-        IpAddr::V6(_) => surge_ping::Config::builder().kind(surge_ping::ICMP::V6).build(),
+        IpAddr::V6(_) => surge_ping::Config::builder()
+            .kind(surge_ping::ICMP::V6)
+            .build(),
     };
     let client = match surge_ping::Client::new(&config) {
         Ok(c) => c,
@@ -763,9 +760,7 @@ async fn probe_one(
         }
     };
 
-    let mut pinger = client
-        .pinger(ip, surge_ping::PingIdentifier(0))
-        .await;
+    let mut pinger = client.pinger(ip, surge_ping::PingIdentifier(0)).await;
 
     let latencies = send_n_pings(&mut pinger, host).await;
     let success = latencies.len();

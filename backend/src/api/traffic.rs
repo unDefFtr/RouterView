@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use axum::{Json, extract::{Query, State}};
+use axum::{
+    extract::{Query, State},
+    Json,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
@@ -9,8 +12,8 @@ use crate::state::AppState;
 /// Query parameters for GET /api/traffic.
 #[derive(Deserialize)]
 pub struct TrafficQueryParams {
-    pub start: i64,  // unix milliseconds, inclusive
-    pub end: i64,    // unix milliseconds, exclusive
+    pub start: i64, // unix milliseconds, inclusive
+    pub end: i64,   // unix milliseconds, exclusive
     /// Optional WAN interface name filter for per-WAN queries
     #[serde(default)]
     pub wan_name: Option<String>,
@@ -55,13 +58,13 @@ pub async fn query_traffic(
 
     let max_range_ms = 90 * 86400 * 1000i64;
     if params.end - params.start > max_range_ms {
-        return Err(AppError::InvalidData(
-            "time range exceeds 90 days".into(),
-        ));
+        return Err(AppError::InvalidData("time range exceeds 90 days".into()));
     }
 
     let records = if let Some(ref wan_name) = params.wan_name {
-        state.traffic_db.query_by_wan(params.start, params.end, wan_name)
+        state
+            .traffic_db
+            .query_by_wan(params.start, params.end, wan_name)
     } else {
         state.traffic_db.query(params.start, params.end)
     };
@@ -80,7 +83,11 @@ pub async fn query_traffic(
             timestamp_ms: r.timestamp_ms,
             download_bps: r.download_bps,
             upload_bps: r.upload_bps,
-            wan_name: if r.wan_name.is_empty() { None } else { Some(r.wan_name) },
+            wan_name: if r.wan_name.is_empty() {
+                None
+            } else {
+                Some(r.wan_name)
+            },
         })
         .collect();
 

@@ -10,7 +10,9 @@ use crate::state::AppState;
 
 /// Health check endpoint — returns server status.
 pub async fn health_check(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let connections = state.connection_count.load(std::sync::atomic::Ordering::Relaxed);
+    let connections = state
+        .connection_count
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     Json(json!({
         "status": "ok",
@@ -76,11 +78,16 @@ pub async fn update_config(
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     let known_keys: &[&str] = &[
         "router_type",
-        "router_host", "routeros_host",
-        "router_port", "routeros_port",
-        "router_scheme", "routeros_scheme",
-        "router_username", "routeros_username",
-        "router_password", "routeros_password",
+        "router_host",
+        "routeros_host",
+        "router_port",
+        "routeros_port",
+        "router_scheme",
+        "routeros_scheme",
+        "router_username",
+        "routeros_username",
+        "router_password",
+        "routeros_password",
         "accept_invalid_certs",
         "poll_interval_secs",
         "probe_interval_secs",
@@ -93,9 +100,7 @@ pub async fn update_config(
         "wizard_completed",
     ];
 
-    let requires_restart: &[&str] = &[
-        "server_port",
-    ];
+    let requires_restart: &[&str] = &["server_port"];
 
     let mut saved: Vec<String> = Vec::new();
     let mut restart: Vec<String> = Vec::new();
@@ -273,14 +278,16 @@ pub async fn test_connection(
     let conn_config = RouterConnectionConfig {
         router_type,
         host: get_str("router_host", "routeros_host", &cfg.router_host),
-        port: body.get("router_port")
+        port: body
+            .get("router_port")
             .or_else(|| body.get("routeros_port"))
             .and_then(|v| v.as_u64())
             .unwrap_or(cfg.router_port as u64) as u16,
         scheme: get_str("router_scheme", "routeros_scheme", &cfg.router_scheme),
         username: get_str("router_username", "routeros_username", &cfg.router_username),
         password: get_str("router_password", "routeros_password", &cfg.router_password),
-        accept_invalid_certs: body.get("accept_invalid_certs")
+        accept_invalid_certs: body
+            .get("accept_invalid_certs")
             .map(|v| v.as_bool().unwrap_or(false) || v.as_str() == Some("true"))
             .unwrap_or(cfg.accept_invalid_certs),
     };

@@ -46,11 +46,9 @@ impl MergedConfig {
         let get = |key: &str| -> Option<&str> { db_overrides.get(key).map(|s| s.as_str()) };
 
         let router_type = get("router_type")
-            .and_then(|s| {
-                match s.to_lowercase().as_str() {
-                    "routeros" => Some(RouterType::RouterOs),
-                    _ => None,
-                }
+            .and_then(|s| match s.to_lowercase().as_str() {
+                "routeros" => Some(RouterType::RouterOs),
+                _ => None,
             })
             .unwrap_or(env.router_type);
 
@@ -108,7 +106,9 @@ impl MergedConfig {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(env.db_total_retention_days),
 
-            theme: get("theme").map(|s| s.to_string()).unwrap_or_else(|| "system".to_string()),
+            theme: get("theme")
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "system".to_string()),
 
             latency_good_ms: get("latency_good_ms")
                 .and_then(|s| s.parse().ok())
@@ -133,10 +133,7 @@ impl ConfigStore {
     /// Load merged config: env defaults + DB overrides.
     pub fn load(db: &TrafficDb, env: &Config) -> MergedConfig {
         let overrides = db.get_all_config();
-        info!(
-            "ConfigStore: loaded {} overrides from DB",
-            overrides.len()
-        );
+        info!("ConfigStore: loaded {} overrides from DB", overrides.len());
         MergedConfig::from_env_and_db(env, &overrides)
     }
 

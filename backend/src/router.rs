@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use axum::{routing::{get, post, put}, Router};
+use axum::{
+    routing::{get, post, put},
+    Router,
+};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
@@ -17,9 +20,18 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 
     Router::new()
         .route("/api/health", get(api::system::health_check))
-        .route("/api/config", get(api::system::config_info).put(api::system::update_config))
-        .route("/api/config/test-connection", post(api::system::test_connection))
-        .route("/api/probes", get(api::probes::list_probes).put(api::probes::update_probes))
+        .route(
+            "/api/config",
+            get(api::system::config_info).put(api::system::update_config),
+        )
+        .route(
+            "/api/config/test-connection",
+            post(api::system::test_connection),
+        )
+        .route(
+            "/api/probes",
+            get(api::probes::list_probes).put(api::probes::update_probes),
+        )
         .route("/api/probes/reset", post(api::probes::reset_probes))
         .route("/api/traffic", get(api::traffic::query_traffic))
         .route("/api/oui/lookup", get(api::oui::lookup_oui))

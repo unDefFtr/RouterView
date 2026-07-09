@@ -23,10 +23,7 @@ pub async fn run_session(socket: WebSocket, state: Arc<AppState>) {
             data: (**snapshot).clone(),
         };
         if let Ok(json) = serde_json::to_string(&msg) {
-            debug!(
-                "Sent cached snapshot to new client ({} bytes)",
-                json.len()
-            );
+            debug!("Sent cached snapshot to new client ({} bytes)", json.len());
             let _ = sender.send(Message::Text(json.into())).await;
         }
     } else {

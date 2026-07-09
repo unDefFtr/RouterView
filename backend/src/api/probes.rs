@@ -20,9 +20,7 @@ pub(crate) struct ProbeTargetInput {
 }
 
 /// GET /api/probes — list all probe targets.
-pub async fn list_probes(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<Value>, AppError> {
+pub async fn list_probes(State(state): State<Arc<AppState>>) -> Result<Json<Value>, AppError> {
     let rows = state.traffic_db.get_all_probe_targets();
     let list: Vec<Value> = rows
         .into_iter()

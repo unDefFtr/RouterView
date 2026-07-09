@@ -43,9 +43,10 @@ impl IntoResponse for AppError {
             AppError::HttpError(e) => (StatusCode::BAD_GATEWAY, e.to_string()),
             AppError::Serialization(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             AppError::Config(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-            AppError::RouterUnreachable => {
-                (StatusCode::SERVICE_UNAVAILABLE, "Router is unreachable".into())
-            }
+            AppError::RouterUnreachable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Router is unreachable".into(),
+            ),
             AppError::Database(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             AppError::InvalidData(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg.clone()),
             AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),

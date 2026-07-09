@@ -23,9 +23,10 @@ use crate::state::AppState;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing
     tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new("info,routerview_backend=debug")
-        }))
+        .with(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,routerview_backend=debug")),
+        )
         .with(tracing_subscriber::fmt::layer())
         .init();
 

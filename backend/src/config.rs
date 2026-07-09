@@ -63,15 +63,15 @@ impl Config {
         // Default port depends on scheme
         let default_port: u16 = if scheme == "http" { 80 } else { 443 };
 
-        let router_type = env_host("ROUTER_TYPE", "ROUTEROS_TYPE")
-            .unwrap_or_else(|| "routeros".to_string());
+        let router_type =
+            env_host("ROUTER_TYPE", "ROUTEROS_TYPE").unwrap_or_else(|| "routeros".to_string());
 
         let router_type = match router_type.to_lowercase().as_str() {
             "routeros" => RouterType::RouterOs,
             other => {
-                return Err(ConfigError::InvalidFormat(
-                    format!("Unknown router type: '{other}'. Supported: routeros"),
-                ));
+                return Err(ConfigError::InvalidFormat(format!(
+                    "Unknown router type: '{other}'. Supported: routeros"
+                )));
             }
         };
 
@@ -83,8 +83,7 @@ impl Config {
             router_scheme: scheme,
             router_username: env_host("ROUTER_USERNAME", "ROUTEROS_USERNAME")
                 .unwrap_or_else(|| "admin".to_string()),
-            router_password: env_host("ROUTER_PASSWORD", "ROUTEROS_PASSWORD")
-                .unwrap_or_default(),
+            router_password: env_host("ROUTER_PASSWORD", "ROUTEROS_PASSWORD").unwrap_or_default(),
             accept_invalid_certs: env_host("ROUTER_INSECURE_TLS", "ROUTEROS_INSECURE_TLS")
                 .map(|v| v.to_lowercase() == "true" || v == "1")
                 .unwrap_or(false),
@@ -106,14 +105,22 @@ fn env_host(new_key: &str, legacy_key: &str) -> Option<String> {
 }
 
 /// Parse an env var, checking the new name first, then the legacy name as fallback.
-fn parse_env_host<T: std::str::FromStr>(new_key: &str, legacy_key: &str, default: T) -> Result<T, ConfigError> {
+fn parse_env_host<T: std::str::FromStr>(
+    new_key: &str,
+    legacy_key: &str,
+    default: T,
+) -> Result<T, ConfigError> {
     // Try new key first
     if let Ok(val) = env::var(new_key) {
-        return val.parse::<T>().map_err(|_| ConfigError::InvalidFormat(new_key.to_string()));
+        return val
+            .parse::<T>()
+            .map_err(|_| ConfigError::InvalidFormat(new_key.to_string()));
     }
     // Fall back to legacy key
     match env::var(legacy_key) {
-        Ok(val) => val.parse::<T>().map_err(|_| ConfigError::InvalidFormat(legacy_key.to_string())),
+        Ok(val) => val
+            .parse::<T>()
+            .map_err(|_| ConfigError::InvalidFormat(legacy_key.to_string())),
         Err(std::env::VarError::NotPresent) => Ok(default),
         Err(e) => Err(ConfigError::EnvError(e)),
     }

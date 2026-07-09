@@ -1,5 +1,5 @@
 use chrono::{Datelike, Timelike};
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -9,7 +9,7 @@ use tracing::{info, warn};
 /// Traffic data point as returned by queries (from either raw or aggregated table).
 #[derive(Debug, Clone)]
 pub struct TrafficRecord {
-    pub timestamp_ms: i64,   // unix milliseconds
+    pub timestamp_ms: i64, // unix milliseconds
     pub download_bps: f64,
     pub upload_bps: f64,
     /// WAN interface name (empty string = aggregate)
@@ -363,10 +363,12 @@ impl TrafficDb {
             };
 
             stmt.query_map(params![raw_cutoff], |row| {
-                Ok((row.get::<_, i64>(0)?,
+                Ok((
+                    row.get::<_, i64>(0)?,
                     row.get::<_, f64>(1)?,
                     row.get::<_, f64>(2)?,
-                    row.get::<_, String>(3)?))
+                    row.get::<_, String>(3)?,
+                ))
             })
             .ok()
             .into_iter()
@@ -403,7 +405,9 @@ impl TrafficDb {
 
             for (bucket, wan_name, dl_sum, ul_sum, count) in &bucket_sums {
                 let c = *count as f64;
-                if let Err(e) = insert_stmt.execute(params![bucket, dl_sum / c, ul_sum / c, wan_name.as_str()]) {
+                if let Err(e) =
+                    insert_stmt.execute(params![bucket, dl_sum / c, ul_sum / c, wan_name.as_str()])
+                {
                     warn!("TrafficDB aggregate insert failed: {e}");
                 }
             }
@@ -417,20 +421,32 @@ impl TrafficDb {
         }
 
         // Delete old raw points
-        match conn.execute("DELETE FROM traffic_points WHERE ts < ?1", params![raw_cutoff]) {
+        match conn.execute(
+            "DELETE FROM traffic_points WHERE ts < ?1",
+            params![raw_cutoff],
+        ) {
             Ok(deleted) => {
                 if deleted > 0 {
-                    info!("TrafficDB deleted {} raw points older than {} ms", deleted, raw_cutoff);
+                    info!(
+                        "TrafficDB deleted {} raw points older than {} ms",
+                        deleted, raw_cutoff
+                    );
                 }
             }
             Err(e) => warn!("TrafficDB delete raw failed: {e}"),
         }
 
         // Delete old 1-minute buckets
-        match conn.execute("DELETE FROM traffic_1m WHERE bucket < ?1", params![total_cutoff]) {
+        match conn.execute(
+            "DELETE FROM traffic_1m WHERE bucket < ?1",
+            params![total_cutoff],
+        ) {
             Ok(deleted) => {
                 if deleted > 0 {
-                    info!("TrafficDB deleted {} aggregated buckets older than {} ms", deleted, total_cutoff);
+                    info!(
+                        "TrafficDB deleted {} aggregated buckets older than {} ms",
+                        deleted, total_cutoff
+                    );
                 }
             }
             Err(e) => warn!("TrafficDB delete 1m failed: {e}"),
@@ -577,9 +593,9 @@ impl TrafficDb {
                 return vec![];
             }
         };
-        let mut stmt = match conn.prepare(
-            "SELECT mac, custom_name, custom_type, updated_at FROM device_overrides",
-        ) {
+        let mut stmt = match conn
+            .prepare("SELECT mac, custom_name, custom_type, updated_at FROM device_overrides")
+        {
             Ok(s) => s,
             Err(e) => {
                 warn!("TrafficDB prepare overrides query failed: {e}");
@@ -792,10 +808,7 @@ pub fn apply_device_overrides(wifi: &mut WifiInfo, db: &TrafficDb) {
 /// the same timestamp.  This function is idempotent — if the schema is
 /// already current it does nothing.
 fn migrate_traffic_schema(conn: &rusqlite::Connection) {
-    for (table, pk_col) in &[
-        ("traffic_points", "ts"),
-        ("traffic_1m", "bucket"),
-    ] {
+    for (table, pk_col) in &[("traffic_points", "ts"), ("traffic_1m", "bucket")] {
         // Detect old schema: single-column PK without wan_name in PK
         let has_old_schema: bool = conn
             .prepare(&format!(
@@ -827,9 +840,7 @@ fn migrate_traffic_schema(conn: &rusqlite::Connection) {
         info!("Migrating {table} to composite-PK schema...");
 
         // Rename old table
-        let _ = conn.execute_batch(&format!(
-            "ALTER TABLE {table} RENAME TO {table}_old;"
-        ));
+        let _ = conn.execute_batch(&format!("ALTER TABLE {table} RENAME TO {table}_old;"));
 
         // Create new table with composite PK
         let create_sql = if *table == "traffic_points" {
@@ -856,7 +867,8 @@ fn migrate_traffic_schema(conn: &rusqlite::Connection) {
         let _ = conn.execute_batch(&create_sql);
 
         // Copy data: NULL → '' for aggregate rows
-        let _ = conn.execute_batch(&format!(
+        let _ =
+            conn.execute_batch(&format!(
             "INSERT OR IGNORE INTO {table} ({pk_col}, download_{suffix}, upload_{suffix}, wan_name)
              SELECT {pk_col}, download_{suffix}, upload_{suffix}, COALESCE(wan_name, '')
              FROM {table}_old",

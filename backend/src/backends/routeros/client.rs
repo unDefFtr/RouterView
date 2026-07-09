@@ -6,11 +6,11 @@ use reqwest::header::{HeaderValue, AUTHORIZATION};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
+use crate::backends::routeros::models::*;
 use crate::backends::{
     ConnectionTestResult, RouterBackend, RouterConnectionConfig, RouterData, RouterType,
 };
 use crate::error::AppError;
-use crate::backends::routeros::models::*;
 
 /// HTTP client wrapper for the MikroTik RouterOS REST API.
 ///
@@ -37,10 +37,7 @@ impl RouterOsClient {
     }
 
     /// Generic GET request to a RouterOS REST API path.
-    async fn get<T: serde::de::DeserializeOwned>(
-        &self,
-        path: &str,
-    ) -> Result<Vec<T>, AppError> {
+    async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<Vec<T>, AppError> {
         let url = format!("{}{}", self.base_url, path);
         debug!("GET {}", url);
 
@@ -49,9 +46,8 @@ impl RouterOsClient {
             .get(&url)
             .header(
                 AUTHORIZATION,
-                HeaderValue::from_str(&self.auth_header).map_err(|e| {
-                    AppError::Internal(format!("Invalid auth header: {e}"))
-                })?,
+                HeaderValue::from_str(&self.auth_header)
+                    .map_err(|e| AppError::Internal(format!("Invalid auth header: {e}")))?,
             )
             .send()
             .await
@@ -77,23 +73,20 @@ impl RouterOsClient {
             )));
         }
 
-        let body_text = resp.text().await.map_err(|e| {
-            AppError::RouterApi(format!("Failed to read response body: {e}"))
-        })?;
+        let body_text = resp
+            .text()
+            .await
+            .map_err(|e| AppError::RouterApi(format!("Failed to read response body: {e}")))?;
 
         if body_text.trim().is_empty() {
             return Ok(Vec::new());
         }
 
         serde_json::from_str::<Vec<T>>(&body_text)
-            .or_else(|_| {
-                serde_json::from_str::<T>(&body_text).map(|item| vec![item])
-            })
+            .or_else(|_| serde_json::from_str::<T>(&body_text).map(|item| vec![item]))
             .map_err(|e| {
                 warn!("Failed to deserialize RouterOS response: {e}");
-                AppError::RouterApi(format!(
-                    "Failed to parse response from {path}: {e}"
-                ))
+                AppError::RouterApi(format!("Failed to parse response from {path}: {e}"))
             })
     }
 
@@ -157,10 +150,7 @@ impl RouterOsClient {
     }
 
     async fn firewall_connections(&self) -> Result<Vec<ConnectionEntry>, AppError> {
-        match self
-            .get::<ConnectionEntry>("/ip/firewall/connection")
-            .await
-        {
+        match self.get::<ConnectionEntry>("/ip/firewall/connection").await {
             Ok(conns) => Ok(conns),
             Err(e) => {
                 debug!("Firewall connection tracking not available: {e}");
@@ -202,7 +192,10 @@ impl RouterOsClient {
     }
 
     async fn ipv6_firewall_connections(&self) -> Result<Vec<Ipv6ConnectionEntry>, AppError> {
-        match self.get::<Ipv6ConnectionEntry>("/ipv6/firewall/connection").await {
+        match self
+            .get::<Ipv6ConnectionEntry>("/ipv6/firewall/connection")
+            .await
+        {
             Ok(conns) => Ok(conns),
             Err(e) => {
                 debug!("IPv6 firewall connection tracking not available: {e}");
@@ -220,18 +213,13 @@ impl RouterOsClient {
 impl RouterBackend for RouterOsClient {
     async fn connect(config: &RouterConnectionConfig) -> Result<Self, AppError> {
         let base_url = Self::base_url(config);
-        let base_rest = format!(
-            "{}://{}:{}",
-            config.scheme, config.host, config.port
-        );
+        let base_rest = format!("{}://{}:{}", config.scheme, config.host, config.port);
 
         let http_client = build_http_client(config)?;
 
         // Strategy 1: Try token-based authentication
         debug!("Attempting token-based auth...");
-        if let Ok(auth_header) =
-            try_token_auth(&http_client, &base_rest, config).await
-        {
+        if let Ok(auth_header) = try_token_auth(&http_client, &base_rest, config).await {
             info!("RouterOS authenticated via token");
             return Ok(Self {
                 base_url,
@@ -242,18 +230,17 @@ impl RouterBackend for RouterOsClient {
 
         // Strategy 2: Fall back to Basic auth
         debug!("Token auth unavailable, falling back to Basic auth");
-        let auth_header = build_basic_auth_header(
-            &config.username,
-            &config.password,
-        )?;
+        let auth_header = build_basic_auth_header(&config.username, &config.password)?;
 
         // Quick sanity check: does a simple GET work with Basic auth?
         let test_url = format!("{}/system/resource", base_url);
         match http_client
             .get(&test_url)
-            .header(AUTHORIZATION, HeaderValue::from_str(&auth_header).map_err(|e| {
-                AppError::InvalidData(format!("Invalid auth header: {e}"))
-            })?)
+            .header(
+                AUTHORIZATION,
+                HeaderValue::from_str(&auth_header)
+                    .map_err(|e| AppError::InvalidData(format!("Invalid auth header: {e}")))?,
+            )
             .send()
             .await
         {
@@ -323,34 +310,35 @@ impl RouterBackend for RouterOsClient {
 
         // Fetch IPv6 endpoints in a separate parallel batch
         // IPv6 methods use graceful degradation (return Ok(empty) on error)
-        let (ipv6_ips_result, ipv6_routes_result, ipv6_neighbors_result, ipv6_connections_result) =
-            tokio::join!(
-                self.ipv6_addresses(),
-                self.ipv6_routes(),
-                self.ipv6_neighbors(),
-                self.ipv6_firewall_connections(),
-            );
+        let (ipv6_ips_result, ipv6_routes_result, ipv6_neighbors_result, ipv6_connections_result) = tokio::join!(
+            self.ipv6_addresses(),
+            self.ipv6_routes(),
+            self.ipv6_neighbors(),
+            self.ipv6_firewall_connections(),
+        );
         let ipv6_ips_result = ipv6_ips_result.unwrap_or_default();
         let ipv6_routes_result = ipv6_routes_result.unwrap_or_default();
         let ipv6_neighbors_result = ipv6_neighbors_result.unwrap_or_default();
         let ipv6_connections_result = ipv6_connections_result.unwrap_or_default();
 
-        Ok(crate::backends::routeros::transform::routeros_to_router_data(
-            sys_result,
-            identity_result,
-            ips_result,
-            interfaces_result,
-            arp_result,
-            dns_result,
-            leases_result,
-            wireless_result,
-            routes_result,
-            connections_result,
-            ipv6_ips_result,
-            ipv6_routes_result,
-            ipv6_neighbors_result,
-            ipv6_connections_result,
-        ))
+        Ok(
+            crate::backends::routeros::transform::routeros_to_router_data(
+                sys_result,
+                identity_result,
+                ips_result,
+                interfaces_result,
+                arp_result,
+                dns_result,
+                leases_result,
+                wireless_result,
+                routes_result,
+                connections_result,
+                ipv6_ips_result,
+                ipv6_routes_result,
+                ipv6_neighbors_result,
+                ipv6_connections_result,
+            ),
+        )
     }
 
     async fn test_connection(
@@ -362,12 +350,13 @@ impl RouterBackend for RouterOsClient {
         );
 
         let http_client = {
-            let mut builder = reqwest::Client::builder()
-                .timeout(Duration::from_secs(10));
+            let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(10));
             if config.scheme == "https" {
                 builder = builder.danger_accept_invalid_certs(config.accept_invalid_certs);
             }
-            builder.build().map_err(|e| AppError::Internal(e.to_string()))?
+            builder
+                .build()
+                .map_err(|e| AppError::Internal(e.to_string()))?
         };
 
         let auth_header = build_basic_auth_header(&config.username, &config.password)?;
@@ -376,9 +365,8 @@ impl RouterBackend for RouterOsClient {
             .get(&test_url)
             .header(
                 AUTHORIZATION,
-                HeaderValue::from_str(&auth_header).map_err(|e| {
-                    AppError::Internal(format!("Invalid auth header: {e}"))
-                })?,
+                HeaderValue::from_str(&auth_header)
+                    .map_err(|e| AppError::Internal(format!("Invalid auth header: {e}")))?,
             )
             .send()
             .await
@@ -392,8 +380,14 @@ impl RouterBackend for RouterOsClient {
                     version: String,
                 }
                 let info = resp.json::<Vec<Resource>>().await.ok();
-                let model = info.as_ref().and_then(|v| v.first()).map(|r| r.board_name.clone());
-                let version = info.as_ref().and_then(|v| v.first()).map(|r| r.version.clone());
+                let model = info
+                    .as_ref()
+                    .and_then(|v| v.first())
+                    .map(|r| r.board_name.clone());
+                let version = info
+                    .as_ref()
+                    .and_then(|v| v.first())
+                    .map(|r| r.version.clone());
 
                 Ok(ConnectionTestResult {
                     success: true,
@@ -432,8 +426,7 @@ impl RouterBackend for RouterOsClient {
 
 /// Build the base HTTP client (without auth headers — those are per-request).
 fn build_http_client(config: &RouterConnectionConfig) -> Result<reqwest::Client, AppError> {
-    let mut builder = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10));
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(10));
 
     if config.scheme == "https" {
         builder = builder.danger_accept_invalid_certs(config.accept_invalid_certs);
