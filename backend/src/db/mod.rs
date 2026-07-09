@@ -8,6 +8,19 @@ use tracing::{info, warn};
 
 use crate::secrets::EncryptedSecret;
 
+mod maintenance;
+mod schema;
+mod types;
+
+pub use maintenance::{
+    backup_database, check_database, export_legacy, migrate_database, restore_database,
+};
+#[allow(unused_imports)]
+pub use types::{
+    BackupArtifact, DatabaseError, DatabaseReport, MigrationReport, RestoreReport,
+    CURRENT_SCHEMA_VERSION,
+};
+
 /// Traffic data point as returned by queries (from either raw or aggregated table).
 #[derive(Debug, Clone)]
 pub struct TrafficRecord {
@@ -76,99 +89,63 @@ pub struct PairingRecord {
 /// reads are REST API queries (low concurrency).
 pub struct TrafficDb {
     conn: Mutex<Connection>,
+    _lock: Option<maintenance::DatabaseLock>,
+    path: PathBuf,
 }
 
 impl TrafficDb {
     /// Open (or create) the SQLite database at the given path.
-    pub fn open(path: &PathBuf) -> Result<Self, rusqlite::Error> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-
-        let conn = Connection::open(path)?;
-
-        // Enable WAL mode for better concurrent read/write performance. Secure
-        // deletion is required because legacy releases stored credentials in
-        // the config table.
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;
-             PRAGMA secure_delete=ON;
-             PRAGMA foreign_keys=ON;",
-        )?;
-
-        // Raw 5-second data — composite PK (ts, wan_name) so per-WAN
-        // and aggregate rows can coexist at the same timestamp.
-        // wan_name = '' means aggregate traffic.
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS traffic_points (
-                ts          INTEGER NOT NULL,
-                download_bps REAL NOT NULL,
-                upload_bps   REAL NOT NULL,
-                wan_name     TEXT NOT NULL DEFAULT '',
-                PRIMARY KEY (ts, wan_name)
-            )",
-            [],
-        )?;
-
-        // 1-minute aggregated data for older records
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS traffic_1m (
-                bucket       INTEGER NOT NULL,
-                download_avg REAL NOT NULL,
-                upload_avg   REAL NOT NULL,
-                wan_name     TEXT NOT NULL DEFAULT '',
-                PRIMARY KEY (bucket, wan_name)
-            )",
-            [],
-        )?;
-
-        // Migrate old schema: tables created before the composite-PK change
-        // may have wan_name as a nullable column with NULL for aggregate.
-        // Convert NULL → '' and rebuild the PK to include wan_name.
-        migrate_traffic_schema(&conn);
-
-        // Simple key-value config store
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS config (
-                key   TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )",
-            [],
-        )?;
-
-        migrate_security_schema(&conn)?;
-
-        // User-assigned device name/type overrides
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS device_overrides (
-                mac         TEXT PRIMARY KEY,
-                custom_name TEXT,
-                custom_type TEXT,
-                updated_at  INTEGER NOT NULL DEFAULT (unixepoch())
-            )",
-            [],
-        )?;
-
-        // User-configurable latency probe targets
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS probe_targets (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                name       TEXT NOT NULL,
-                host       TEXT NOT NULL,
-                category   TEXT NOT NULL DEFAULT 'custom',
-                sort_order INTEGER NOT NULL DEFAULT 0
-            )",
-            [],
-        )?;
+    pub fn open(path: &PathBuf) -> Result<Self, DatabaseError> {
+        let (conn, lock, migration) = maintenance::open_runtime(path)?;
 
         // Seed default probe targets (idempotent — skips if any exist)
         seed_default_probe_targets_inner(&conn);
 
+        if let Some(backup) = &migration.backup {
+            info!(
+                "Migrated traffic DB from v{} to v{}; verified backup: {} ({})",
+                migration.from_version,
+                migration.to_version,
+                backup.path.display(),
+                backup.sha256
+            );
+        }
         info!("Traffic DB opened at {}", path.display());
         Ok(Self {
             conn: Mutex::new(conn),
+            _lock: lock,
+            path: path.clone(),
         })
+    }
+
+    /// Open only the configuration and security schema. The caller must load
+    /// encrypted secrets and then call `finish_migrations` before serving.
+    pub fn open_for_bootstrap(path: &PathBuf) -> Result<Self, DatabaseError> {
+        let (conn, lock) = maintenance::open_bootstrap_runtime(path)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+            _lock: lock,
+            path: path.clone(),
+        })
+    }
+
+    pub fn finish_migrations(&self) -> Result<MigrationReport, DatabaseError> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let migration = maintenance::finish_runtime_migration(&self.path, &mut conn)?;
+        seed_default_probe_targets_inner(&conn);
+        if let Some(backup) = &migration.backup {
+            info!(
+                "Migrated traffic DB from v{} to v{}; verified backup: {} ({})",
+                migration.from_version,
+                migration.to_version,
+                backup.path.display(),
+                backup.sha256
+            );
+        }
+        Ok(migration)
     }
 
     /// Insert a single raw traffic point (idempotent on composite PK).
@@ -494,28 +471,6 @@ impl TrafficDb {
                 }
             }
             Err(e) => warn!("TrafficDB delete 1m failed: {e}"),
-        }
-    }
-
-    /// Delete all records older than `before_ms`. Legacy; prefer `aggregate_and_prune`.
-    pub fn prune(&self, before_ms: i64) {
-        let conn = match self.conn.lock() {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("TrafficDB lock poisoned during prune: {e}");
-                return;
-            }
-        };
-        match conn.execute(
-            "DELETE FROM traffic_points WHERE ts < ?1",
-            params![before_ms],
-        ) {
-            Ok(deleted) => {
-                if deleted > 0 {
-                    info!("TrafficDB pruned {} old records", deleted);
-                }
-            }
-            Err(e) => warn!("TrafficDB prune failed: {e}"),
         }
     }
 
@@ -952,8 +907,7 @@ impl TrafficDb {
         conn.execute_batch(
             "VACUUM;
              PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;
-             PRAGMA wal_checkpoint(TRUNCATE);",
+             PRAGMA synchronous=NORMAL;",
         )?;
         Ok(())
     }
@@ -1440,175 +1394,6 @@ pub fn apply_device_overrides(wifi: &mut WifiInfo, db: &TrafficDb) {
     }
 }
 
-fn migrate_security_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(
-        "BEGIN IMMEDIATE;
-         CREATE TABLE IF NOT EXISTS schema_migrations (
-             name       TEXT PRIMARY KEY,
-             applied_at INTEGER NOT NULL DEFAULT (unixepoch())
-         );
-         CREATE TABLE IF NOT EXISTS encrypted_secrets (
-             name       TEXT PRIMARY KEY,
-             ciphertext BLOB NOT NULL,
-             nonce      BLOB NOT NULL,
-             key_id     TEXT NOT NULL,
-             updated_at INTEGER NOT NULL DEFAULT (unixepoch())
-         );
-         CREATE TABLE IF NOT EXISTS admins (
-             id            INTEGER PRIMARY KEY CHECK (id = 1),
-             username      TEXT NOT NULL UNIQUE,
-             password_hash TEXT NOT NULL,
-             credential_version INTEGER NOT NULL DEFAULT 1 CHECK (credential_version > 0),
-             created_at    INTEGER NOT NULL DEFAULT (unixepoch()),
-             updated_at    INTEGER NOT NULL DEFAULT (unixepoch())
-         );
-         CREATE TABLE IF NOT EXISTS auth_sessions (
-             id                  TEXT PRIMARY KEY,
-             token_hash          BLOB NOT NULL UNIQUE,
-             csrf_hash           BLOB NOT NULL,
-             username            TEXT NOT NULL,
-             role                TEXT NOT NULL CHECK (role IN ('viewer', 'admin')),
-             kind                TEXT NOT NULL CHECK (kind IN ('standard', 'fixed')),
-             label               TEXT,
-             created_at          INTEGER NOT NULL,
-             last_seen_at        INTEGER NOT NULL,
-             idle_expires_at     INTEGER,
-             absolute_expires_at INTEGER NOT NULL,
-             revoked_at          INTEGER
-         );
-         CREATE INDEX IF NOT EXISTS idx_auth_sessions_token
-             ON auth_sessions(token_hash);
-         CREATE INDEX IF NOT EXISTS idx_auth_sessions_expiry
-             ON auth_sessions(absolute_expires_at, revoked_at);
-         CREATE TABLE IF NOT EXISTS pairing_codes (
-             id                    TEXT PRIMARY KEY,
-             code_hash             BLOB NOT NULL UNIQUE,
-             role                  TEXT NOT NULL CHECK (role IN ('viewer', 'admin')),
-             label                 TEXT NOT NULL,
-             created_by_session_id TEXT NOT NULL,
-             created_at            INTEGER NOT NULL,
-             expires_at            INTEGER NOT NULL,
-             used_at               INTEGER,
-             FOREIGN KEY(created_by_session_id) REFERENCES auth_sessions(id)
-         );
-         CREATE TABLE IF NOT EXISTS setup_tokens (
-             id         INTEGER PRIMARY KEY CHECK (id = 1),
-             token_hash BLOB NOT NULL,
-             expires_at INTEGER NOT NULL,
-             used_at    INTEGER
-         );
-         INSERT OR IGNORE INTO schema_migrations(name)
-             VALUES ('security_auth_secrets_v1');
-         COMMIT;",
-    )?;
-    let has_credential_version = conn
-        .prepare("SELECT 1 FROM pragma_table_info('admins') WHERE name = 'credential_version'")?
-        .exists([])?;
-    if !has_credential_version {
-        let tx = conn.unchecked_transaction()?;
-        tx.execute(
-            "ALTER TABLE admins ADD COLUMN credential_version INTEGER NOT NULL DEFAULT 1
-             CHECK (credential_version > 0)",
-            [],
-        )?;
-        tx.execute(
-            "INSERT OR IGNORE INTO schema_migrations(name)
-             VALUES ('admin_credential_version_v1')",
-            [],
-        )?;
-        tx.commit()?;
-    } else {
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations(name)
-             VALUES ('admin_credential_version_v1')",
-            [],
-        )?;
-    }
-    Ok(())
-}
-
-/// Migrate old traffic table schemas to the composite-PK layout.
-///
-/// Old tables used `ts INTEGER PRIMARY KEY` with an optional `wan_name`
-/// column added later via ALTER TABLE (NULL = aggregate).  The composite
-/// PK `(ts, wan_name)` allows aggregate and per-WAN rows to coexist at
-/// the same timestamp.  This function is idempotent — if the schema is
-/// already current it does nothing.
-fn migrate_traffic_schema(conn: &rusqlite::Connection) {
-    for (table, pk_col) in &[("traffic_points", "ts"), ("traffic_1m", "bucket")] {
-        // Detect old schema: single-column PK without wan_name in PK
-        let has_old_schema: bool = conn
-            .prepare(&format!(
-                "SELECT 1 FROM pragma_table_info('{table}') WHERE name = 'wan_name'"
-            ))
-            .and_then(|mut s| s.exists([]))
-            .unwrap_or(false);
-
-        // Check if wan_name is already part of a composite PK (v2 schema)
-        let is_composite_pk: bool = conn
-            .prepare(&format!(
-                "SELECT 1 FROM pragma_table_info('{table}')
-                 WHERE name = 'wan_name' AND pk > 0"
-            ))
-            .and_then(|mut s| s.exists([]))
-            .unwrap_or(false);
-
-        if !has_old_schema {
-            // Table was created with the new schema already — nothing to do
-            continue;
-        }
-
-        if is_composite_pk {
-            // Already migrated
-            continue;
-        }
-
-        // ── Perform migration ──────────────────────────────────
-        info!("Migrating {table} to composite-PK schema...");
-
-        // Rename old table
-        let _ = conn.execute_batch(&format!("ALTER TABLE {table} RENAME TO {table}_old;"));
-
-        // Create new table with composite PK
-        let create_sql = if *table == "traffic_points" {
-            format!(
-                "CREATE TABLE {table} (
-                    ts          INTEGER NOT NULL,
-                    download_bps REAL NOT NULL,
-                    upload_bps   REAL NOT NULL,
-                    wan_name     TEXT NOT NULL DEFAULT '',
-                    PRIMARY KEY (ts, wan_name)
-                )"
-            )
-        } else {
-            format!(
-                "CREATE TABLE {table} (
-                    bucket       INTEGER NOT NULL,
-                    download_avg REAL NOT NULL,
-                    upload_avg   REAL NOT NULL,
-                    wan_name     TEXT NOT NULL DEFAULT '',
-                    PRIMARY KEY (bucket, wan_name)
-                )"
-            )
-        };
-        let _ = conn.execute_batch(&create_sql);
-
-        // Copy data: NULL → '' for aggregate rows
-        let _ =
-            conn.execute_batch(&format!(
-            "INSERT OR IGNORE INTO {table} ({pk_col}, download_{suffix}, upload_{suffix}, wan_name)
-             SELECT {pk_col}, download_{suffix}, upload_{suffix}, COALESCE(wan_name, '')
-             FROM {table}_old",
-            suffix = if *table == "traffic_points" { "bps" } else { "avg" },
-        ));
-
-        // Drop old table
-        let _ = conn.execute_batch(&format!("DROP TABLE {table}_old;"));
-
-        info!("{table} migration complete");
-    }
-}
-
 // ═══════════════════════════════════════════════════════════════════
 // Probe target seed data
 // ═══════════════════════════════════════════════════════════════════
@@ -1908,7 +1693,7 @@ mod security_tests {
 
     #[test]
     fn security_schema_migrates_existing_admin_credential_version() {
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE admins (
                  id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -1921,7 +1706,7 @@ mod security_tests {
         )
         .unwrap();
 
-        migrate_security_schema(&conn).unwrap();
+        schema::bootstrap_security_schema(&mut conn).unwrap();
         assert_eq!(
             conn.query_row(
                 "SELECT credential_version FROM admins WHERE id = 1",

@@ -35,13 +35,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if run_admin_cli()? {
         return Ok(());
     }
+    if run_database_cli()? {
+        return Ok(());
+    }
 
     // Load configuration from environment
     let env_config = Config::from_env()?;
 
     // Open SQLite traffic history database
     let db_path = std::path::PathBuf::from(&env_config.db_path);
-    let traffic_db = Arc::new(db::TrafficDb::open(&db_path)?);
+    let traffic_db = Arc::new(db::TrafficDb::open_for_bootstrap(&db_path)?);
 
     let secret_cipher = Arc::new(secrets::SecretCipher::from_file(
         &env_config.master_key_file,
@@ -50,6 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Merge env config with DB overrides
     let merged_config = ConfigStore::load(&traffic_db, &env_config, &secret_cipher)?;
+    traffic_db.finish_migrations()?;
     let config = Arc::new(tokio::sync::RwLock::new(merged_config));
 
     {
@@ -177,8 +181,12 @@ fn run_admin_cli() -> Result<bool, Box<dyn std::error::Error>> {
         return Err("passwords do not match".into());
     }
 
-    let db_path = std::env::var("DB_PATH").unwrap_or_else(|_| "traffic.db".to_string());
-    let database = db::TrafficDb::open(&std::path::PathBuf::from(db_path))?;
+    let env_config = Config::from_env()?;
+    let db_path = std::path::PathBuf::from(&env_config.db_path);
+    let database = db::TrafficDb::open_for_bootstrap(&db_path)?;
+    let secret_cipher = secrets::SecretCipher::from_file(&env_config.master_key_file)?;
+    ConfigStore::load(&database, &env_config, &secret_cipher)?;
+    database.finish_migrations()?;
     auth::create_admin_from_cli(&database, username, &password, command == "reset-password")?;
     let setup_token_file = std::env::var("SETUP_TOKEN_FILE")
         .unwrap_or_else(|_| "/tmp/routerview-setup-token".to_string());
@@ -187,4 +195,160 @@ fn run_admin_cli() -> Result<bool, Box<dyn std::error::Error>> {
     }
     println!("Administrator credentials updated successfully.");
     Ok(true)
+}
+
+fn run_database_cli() -> Result<bool, Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) != Some("db") {
+        return Ok(false);
+    }
+    let command = args.get(2).map(String::as_str).unwrap_or("");
+    let parsed = parse_database_cli_options(&args[3..])?;
+    let database_path = parsed
+        .database_path
+        .unwrap_or_else(|| std::path::PathBuf::from(env_or("DB_PATH", "traffic.db")));
+
+    match command {
+        "check" => {
+            require_positionals(command, &parsed.positionals, 0)?;
+            let report = db::check_database(&database_path)?;
+            println!(
+                "database={} user_version={} integrity={} foreign_key_violations={}",
+                report.path.display(),
+                report.user_version,
+                report.integrity,
+                report.foreign_key_violations
+            );
+            for (table, count) in report.table_counts {
+                println!("table={table} rows={count}");
+            }
+        }
+        "migrate" => {
+            require_positionals(command, &parsed.positionals, 0)?;
+            let report = db::migrate_database(&database_path, parsed.backup_dir.as_deref())?;
+            println!(
+                "database={} migrated_from={} migrated_to={}",
+                report.path.display(),
+                report.from_version,
+                report.to_version
+            );
+            if let Some(backup) = report.backup {
+                print_backup(&backup);
+            }
+        }
+        "backup" => {
+            require_positionals(command, &parsed.positionals, 1)?;
+            let backup = db::backup_database(
+                &database_path,
+                &std::path::PathBuf::from(&parsed.positionals[0]),
+            )?;
+            print_backup(&backup);
+        }
+        "restore" => {
+            require_positionals(command, &parsed.positionals, 1)?;
+            let report = db::restore_database(
+                &database_path,
+                &std::path::PathBuf::from(&parsed.positionals[0]),
+                parsed.backup_dir.as_deref(),
+            )?;
+            println!(
+                "database={} restored_from={}",
+                report.path.display(),
+                report.restored_from.display()
+            );
+            if let Some(backup) = &report.recovery_backup {
+                println!("recovery_backup={}", backup.path.display());
+                println!("recovery_backup_sha256={}", backup.sha256);
+            }
+            if let Some(quarantine) = &report.quarantine {
+                println!("quarantine={}", quarantine.directory.display());
+                println!("quarantine_manifest={}", quarantine.manifest_path.display());
+                for (name, checksum) in &quarantine.file_checksums {
+                    println!("quarantine_file={name} sha256={checksum}");
+                }
+            }
+        }
+        "export-legacy" => {
+            require_positionals(command, &parsed.positionals, 1)?;
+            let export = db::export_legacy(
+                &database_path,
+                &std::path::PathBuf::from(&parsed.positionals[0]),
+            )?;
+            println!("legacy_export={}", export.path.display());
+            println!("legacy_export_sha256={}", export.sha256);
+            println!("manifest={}", export.manifest_path.display());
+        }
+        _ => {
+            return Err(
+                "usage: routerview-backend db <check|migrate|backup|restore|export-legacy> \
+                 [FILE] [--path DATABASE] [--backup-dir DIRECTORY]"
+                    .into(),
+            )
+        }
+    }
+    Ok(true)
+}
+
+#[derive(Default)]
+struct DatabaseCliOptions {
+    database_path: Option<std::path::PathBuf>,
+    backup_dir: Option<std::path::PathBuf>,
+    positionals: Vec<String>,
+}
+
+fn parse_database_cli_options(
+    args: &[String],
+) -> Result<DatabaseCliOptions, Box<dyn std::error::Error>> {
+    let mut parsed = DatabaseCliOptions::default();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--path" => {
+                index += 1;
+                let value = args.get(index).ok_or("--path requires a value")?;
+                if parsed.database_path.replace(value.into()).is_some() {
+                    return Err("--path may only be specified once".into());
+                }
+            }
+            "--backup-dir" => {
+                index += 1;
+                let value = args.get(index).ok_or("--backup-dir requires a value")?;
+                if parsed.backup_dir.replace(value.into()).is_some() {
+                    return Err("--backup-dir may only be specified once".into());
+                }
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown database option: {value}").into());
+            }
+            value => parsed.positionals.push(value.to_string()),
+        }
+        index += 1;
+    }
+    Ok(parsed)
+}
+
+fn require_positionals(
+    command: &str,
+    positionals: &[String],
+    expected: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if positionals.len() != expected {
+        return Err(format!(
+            "db {command} expects {expected} file argument(s), received {}",
+            positionals.len()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn print_backup(backup: &db::BackupArtifact) {
+    println!("backup={}", backup.path.display());
+    println!("sha256={}", backup.sha256);
+    println!("manifest={}", backup.manifest_path.display());
+    println!("user_version={}", backup.user_version);
+}
+
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
