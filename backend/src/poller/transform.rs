@@ -3,9 +3,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use tracing::debug;
 
+use crate::backends::*;
 use crate::db::TrafficDb;
 use crate::error::AppError;
-use crate::routeros::models::*;
 use crate::ws::protocol::*;
 
 /// Neighbor states that represent a currently-connected device.
@@ -14,26 +14,13 @@ use crate::ws::protocol::*;
 /// "incomplete" (unresolved).
 const LIVE_NEIGHBOR_STATES: &[&str] = &["permanent", "reachable", "stale", "delay", "probe"];
 
-/// Transforms raw RouterOS REST API data into the dashboard-friendly
+/// Transforms vendor-neutral `RouterData` into the dashboard-friendly
 /// `DashboardSnapshot` structure.
 ///
-/// This function is the bridge between the string-based RouterOS API
-/// responses and the typed, normalized format the frontend expects.
+/// This function is the bridge between the typed, normalized data from
+/// any router backend and the format the frontend expects.
 pub fn to_dashboard_snapshot(
-    sys: SystemResource,
-    identity: SystemIdentity,
-    ips: Vec<IpAddress>,
-    interfaces: Vec<Interface>,
-    arp: Vec<ArpEntry>,
-    _dns: DnsConfig,
-    leases: Vec<DhcpLease>,
-    wireless_regs: Vec<WirelessRegistration>,
-    routes: Vec<Route>,
-    connections: Vec<ConnectionEntry>,
-    ipv6_ips: Vec<Ipv6Address>,
-    ipv6_routes: Vec<Ipv6Route>,
-    ipv6_neighbors: Vec<Ipv6Neighbor>,
-    ipv6_connections: Vec<Ipv6ConnectionEntry>,
+    data: RouterData,
     prev_counters: Option<&HashMap<String, (u64, u64)>>, // (rx_bytes, tx_bytes) from last tick
     latency_results: Vec<LatencyProbe>,
     stability: IspStability,
@@ -43,46 +30,44 @@ pub fn to_dashboard_snapshot(
     let now = chrono::Utc::now().to_rfc3339();
 
     // ── Find all WANs from the routing table ──────────────
-    let all_wans = resolve_all_wans(&ips, &interfaces, &routes, &ipv6_ips, &ipv6_routes);
+    let all_wans = resolve_all_wans(&data.ip_addresses, &data.interfaces, &data.routes, &data.ipv6_addresses, &data.ipv6_routes);
     let primary_wan = all_wans
         .first()
         .cloned()
-        .unwrap_or_else(|| fallback_wan(&ips, &interfaces, &ipv6_ips));
+        .unwrap_or_else(|| fallback_wan(&data.ip_addresses, &data.interfaces, &data.ipv6_addresses));
 
     // ── System Info ───────────────────────────────────────
-    let system = extract_system_info(&sys);
+    let system = extract_system_info(&data.system);
 
     // ── Gateway Info (primary + all WAN entries) ──────────
-    let gateway = extract_gateway(&primary_wan, &all_wans, &leases, prev_counters, poll_interval_secs);
+    let gateway = extract_gateway(&primary_wan, &all_wans, &data.dhcp_leases, prev_counters, poll_interval_secs);
 
     // ── Interface Summary ─────────────────────────────────
-    let interface_summary = extract_interface_summary(&interfaces, &arp, &ipv6_neighbors);
+    let interface_summary = extract_interface_summary(&data.interfaces, &data.arp_entries, &data.ipv6_neighbors);
 
     // ── ISP Info (primary + per-WAN) ──────────────────────
-    let total_connection_count = connections.len() as u32 + ipv6_connections.len() as u32;
-    let ipv6_conn_count = ipv6_connections.len() as u32;
+    let total_connection_count = data.connection_count + data.ipv6_connection_count;
+    let ipv6_conn_count = data.ipv6_connection_count;
     // Only surface the v6 connection count when the primary WAN actually has a GUA.
-    // If the WAN only has ULA (or no IPv6 at all), treat the egress as v6-incapable
-    // and hide the v6 connection counter from the UI.
     let connection_count_ipv6 = if primary_wan.ipv6_address.is_some() {
         Some(ipv6_conn_count)
     } else {
         None
     };
-    let isp = extract_isp(&identity, &primary_wan, &all_wans, prev_counters, traffic_db, poll_interval_secs, total_connection_count, connection_count_ipv6);
+    let isp = extract_isp(&data.identity, &primary_wan, &all_wans, prev_counters, traffic_db, poll_interval_secs, total_connection_count, connection_count_ipv6);
 
     // ── Traffic (aggregate + per-WAN points) ───────────────
     let traffic = extract_traffic(&all_wans, prev_counters, &now, poll_interval_secs);
 
     // ── WiFi Info ─────────────────────────────────────────
-    let wifi = extract_wifi(&wireless_regs, &arp, &leases, &ipv6_neighbors);
+    let wifi = extract_wifi(&data.wireless_clients, &data.arp_entries, &data.dhcp_leases, &data.ipv6_neighbors);
 
     // ── Per-interface status with rates ───────────────────
-    let interface_statuses = extract_interface_statuses(&interfaces, prev_counters, &all_wans, poll_interval_secs);
+    let interface_statuses = extract_interface_statuses(&data.interfaces, prev_counters, &all_wans, poll_interval_secs);
 
     // ── Build per-WAN snapshot fields ─────────────────────
     let wans: Vec<WanEntry> = build_wan_entries(&all_wans, prev_counters, poll_interval_secs);
-    let wans_isp: Vec<WanIspInfo> = build_wan_isp_entries(&all_wans, &identity);
+    let wans_isp: Vec<WanIspInfo> = build_wan_isp_entries(&all_wans, &data.identity);
     let wan_traffic_points: Vec<TrafficPoint> = build_wan_traffic_points(&all_wans, prev_counters, &now, poll_interval_secs);
 
     Ok(DashboardSnapshot {
@@ -115,8 +100,8 @@ struct WanInfo {
     gateway: String,
     /// Whether the interface is running
     online: bool,
-    /// Matching Interface struct (for RX/TX byte counters)
-    iface: Option<Interface>,
+    /// Matching InterfaceEntry (for RX/TX byte counters)
+    iface: Option<InterfaceEntry>,
     /// IPv6 address on this WAN interface, if any (non-link-local)
     ipv6_address: Option<String>,
     /// IPv6 gateway from the default IPv6 route, if any
@@ -125,19 +110,12 @@ struct WanInfo {
 
 /// Collect ALL active default routes from the routing table (both IPv4 and IPv6).
 /// Each distinct (gateway, interface_name) pair becomes one WanInfo.
-///
-/// Routes are sorted so reachable gateways come first; the first online
-/// entry is treated as the primary WAN by callers.
-///
-/// IPv6 addresses and gateways are ATTACHED to existing WAN entries when
-/// the interface matches — a dual-stack WAN is one logical entry with both
-/// address families, not two separate entries.
 fn resolve_all_wans(
-    ips: &[IpAddress],
-    interfaces: &[Interface],
-    routes: &[Route],
-    ipv6_ips: &[Ipv6Address],
-    ipv6_routes: &[Ipv6Route],
+    ips: &[IpAddrEntry],
+    interfaces: &[InterfaceEntry],
+    routes: &[RouteEntry],
+    ipv6_ips: &[Ipv6AddrEntry],
+    ipv6_routes: &[RouteEntry],
 ) -> Vec<WanInfo> {
     let mut seen: HashSet<(String, String)> = HashSet::new();
     let mut wans: Vec<WanInfo> = Vec::new();
@@ -149,12 +127,12 @@ fn resolve_all_wans(
     let ipv6_default_ifaces = build_ipv6_default_iface_set(ipv6_routes);
 
     // Collect and sort: reachable gateways first
-    let mut default_routes: Vec<&Route> = routes
+    let mut default_routes: Vec<&RouteEntry> = routes
         .iter()
         .filter(|r| {
             r.dst_address == "0.0.0.0/0"
-                && r.active != "false"
-                && r.disabled != "true"
+                && r.active
+                && !r.disabled
                 && !r.gateway.is_empty()
         })
         .collect();
@@ -174,16 +152,14 @@ fn resolve_all_wans(
             route.interface.clone()
         };
 
-        // Deduplicate by (gateway, interface_name)
         let key = (route.gateway.clone(), route_iface_name.clone());
         if !seen.insert(key) {
             continue;
         }
 
-        // Find the IP on that egress interface
         let ip_entry = ips
             .iter()
-            .filter(|ip| ip.disabled != "true")
+            .filter(|ip| !ip.disabled)
             .find(|ip| {
                 let ifname = if ip.actual_interface.is_empty() {
                     &ip.interface
@@ -197,7 +173,6 @@ fn resolve_all_wans(
             .map(|e| extract_ip_from_cidr(&e.address))
             .unwrap_or_else(|| "—".to_string());
 
-        // Find the matching Interface struct
         let iface = interfaces
             .iter()
             .find(|i| i.name == route_iface_name)
@@ -205,7 +180,7 @@ fn resolve_all_wans(
 
         let online = iface
             .as_ref()
-            .map(|i| i.running == "true")
+            .map(|i| i.running)
             .unwrap_or(false);
 
         // ── IPv6: look up address and gateway for this interface ──
@@ -232,12 +207,12 @@ fn resolve_all_wans(
     // ── IPv6-only WANs: IPv6 default routes whose interfaces aren't already in the list ──
     let seen_ifaces: HashSet<String> = wans.iter().map(|w| w.interface_name.clone()).collect();
 
-    let mut v6_only_routes: Vec<&Ipv6Route> = ipv6_routes
+    let mut v6_only_routes: Vec<&RouteEntry> = ipv6_routes
         .iter()
         .filter(|r| {
             r.dst_address == "::/0"
-                && r.active != "false"
-                && r.disabled != "true"
+                && r.active
+                && !r.disabled
                 && !r.gateway.is_empty()
         })
         .collect();
@@ -259,8 +234,6 @@ fn resolve_all_wans(
             if v6route.gateway.parse::<IpAddr>().is_ok() {
                 v6route.gateway.clone()
             } else {
-                // PPPoE-style: gateway IS the interface name, the actual next-hop
-                // isn't visible in the route table. Use the gateway field as-is.
                 v6route.gateway.clone()
             }
         });
@@ -272,7 +245,7 @@ fn resolve_all_wans(
 
         let online = iface
             .as_ref()
-            .map(|i| i.running == "true")
+            .map(|i| i.running)
             .unwrap_or(false);
 
         wans.push(WanInfo {
@@ -297,33 +270,29 @@ fn resolve_all_wans(
 }
 
 /// Pick the primary WAN from the resolved list (first reachable, or fallback).
-/// Kept for backward compatibility — single-WAN callers use this.
 fn resolve_wan(
-    ips: &[IpAddress],
-    interfaces: &[Interface],
-    routes: &[Route],
-    ipv6_ips: &[Ipv6Address],
-    ipv6_routes: &[Ipv6Route],
+    ips: &[IpAddrEntry],
+    interfaces: &[InterfaceEntry],
+    routes: &[RouteEntry],
+    ipv6_ips: &[Ipv6AddrEntry],
+    ipv6_routes: &[RouteEntry],
 ) -> WanInfo {
     let all = resolve_all_wans(ips, interfaces, routes, ipv6_ips, ipv6_routes);
 
-    // Prefer the first online WAN
     if let Some(wan) = all.into_iter().find(|w| w.online) {
         return wan;
     }
 
-    // Fallback: pick first running ethernet interface with an IP
     fallback_wan(ips, interfaces, ipv6_ips)
 }
 
 /// Fallback when no default route exists.
-fn fallback_wan(ips: &[IpAddress], interfaces: &[Interface], ipv6_ips: &[Ipv6Address]) -> WanInfo {
+fn fallback_wan(ips: &[IpAddrEntry], interfaces: &[InterfaceEntry], ipv6_ips: &[Ipv6AddrEntry]) -> WanInfo {
     let ipv6_addr_map = build_ipv6_addr_map(ipv6_ips);
 
-    // Pick the first running ethernet interface that has an IP
     for iface in interfaces
         .iter()
-        .filter(|i| i.running == "true" && i.disabled != "true")
+        .filter(|i| i.running && !i.disabled)
     {
         if let Some(ip) = ips.iter().find(|ip| {
             let ifname = if ip.actual_interface.is_empty() {
@@ -331,7 +300,7 @@ fn fallback_wan(ips: &[IpAddress], interfaces: &[Interface], ipv6_ips: &[Ipv6Add
             } else {
                 &ip.actual_interface
             };
-            ifname == &iface.name && ip.disabled != "true"
+            ifname == &iface.name && !ip.disabled
         }) {
             let ip_addr = extract_ip_from_cidr(&ip.address);
             let gateway = extract_first_ip_in_subnet(&ip.address);
@@ -343,7 +312,7 @@ fn fallback_wan(ips: &[IpAddress], interfaces: &[Interface], ipv6_ips: &[Ipv6Add
                 online: true,
                 iface: Some(iface.clone()),
                 ipv6_address,
-                ipv6_gateway: None, // no route table to consult
+                ipv6_gateway: None,
             };
         }
     }
@@ -361,20 +330,20 @@ fn fallback_wan(ips: &[IpAddress], interfaces: &[Interface], ipv6_ips: &[Ipv6Add
 
 // ── Extraction Helpers ───────────────────────────────────────
 
-fn extract_system_info(sys: &SystemResource) -> SystemInfo {
+fn extract_system_info(sys: &SystemData) -> SystemInfo {
     let uptime_str = parse_routeros_uptime(&sys.uptime);
-    let uptime_seconds = parse_routeros_uptime_to_seconds(&sys.uptime);
+    let uptime_seconds = sys.uptime_seconds;
 
     SystemInfo {
         model: sys.board_name.clone(),
         version: sys.version.clone(),
         uptime: uptime_str,
         uptime_seconds,
-        cpu_load: parse_f64(&sys.cpu_load),
-        free_memory: parse_u64(&sys.free_memory),
-        total_memory: parse_u64(&sys.total_memory),
-        total_hdd: parse_u64(&sys.total_hdd),
-        free_hdd: parse_u64(&sys.free_hdd),
+        cpu_load: sys.cpu_load,
+        free_memory: sys.free_memory,
+        total_memory: sys.total_memory,
+        total_hdd: sys.total_hdd,
+        free_hdd: sys.free_hdd,
         architecture: sys.architecture_name.clone(),
         board_name: sys.board_name.clone(),
     }
@@ -383,7 +352,7 @@ fn extract_system_info(sys: &SystemResource) -> SystemInfo {
 fn extract_gateway(
     primary: &WanInfo,
     all_wans: &[WanInfo],
-    leases: &[DhcpLease],
+    leases: &[DhcpLeaseEntry],
     prev_counters: Option<&HashMap<String, (u64, u64)>>,
     poll_interval_secs: f64,
 ) -> GatewayInfo {
@@ -404,7 +373,7 @@ fn extract_gateway(
     }
 }
 
-fn extract_interface_summary(interfaces: &[Interface], arp: &[ArpEntry], ipv6_neighbors: &[Ipv6Neighbor]) -> InterfaceSummary {
+fn extract_interface_summary(interfaces: &[InterfaceEntry], arp: &[NeighborEntry], ipv6_neighbors: &[NeighborEntry]) -> InterfaceSummary {
     let ethernet_count = interfaces
         .iter()
         .filter(|i| i.iface_type == "ether" || i.default_name.starts_with("ether"))
@@ -420,22 +389,19 @@ fn extract_interface_summary(interfaces: &[Interface], arp: &[ArpEntry], ipv6_ne
         })
         .count() as u32;
 
-    // Active ARP entries = connected devices.
     let mut connected_macs: HashSet<String> = HashSet::new();
 
     for a in arp.iter().filter(|a| {
         LIVE_NEIGHBOR_STATES.contains(&a.status.as_str())
-            && a.disabled != "true"
+            && !a.disabled
             && !a.mac_address.is_empty()
     }) {
         connected_macs.insert(a.mac_address.to_lowercase());
     }
 
-    // Also count IPv6 neighbors in live states, deduplicating by MAC
-    // (a dual-stack device may appear in both ARP and IPv6 neighbor tables).
     for n in ipv6_neighbors.iter().filter(|n| {
         LIVE_NEIGHBOR_STATES.contains(&n.status.as_str())
-            && n.disabled != "true"
+            && !n.disabled
             && !n.mac_address.is_empty()
     }) {
         connected_macs.insert(n.mac_address.to_lowercase());
@@ -447,7 +413,7 @@ fn extract_interface_summary(interfaces: &[Interface], arp: &[ArpEntry], ipv6_ne
         .iter()
         .any(|i| {
             (i.iface_type == "wlan" || i.iface_type == "wifi")
-                && i.running == "true"
+                && i.running
         });
 
     InterfaceSummary {
@@ -461,7 +427,7 @@ fn extract_interface_summary(interfaces: &[Interface], arp: &[ArpEntry], ipv6_ne
 /// Build per-interface status with real-time RX/TX rates.
 /// WAN interfaces are tagged with `is_wan` and `wan_name` for UI highlighting.
 fn extract_interface_statuses(
-    interfaces: &[Interface],
+    interfaces: &[InterfaceEntry],
     prev_counters: Option<&HashMap<String, (u64, u64)>>,
     all_wans: &[WanInfo],
     poll_interval_secs: f64,
@@ -476,10 +442,8 @@ fn extract_interface_statuses(
             let (rx_bps, tx_bps) = prev_counters
                 .and_then(|prev| prev.get(&iface.name))
                 .map(|(prev_rx, prev_tx)| {
-                    let rx = parse_u64(&iface.rx_byte);
-                    let tx = parse_u64(&iface.tx_byte);
-                    let rx_diff = rx.saturating_sub(*prev_rx);
-                    let tx_diff = tx.saturating_sub(*prev_tx);
+                    let rx_diff = iface.rx_byte.saturating_sub(*prev_rx);
+                    let tx_diff = iface.tx_byte.saturating_sub(*prev_tx);
                     (rx_diff as f64 * 8.0 / poll_interval_secs, tx_diff as f64 * 8.0 / poll_interval_secs)
                 })
                 .unwrap_or((0.0, 0.0));
@@ -489,7 +453,7 @@ fn extract_interface_statuses(
             Some(InterfaceStatus {
                 name: iface.name.clone(),
                 iface_type: iface.iface_type.clone(),
-                running: iface.running == "true",
+                running: iface.running,
                 rx_bps,
                 tx_bps,
                 is_wan: if is_wan { Some(true) } else { None },
@@ -518,7 +482,7 @@ fn extract_interface_statuses(
 }
 
 fn extract_isp(
-    identity: &SystemIdentity,
+    identity: &IdentityData,
     primary: &WanInfo,
     all_wans: &[WanInfo],
     prev_counters: Option<&HashMap<String, (u64, u64)>>,
@@ -533,11 +497,9 @@ fn extract_isp(
         identity.name.clone()
     };
 
-    // Primary WAN rate
     let (download_bps, upload_bps) = compute_wan_rate(primary, prev_counters, poll_interval_secs)
         .unwrap_or((0.0, 0.0));
 
-    // Accumulated month-to-date usage from stored traffic history
     let (dl_gb, ul_gb) = traffic_db.monthly_usage_gb(poll_interval_secs);
 
     IspInfo {
@@ -561,10 +523,8 @@ fn compute_wan_rate(
     let iface = wan.iface.as_ref()?;
     let prev = prev_counters?;
     let (prev_rx, prev_tx) = prev.get(&iface.name)?;
-    let rx = parse_u64(&iface.rx_byte);
-    let tx = parse_u64(&iface.tx_byte);
-    let rx_diff = rx.saturating_sub(*prev_rx);
-    let tx_diff = tx.saturating_sub(*prev_tx);
+    let rx_diff = iface.rx_byte.saturating_sub(*prev_rx);
+    let tx_diff = iface.tx_byte.saturating_sub(*prev_tx);
     Some((
         rx_diff as f64 * 8.0 / poll_interval_secs,
         tx_diff as f64 * 8.0 / poll_interval_secs,
@@ -603,7 +563,7 @@ fn build_wan_entries(
 /// Build `Vec<WanIspInfo>` from resolved WANs.
 fn build_wan_isp_entries(
     all_wans: &[WanInfo],
-    identity: &SystemIdentity,
+    identity: &IdentityData,
 ) -> Vec<WanIspInfo> {
     let isp_name = if identity.name.is_empty() {
         "Unknown ISP".to_string()
@@ -688,18 +648,18 @@ fn extract_traffic(
 }
 
 fn extract_wifi(
-    wireless_regs: &[WirelessRegistration],
-    arp: &[ArpEntry],
-    leases: &[DhcpLease],
-    ipv6_neighbors: &[Ipv6Neighbor],
+    wireless_clients: &[WirelessClientEntry],
+    arp: &[NeighborEntry],
+    leases: &[DhcpLeaseEntry],
+    ipv6_neighbors: &[NeighborEntry],
 ) -> WifiInfo {
-    let client_count = wireless_regs.len() as u32;
+    let client_count = wireless_clients.len() as u32;
 
     // Build device list from wireless registrations + ARP + DHCP leases
     let mut devices: Vec<Device> = Vec::new();
 
     // Start with wireless registrations (most accurate for WiFi clients)
-    for reg in wireless_regs {
+    for reg in wireless_clients {
         // Find matching DHCP lease
         let lease = leases.iter().find(|l| {
             l.active_mac_address.to_lowercase() == reg.mac_address.to_lowercase()
@@ -721,14 +681,12 @@ fn extract_wifi(
             .map(|a| a.address.clone())
             .unwrap_or_else(|| "—".to_string());
 
-        let signal = reg.signal_strength.parse::<i32>().ok();
-
         devices.push(Device {
             mac: reg.mac_address.clone(),
             hostname: hostname.to_string(),
             ip,
             device_type: infer_device_type(hostname, &reg.mac_address),
-            signal,
+            signal: reg.signal_strength,
             connected_duration: parse_routeros_uptime_to_seconds(&reg.uptime),
             dhcp_status: lease.map(|l| l.status.clone()).filter(|s| !s.is_empty()),
             dhcp_expires: lease.map(|l| l.expires_after.clone()).filter(|s| !s.is_empty()),
@@ -740,12 +698,12 @@ fn extract_wifi(
     }
 
     // Also include wired ARP entries (devices on LAN ports)
-    let mut wifi_macs: HashSet<String> = wireless_regs.iter().map(|r| r.mac_address.to_lowercase()).collect();
+    let mut wifi_macs: HashSet<String> = wireless_clients.iter().map(|r| r.mac_address.to_lowercase()).collect();
 
     // Collect matching ARP entries first to avoid borrowing wifi_macs in the loop
-    let arp_devices: Vec<&ArpEntry> = arp.iter().filter(|a| {
+    let arp_devices: Vec<&NeighborEntry> = arp.iter().filter(|a| {
         LIVE_NEIGHBOR_STATES.contains(&a.status.as_str())
-            && a.disabled != "true"
+            && !a.disabled
             && !a.mac_address.is_empty()
             && !wifi_macs.contains(&a.mac_address.to_lowercase())
     }).collect();
@@ -783,9 +741,9 @@ fn extract_wifi(
     // ── IPv6 neighbors ── discover devices from the IPv6 neighbor table.
     // Deduplicate by MAC — a dual-stack device may appear in both ARP and
     // the IPv6 neighbor table with different addresses but the same MAC.
-    let ipv6_devices: Vec<&Ipv6Neighbor> = ipv6_neighbors.iter().filter(|n| {
+    let ipv6_devices: Vec<&NeighborEntry> = ipv6_neighbors.iter().filter(|n| {
         LIVE_NEIGHBOR_STATES.contains(&n.status.as_str())
-            && n.disabled != "true"
+            && !n.disabled
             && !n.mac_address.is_empty()
             && !wifi_macs.contains(&n.mac_address.to_lowercase())
     }).collect();
@@ -1040,9 +998,9 @@ pub fn default_latency_probe_targets(dns_servers: &[String]) -> Vec<(String, Str
 /// Filters out disabled, link-local (`fe80::`), and ULA addresses
 /// (`fc00::/7`, `fd00::/8`).  Only global unicast (2000::/3) is kept — if an
 /// interface has no GUA the egress is treated as having no public IPv6.
-fn build_ipv6_addr_map(ipv6_ips: &[Ipv6Address]) -> HashMap<String, String> {
+fn build_ipv6_addr_map(ipv6_ips: &[Ipv6AddrEntry]) -> HashMap<String, String> {
     let mut map: HashMap<String, String> = HashMap::new();
-    for a in ipv6_ips.iter().filter(|a| a.disabled != "true") {
+    for a in ipv6_ips.iter().filter(|a| !a.disabled) {
         let ifname = if a.actual_interface.is_empty() {
             &a.interface
         } else {
@@ -1062,13 +1020,13 @@ fn build_ipv6_addr_map(ipv6_ips: &[Ipv6Address]) -> HashMap<String, String> {
 }
 
 /// Build a set of interface names that have an active IPv6 default route.
-fn build_ipv6_default_iface_set(ipv6_routes: &[Ipv6Route]) -> HashSet<String> {
+fn build_ipv6_default_iface_set(ipv6_routes: &[RouteEntry]) -> HashSet<String> {
     ipv6_routes
         .iter()
         .filter(|r| {
             r.dst_address == "::/0"
-                && r.active != "false"
-                && r.disabled != "true"
+                && r.active
+                && !r.disabled
                 && !r.gateway.is_empty()
         })
         .map(|r| resolve_ipv6_route_iface(r))
@@ -1080,7 +1038,7 @@ fn build_ipv6_default_iface_set(ipv6_routes: &[Ipv6Route]) -> HashSet<String> {
 /// Uses the same PPPoE-detection logic as IPv4: if `interface` is empty and
 /// `gateway` is not a parseable IP address, the gateway field IS the interface
 /// name (e.g. "pppoe-cntelecom").
-fn resolve_ipv6_route_iface(route: &Ipv6Route) -> String {
+fn resolve_ipv6_route_iface(route: &RouteEntry) -> String {
     if route.interface.is_empty() && route.gateway.parse::<std::net::IpAddr>().is_err() {
         route.gateway.clone()
     } else {
@@ -1104,23 +1062,15 @@ fn route_ipv6_addr(iface_name: &str, map: &HashMap<String, String>) -> Option<St
 }
 
 /// Resolve the IPv6 gateway for a given interface from IPv6 default routes.
-fn resolve_ipv6_gateway(iface_name: &str, ipv6_routes: &[Ipv6Route]) -> Option<String> {
+fn resolve_ipv6_gateway(iface_name: &str, ipv6_routes: &[RouteEntry]) -> Option<String> {
     ipv6_routes
         .iter()
         .filter(|r| {
             r.dst_address == "::/0"
-                && r.active != "false"
-                && r.disabled != "true"
+                && r.active
+                && !r.disabled
                 && !r.gateway.is_empty()
         })
         .find(|r| resolve_ipv6_route_iface(r) == iface_name)
         .map(|r| r.gateway.clone())
-}
-
-fn parse_f64(s: &str) -> f64 {
-    s.parse().unwrap_or(0.0)
-}
-
-fn parse_u64(s: &str) -> u64 {
-    s.parse().unwrap_or(0)
 }

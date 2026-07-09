@@ -1,18 +1,22 @@
 use std::env;
 
+use crate::backends::RouterType;
+
 /// Application configuration loaded from environment variables.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// RouterOS hostname or IP address
-    pub routeros_host: String,
-    /// RouterOS REST API port (default: 443 for HTTPS, 80 for HTTP)
-    pub routeros_port: u16,
+    /// Router type (default: "routeros")
+    pub router_type: RouterType,
+    /// Router hostname or IP address
+    pub router_host: String,
+    /// Router REST API port (default: 443 for HTTPS, 80 for HTTP)
+    pub router_port: u16,
     /// Connection scheme: "http" or "https"
-    pub routeros_scheme: String,
-    /// RouterOS username
-    pub routeros_username: String,
-    /// RouterOS password
-    pub routeros_password: String,
+    pub router_scheme: String,
+    /// Router username
+    pub router_username: String,
+    /// Router password
+    pub router_password: String,
     /// Accept invalid TLS certificates (self-signed) — only relevant for HTTPS
     pub accept_invalid_certs: bool,
     /// Poll interval in seconds
@@ -38,34 +42,50 @@ impl Config {
     ///
     /// Attempts to load `.env` file first via dotenvy, then falls back to
     /// environment variables with sensible defaults.
+    ///
+    /// Supports both new `ROUTER_*` and legacy `ROUTEROS_*` env var names
+    /// for backward compatibility.
     pub fn from_env() -> Result<Self, ConfigError> {
         // Attempt to load .env file — ignore if missing
         let _ = dotenvy::dotenv();
 
-        let scheme = env::var("ROUTEROS_SCHEME")
+        let scheme = env_host("ROUTER_SCHEME", "ROUTEROS_SCHEME")
             .map(|s| s.to_lowercase())
-            .unwrap_or_else(|_| "https".to_string());
+            .unwrap_or_else(|| "https".to_string());
 
         // Validate scheme
         if scheme != "http" && scheme != "https" {
             return Err(ConfigError::InvalidFormat(
-                "ROUTEROS_SCHEME must be 'http' or 'https'".to_string(),
+                "ROUTER_SCHEME (or ROUTEROS_SCHEME) must be 'http' or 'https'".to_string(),
             ));
         }
 
         // Default port depends on scheme
         let default_port: u16 = if scheme == "http" { 80 } else { 443 };
 
+        let router_type = env_host("ROUTER_TYPE", "ROUTEROS_TYPE")
+            .unwrap_or_else(|| "routeros".to_string());
+
+        let router_type = match router_type.to_lowercase().as_str() {
+            "routeros" => RouterType::RouterOs,
+            other => {
+                return Err(ConfigError::InvalidFormat(
+                    format!("Unknown router type: '{other}'. Supported: routeros"),
+                ));
+            }
+        };
+
         Ok(Config {
-            routeros_host: env::var("ROUTEROS_HOST")
-                .unwrap_or_else(|_| "192.168.88.1".to_string()),
-            routeros_port: parse_env::<u16>("ROUTEROS_PORT", default_port)?,
-            routeros_scheme: scheme,
-            routeros_username: env::var("ROUTEROS_USERNAME")
-                .unwrap_or_else(|_| "admin".to_string()),
-            routeros_password: env::var("ROUTEROS_PASSWORD")
+            router_type,
+            router_host: env_host("ROUTER_HOST", "ROUTEROS_HOST")
+                .unwrap_or_else(|| "192.168.88.1".to_string()),
+            router_port: parse_env_host("ROUTER_PORT", "ROUTEROS_PORT", default_port)?,
+            router_scheme: scheme,
+            router_username: env_host("ROUTER_USERNAME", "ROUTEROS_USERNAME")
+                .unwrap_or_else(|| "admin".to_string()),
+            router_password: env_host("ROUTER_PASSWORD", "ROUTEROS_PASSWORD")
                 .unwrap_or_default(),
-            accept_invalid_certs: env::var("ROUTEROS_INSECURE_TLS")
+            accept_invalid_certs: env_host("ROUTER_INSECURE_TLS", "ROUTEROS_INSECURE_TLS")
                 .map(|v| v.to_lowercase() == "true" || v == "1")
                 .unwrap_or(false),
             poll_interval_secs: parse_env::<u64>("POLL_INTERVAL_SECS", 3)?,
@@ -78,18 +98,24 @@ impl Config {
             latency_poor_ms: parse_env::<u64>("LATENCY_POOR_MS", 100)?,
         })
     }
+}
 
-    /// Build the RouterOS REST API base URL.
-    pub fn routeros_base_url(&self) -> String {
-        format!(
-            "{}://{}:{}/rest",
-            self.routeros_scheme, self.routeros_host, self.routeros_port
-        )
+/// Get an env var, checking the new name first, then the legacy name as fallback.
+fn env_host(new_key: &str, legacy_key: &str) -> Option<String> {
+    env::var(new_key).ok().or_else(|| env::var(legacy_key).ok())
+}
+
+/// Parse an env var, checking the new name first, then the legacy name as fallback.
+fn parse_env_host<T: std::str::FromStr>(new_key: &str, legacy_key: &str, default: T) -> Result<T, ConfigError> {
+    // Try new key first
+    if let Ok(val) = env::var(new_key) {
+        return val.parse::<T>().map_err(|_| ConfigError::InvalidFormat(new_key.to_string()));
     }
-
-    /// Whether TLS is being used (for conditional client configuration).
-    pub fn is_tls(&self) -> bool {
-        self.routeros_scheme == "https"
+    // Fall back to legacy key
+    match env::var(legacy_key) {
+        Ok(val) => val.parse::<T>().map_err(|_| ConfigError::InvalidFormat(legacy_key.to_string())),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(e) => Err(ConfigError::EnvError(e)),
     }
 }
 

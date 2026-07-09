@@ -11,8 +11,8 @@ use serde_json::json;
 /// are represented here.
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
-    #[error("RouterOS API error: {0}")]
-    RouterOsApi(String),
+    #[error("Router API error: {0}")]
+    RouterApi(String),
 
     #[error("HTTP request failed: {0}")]
     HttpError(#[from] reqwest::Error),
@@ -23,8 +23,8 @@ pub enum AppError {
     #[error("Configuration error: {0}")]
     Config(#[from] crate::config::ConfigError),
 
-    #[error("RouterOS unreachable")]
-    RouterOsUnreachable,
+    #[error("Router unreachable")]
+    RouterUnreachable,
 
     #[error("Invalid data: {0}")]
     InvalidData(String),
@@ -39,12 +39,12 @@ pub enum AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, message) = match &self {
-            AppError::RouterOsApi(msg) => (StatusCode::BAD_GATEWAY, msg.clone()),
+            AppError::RouterApi(msg) => (StatusCode::BAD_GATEWAY, msg.clone()),
             AppError::HttpError(e) => (StatusCode::BAD_GATEWAY, e.to_string()),
             AppError::Serialization(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             AppError::Config(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-            AppError::RouterOsUnreachable => {
-                (StatusCode::SERVICE_UNAVAILABLE, "RouterOS is unreachable".into())
+            AppError::RouterUnreachable => {
+                (StatusCode::SERVICE_UNAVAILABLE, "Router is unreachable".into())
             }
             AppError::Database(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             AppError::InvalidData(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg.clone()),

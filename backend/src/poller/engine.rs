@@ -6,10 +6,10 @@ use std::time::Duration;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, info, warn};
 
+use crate::backends::{RouterBackend, RouterConnectionConfig, RouterType};
 use crate::config_store::MergedConfig;
 use crate::db::TrafficDb;
 use crate::error::AppError;
-use crate::routeros::client::RouterOsClient;
 use crate::ws::protocol::*;
 
 /// Per-round network quality assessment derived from all probe results.
@@ -30,15 +30,15 @@ const PING_GAP_MS: u64 = 200;
 const PING_TIMEOUT_SECS: u64 = 2;
 
 /// The poll engine runs on a configurable interval, fetches data from
-/// the RouterOS REST API, transforms it into dashboard structures,
+/// the router backend, transforms it into dashboard structures,
 /// diffs against the previous snapshot, and broadcasts changes to
 /// all connected WebSocket clients.
 pub struct PollEngine {
-    /// RouterOS HTTP client — None when unconfigured or unreachable.
-    client: Option<RouterOsClient>,
+    /// Router backend — None when unconfigured or unreachable.
+    client: Option<Box<dyn RouterBackend>>,
     /// Last connection params that produced a working client.
-    /// Includes all fields that affect connection; any change triggers reconnect.
-    last_conn_params: (String, u16, String, String, String, bool),
+    /// Tuple: (RouterType, host, port, scheme, username, password, accept_invalid_certs)
+    last_conn_params: (RouterType, String, u16, String, String, String, bool),
     config: Arc<RwLock<MergedConfig>>,
     broadcast_tx: broadcast::Sender<Arc<ServerMessage>>,
     /// Shared snapshot cache — written after every poll, read by new WS clients.
@@ -79,20 +79,30 @@ impl PollEngine {
         let (client, conn_params) = {
             let cfg = config.read().await;
             let params = (
-                cfg.routeros_host.clone(),
-                cfg.routeros_port,
-                cfg.routeros_scheme.clone(),
-                cfg.routeros_username.clone(),
-                cfg.routeros_password.clone(),
+                cfg.router_type,
+                cfg.router_host.clone(),
+                cfg.router_port,
+                cfg.router_scheme.clone(),
+                cfg.router_username.clone(),
+                cfg.router_password.clone(),
                 cfg.accept_invalid_certs,
             );
-            match RouterOsClient::new(&cfg).await {
+            let conn_config = RouterConnectionConfig {
+                router_type: cfg.router_type,
+                host: cfg.router_host.clone(),
+                port: cfg.router_port,
+                scheme: cfg.router_scheme.clone(),
+                username: cfg.router_username.clone(),
+                password: cfg.router_password.clone(),
+                accept_invalid_certs: cfg.accept_invalid_certs,
+            };
+            match connect_backend(&conn_config).await {
                 Ok(c) => {
-                    info!("Poll engine: RouterOS client created successfully");
+                    info!("Poll engine: router backend created successfully");
                     (Some(c), params)
                 }
                 Err(e) => {
-                    warn!("Poll engine: RouterOS not available at startup ({e}). Running in config-waiting mode.");
+                    warn!("Poll engine: router not available at startup ({e}). Running in config-waiting mode.");
                     (None, params)
                 }
             }
@@ -100,7 +110,6 @@ impl PollEngine {
 
         let probe_targets_snapshot = probe_targets.read().await.clone();
 
-        // Read initial latency thresholds
         let (latency_good_ms, latency_poor_ms) = {
             let cfg = config.read().await;
             (cfg.latency_good_ms as f64, cfg.latency_poor_ms as f64)
@@ -118,7 +127,7 @@ impl PollEngine {
         // Broadcast initial connection status
         if client.is_none() {
             let msg = Arc::new(ServerMessage::ConnectionStatus {
-                routeros: false,
+                connected: false,
                 last_poll: None,
             });
             let _ = broadcast_tx.send(msg);
@@ -145,17 +154,18 @@ impl PollEngine {
         }
     }
 
-    /// Attempt to rebuild the RouterOS client from current config.
+    /// Attempt to rebuild the router client from current config.
     /// Returns true if a new client was created.
     async fn try_reconnect(&mut self) -> bool {
         let current_params = {
             let cfg = self.config.read().await;
             (
-                cfg.routeros_host.clone(),
-                cfg.routeros_port,
-                cfg.routeros_scheme.clone(),
-                cfg.routeros_username.clone(),
-                cfg.routeros_password.clone(),
+                cfg.router_type,
+                cfg.router_host.clone(),
+                cfg.router_port,
+                cfg.router_scheme.clone(),
+                cfg.router_username.clone(),
+                cfg.router_password.clone(),
                 cfg.accept_invalid_certs,
             )
         };
@@ -167,14 +177,23 @@ impl PollEngine {
         }
 
         if params_changed {
-            let (ref host, port, ref scheme, _, _, _) = current_params;
+            let (ref _router_type, ref host, port, ref scheme, _, _, _) = current_params;
             info!("Poll engine: config changed, reconnecting to {host}:{port} ({scheme})");
         }
 
         let cfg = self.config.read().await;
-        match RouterOsClient::new(&cfg).await {
+        let conn_config = RouterConnectionConfig {
+            router_type: cfg.router_type,
+            host: cfg.router_host.clone(),
+            port: cfg.router_port,
+            scheme: cfg.router_scheme.clone(),
+            username: cfg.router_username.clone(),
+            password: cfg.router_password.clone(),
+            accept_invalid_certs: cfg.accept_invalid_certs,
+        };
+        match connect_backend(&conn_config).await {
             Ok(c) => {
-                info!("Poll engine: reconnected to RouterOS successfully");
+                info!("Poll engine: reconnected to router successfully");
                 self.client = Some(c);
                 self.last_conn_params = current_params;
                 self.first_poll = true; // force full snapshot
@@ -227,19 +246,15 @@ impl PollEngine {
     }
 
     /// Execute one poll cycle: fetch, transform, diff, broadcast.
-    /// If no RouterOS client is available, try reconnecting and broadcast
+    /// If no router backend is available, try reconnecting and broadcast
     /// disconnected status until the user configures connection params.
-    /// When config changes, reconnects automatically.
     async fn poll_tick(&mut self) {
-        // Always check for config changes — reconnect if params changed
-        // or if we have no working client.
         self.try_reconnect().await;
 
-        // Still no client — broadcast disconnected and skip this tick
         if self.client.is_none() {
-            debug!("Poll tick skipped — no RouterOS connection");
+            debug!("Poll tick skipped — no router connection");
             let msg = Arc::new(ServerMessage::ConnectionStatus {
-                routeros: false,
+                connected: false,
                 last_poll: Some(chrono::Utc::now().to_rfc3339()),
             });
             let _ = self.broadcast_tx.send(msg);
@@ -349,7 +364,7 @@ impl PollEngine {
             Err(e) => {
                 warn!("Poll failed: {e}");
                 let msg = Arc::new(ServerMessage::ConnectionStatus {
-                    routeros: false,
+                    connected: false,
                     last_poll: Some(chrono::Utc::now().to_rfc3339()),
                 });
                 let _ = self.broadcast_tx.send(msg);
@@ -400,7 +415,7 @@ impl PollEngine {
         self.last_probe_results = results;
     }
 
-    /// Fetch all RouterOS endpoints and transform into a snapshot.
+    /// Fetch all router data and transform into a snapshot.
     /// Only called when `self.client` is `Some`.
     async fn fetch_and_transform(&mut self) -> Result<DashboardSnapshot, AppError> {
         let client = self.client.as_ref().expect("client must be Some when fetch_and_transform is called");
@@ -410,79 +425,29 @@ impl PollEngine {
             cfg.poll_interval_secs as f64
         };
 
-        // Fetch all IPv4 endpoints in parallel
-        let (
-            sys_result,
-            identity_result,
-            ips_result,
-            interfaces_result,
-            arp_result,
-            dns_result,
-            leases_result,
-            wireless_result,
-            routes_result,
-            connections_result,
-        ) = tokio::try_join!(
-            client.system_resource(),
-            client.system_identity(),
-            client.ip_addresses(),
-            client.interfaces(),
-            client.arp_table(),
-            client.dns_config(),
-            client.dhcp_leases(),
-            client.wireless_registrations(),
-            client.routes(),
-            client.firewall_connections(),
-        )?;
-
-        // ── Fetch IPv6 endpoints in a separate parallel batch ──────
-        // IPv6 methods use graceful degradation (return Ok(empty) on error),
-        // so we unwrap_or_default to get the Vec directly.
-        let (ipv6_ips_result, ipv6_routes_result, ipv6_neighbors_result, ipv6_connections_result) =
-            tokio::join!(
-                client.ipv6_addresses(),
-                client.ipv6_routes(),
-                client.ipv6_neighbors(),
-                client.ipv6_firewall_connections(),
-            );
-        let ipv6_ips_result = ipv6_ips_result.unwrap_or_default();
-        let ipv6_routes_result = ipv6_routes_result.unwrap_or_default();
-        let ipv6_neighbors_result = ipv6_neighbors_result.unwrap_or_default();
-        let ipv6_connections_result = ipv6_connections_result.unwrap_or_default();
+        // Fetch all data via the backend trait — parallelization is internal
+        let data = client.fetch_all().await?;
 
         // ── Snapshot current byte counters for next tick's rate calculation ──
-        let current_counters: HashMap<String, (u64, u64)> = interfaces_result
+        let current_counters: HashMap<String, (u64, u64)> = data.interfaces
             .iter()
             .map(|iface| {
                 (
                     iface.name.clone(),
-                    (
-                        iface.rx_byte.parse().unwrap_or(0),
-                        iface.tx_byte.parse().unwrap_or(0),
-                    ),
+                    (iface.rx_byte, iface.tx_byte),
                 )
             })
             .collect();
         let prev = std::mem::replace(&mut self.prev_counters, current_counters);
 
         // Count DHCP leases for IP allocations
-        let ip_allocations = leases_result.len() as u32;
+        let ip_allocations = data.dhcp_leases
+            .iter()
+            .filter(|l| l.status == "bound")
+            .count() as u32;
 
         let mut snapshot = crate::poller::transform::to_dashboard_snapshot(
-            sys_result,
-            identity_result,
-            ips_result,
-            interfaces_result,
-            arp_result,
-            dns_result,
-            leases_result,
-            wireless_result,
-            routes_result,
-            connections_result,
-            ipv6_ips_result,
-            ipv6_routes_result,
-            ipv6_neighbors_result,
-            ipv6_connections_result,
+            data,
             Some(&prev),
             Vec::new(),  // Will be filled in poll_tick
             IspStability {
@@ -659,6 +624,25 @@ impl PollEngine {
             segments,
             window_minutes,
         }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Backend Dispatch
+// ═══════════════════════════════════════════════════════════════════
+
+/// Create a backend instance based on the router type in the connection config.
+async fn connect_backend(
+    config: &RouterConnectionConfig,
+) -> Result<Box<dyn RouterBackend>, AppError> {
+    use crate::backends::routeros::client::RouterOsClient;
+
+    match config.router_type {
+        RouterType::RouterOs => {
+            let client = RouterOsClient::connect(config).await?;
+            Ok(Box::new(client))
+        }
+        // Future backends: add a match arm here
     }
 }
 

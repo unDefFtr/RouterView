@@ -32,7 +32,7 @@ pub async fn run_session(socket: WebSocket, state: Arc<AppState>) {
     } else {
         // No snapshot yet — at least tell the client the state
         let connected_msg = ServerMessage::ConnectionStatus {
-            routeros: false,
+            connected: false,
             last_poll: None,
         };
         if let Ok(json) = serde_json::to_string(&connected_msg) {

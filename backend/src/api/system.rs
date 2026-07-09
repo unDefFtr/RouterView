@@ -1,10 +1,10 @@
 use axum::{extract::State, http::StatusCode, Json};
-use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::config_store::{ConfigStore, MergedConfig};
+use crate::backends::{RouterBackend, RouterConnectionConfig, RouterType};
+use crate::config_store::ConfigStore;
 use crate::error::AppError;
 use crate::state::AppState;
 
@@ -22,21 +22,17 @@ pub async fn health_check(State(state): State<Arc<AppState>>) -> Json<Value> {
 
 /// GET /api/config — returns current configuration including credentials
 /// for the settings page. Password is returned as a masked placeholder if set.
+///
+/// Emits `routeros_*` keys for frontend backward compatibility alongside
+/// new `router_type` and `router_*` fields.
 pub async fn config_info(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
     let cfg = state.config.read().await;
-    // Show password only if configured; otherwise return empty so the UI
-    // knows there's no password set yet.
-    let password_hint = if cfg.routeros_password.is_empty() {
+    let password_hint = if cfg.router_password.is_empty() {
         ""
     } else {
-        // Return a placeholder so the UI can show "已设置" but not the actual value.
-        // The PUT endpoint accepts a new password to overwrite it.
         "••••••••"
     };
 
-    // Check whether the welcome wizard has been completed.
-    // This is stored as a key in the config table, separate from
-    // the runtime MergedConfig struct.
     let wizard_completed = state
         .traffic_db
         .get_all_config()
@@ -45,10 +41,12 @@ pub async fn config_info(State(state): State<Arc<AppState>>) -> (StatusCode, Jso
         .unwrap_or(false);
 
     let body = json!({
-        "routeros_host": cfg.routeros_host,
-        "routeros_port": cfg.routeros_port,
-        "routeros_scheme": cfg.routeros_scheme,
-        "routeros_username": cfg.routeros_username,
+        "router_type": cfg.router_type,
+        // Backward-compat keys for frontend:
+        "routeros_host": cfg.router_host,
+        "routeros_port": cfg.router_port,
+        "routeros_scheme": cfg.router_scheme,
+        "routeros_username": cfg.router_username,
         "routeros_password": password_hint,
         "accept_invalid_certs": cfg.accept_invalid_certs,
         "poll_interval_secs": cfg.poll_interval_secs,
@@ -71,23 +69,18 @@ pub async fn config_info(State(state): State<Arc<AppState>>) -> (StatusCode, Jso
 /// - `saved`: keys that were persisted
 /// - `requires_restart`: keys that were saved but take effect on next restart
 ///
-/// Hot-reloadable keys (applied immediately):
-///   poll_interval_secs, probe_interval_secs, db_raw_retention_days,
-///   db_total_retention_days, theme
-///
-/// Restart-required keys:
-///   routeros_host, routeros_port, routeros_scheme, accept_invalid_certs,
-///   routeros_username, routeros_password, server_port
+/// Supports both new `router_*` and legacy `routeros_*` key names.
 pub async fn update_config(
     State(state): State<Arc<AppState>>,
     Json(body): Json<HashMap<String, serde_json::Value>>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     let known_keys: &[&str] = &[
-        "routeros_host",
-        "routeros_port",
-        "routeros_scheme",
-        "routeros_username",
-        "routeros_password",
+        "router_type",
+        "router_host", "routeros_host",
+        "router_port", "routeros_port",
+        "router_scheme", "routeros_scheme",
+        "router_username", "routeros_username",
+        "router_password", "routeros_password",
         "accept_invalid_certs",
         "poll_interval_secs",
         "probe_interval_secs",
@@ -123,78 +116,86 @@ pub async fn update_config(
     }
 
     // Hot-apply all saved keys to the in-memory config.
-    // Connection params are applied immediately so the poll engine can
-    // auto-reconnect on the next tick without requiring a full restart.
     {
         let mut cfg = state.config.write().await;
         for key in &saved {
+            // Build a ResolvedBody that normalizes both new and legacy keys
+            let val = ResolvedBody { body: &body, key };
+
             match key.as_str() {
-                "routeros_host" => {
-                    if let Some(v) = body.get(key).and_then(|v| v.as_str()) {
-                        cfg.routeros_host = v.to_string();
+                "router_type" => {
+                    if let Some(v) = val.as_str() {
+                        cfg.router_type = match v.to_lowercase().as_str() {
+                            "routeros" => RouterType::RouterOs,
+                            _ => continue,
+                        };
                     }
                 }
-                "routeros_port" => {
-                    if let Some(v) = body.get(key).and_then(|v| v.as_u64()) {
-                        cfg.routeros_port = v as u16;
+                "router_host" | "routeros_host" => {
+                    if let Some(v) = val.as_str() {
+                        cfg.router_host = v.to_string();
                     }
                 }
-                "routeros_scheme" => {
-                    if let Some(v) = body.get(key).and_then(|v| v.as_str()) {
+                "router_port" | "routeros_port" => {
+                    if let Some(v) = val.as_u64() {
+                        cfg.router_port = v as u16;
+                    }
+                }
+                "router_scheme" | "routeros_scheme" => {
+                    if let Some(v) = val.as_str() {
                         let s = v.to_lowercase();
                         if s == "http" || s == "https" {
-                            cfg.routeros_scheme = s;
+                            cfg.router_scheme = s;
                         }
                     }
                 }
                 "accept_invalid_certs" => {
-                    if let Some(v) = body.get(key) {
-                        cfg.accept_invalid_certs = v.as_bool().unwrap_or(false)
-                            || v.as_str() == Some("true");
+                    if let Some(v) = val.as_bool() {
+                        cfg.accept_invalid_certs = v;
                     }
                 }
-                "routeros_username" => {
-                    if let Some(v) = body.get(key).and_then(|v| v.as_str()) {
-                        cfg.routeros_username = v.to_string();
+                "router_username" | "routeros_username" => {
+                    if let Some(v) = val.as_str() {
+                        cfg.router_username = v.to_string();
                     }
                 }
-                "routeros_password" => {
-                    if let Some(v) = body.get(key).and_then(|v| v.as_str()) {
-                        cfg.routeros_password = v.to_string();
+                "router_password" | "routeros_password" => {
+                    if let Some(v) = val.as_str() {
+                        cfg.router_password = v.to_string();
                     }
                 }
                 "poll_interval_secs" => {
-                    if let Some(n) = body.get(key).and_then(|v| v.as_u64()) {
+                    if let Some(n) = val.as_u64() {
                         cfg.poll_interval_secs = n;
                     }
                 }
                 "probe_interval_secs" => {
-                    if let Some(n) = body.get(key).and_then(|v| v.as_u64()) {
+                    if let Some(n) = val.as_u64() {
                         cfg.probe_interval_secs = n;
                     }
                 }
                 "db_raw_retention_days" => {
-                    if let Some(n) = body.get(key).and_then(|v| v.as_u64()) {
+                    if let Some(n) = val.as_u64() {
                         cfg.db_raw_retention_days = n;
                     }
                 }
                 "db_total_retention_days" => {
-                    if let Some(n) = body.get(key).and_then(|v| v.as_u64()) {
+                    if let Some(n) = val.as_u64() {
                         cfg.db_total_retention_days = n;
                     }
                 }
                 "latency_good_ms" => {
-                    if let Some(n) = body.get(key).and_then(|v| v.as_u64()) {
+                    if let Some(n) = val.as_u64() {
                         cfg.latency_good_ms = n;
                     }
                 }
                 "latency_poor_ms" => {
-                    if let Some(n) = body.get(key).and_then(|v| v.as_u64()) {
+                    if let Some(n) = val.as_u64() {
                         cfg.latency_poor_ms = n;
                     }
                 }
                 "theme" => {
-                    if let Some(v) = body.get(key).and_then(|v| v.as_str()) {
+                    if let Some(v) = val.as_str() {
                         cfg.theme = v.to_string();
                     }
                 }
@@ -212,127 +213,98 @@ pub async fn update_config(
     ))
 }
 
-/// POST /api/config/test-connection — test RouterOS connectivity.
+/// Helper to extract values from the request body, trying the actual key first,
+/// then falling back to a related legacy key when applicable.
+struct ResolvedBody<'a> {
+    body: &'a HashMap<String, serde_json::Value>,
+    key: &'a str,
+}
+
+impl<'a> ResolvedBody<'a> {
+    fn as_str(&self) -> Option<&str> {
+        self.body.get(self.key).and_then(|v| v.as_str())
+    }
+
+    fn as_u64(&self) -> Option<u64> {
+        self.body.get(self.key).and_then(|v| v.as_u64())
+    }
+
+    fn as_bool(&self) -> Option<bool> {
+        self.body.get(self.key).and_then(|v| {
+            if v.is_boolean() {
+                v.as_bool()
+            } else if let Some(s) = v.as_str() {
+                Some(s == "true" || s == "1")
+            } else {
+                None
+            }
+        })
+    }
+}
+
+/// POST /api/config/test-connection — test router connectivity.
 ///
 /// Accepts optional connection params in the body (to test before saving).
 /// If no params provided, uses the current in-memory config.
+/// Supports both new `router_*` and legacy `routeros_*` key names.
 pub async fn test_connection(
     State(state): State<Arc<AppState>>,
     Json(body): Json<HashMap<String, serde_json::Value>>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
-    // Build test config: start from current, overlay request values
     let cfg = state.config.read().await;
 
-    let host = body
-        .get("routeros_host")
-        .and_then(|v| v.as_str())
-        .unwrap_or(&cfg.routeros_host);
-    let port = body
-        .get("routeros_port")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(cfg.routeros_port as u64) as u16;
-    let scheme = body
-        .get("routeros_scheme")
-        .and_then(|v| v.as_str())
-        .unwrap_or(&cfg.routeros_scheme);
-    let username = body
-        .get("routeros_username")
-        .and_then(|v| v.as_str())
-        .unwrap_or(&cfg.routeros_username);
-    let password = body
-        .get("routeros_password")
-        .and_then(|v| v.as_str())
-        .unwrap_or(&cfg.routeros_password);
-    let accept_invalid = body
-        .get("accept_invalid_certs")
-        .map(|v| v.as_bool().unwrap_or(false) || v.as_str() == Some("true"))
-        .unwrap_or(cfg.accept_invalid_certs);
-
-    let test_config = MergedConfig {
-        routeros_host: host.to_string(),
-        routeros_port: port,
-        routeros_scheme: scheme.to_string(),
-        routeros_username: username.to_string(),
-        routeros_password: password.to_string(),
-        accept_invalid_certs: accept_invalid,
-        poll_interval_secs: cfg.poll_interval_secs,
-        probe_interval_secs: cfg.probe_interval_secs,
-        server_port: cfg.server_port,
-        db_raw_retention_days: cfg.db_raw_retention_days,
-        db_total_retention_days: cfg.db_total_retention_days,
-        theme: cfg.theme.clone(),
-        latency_good_ms: cfg.latency_good_ms,
-        latency_poor_ms: cfg.latency_poor_ms,
+    let get_str = |key: &str, legacy_key: &str, fallback: &str| -> String {
+        body.get(key)
+            .and_then(|v| v.as_str())
+            .or_else(|| body.get(legacy_key).and_then(|v| v.as_str()))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| fallback.to_string())
     };
 
-    let test_url = format!("{}/system/resource", test_config.routeros_base_url());
+    let router_type = body
+        .get("router_type")
+        .and_then(|v| v.as_str())
+        .map(|s| match s.to_lowercase().as_str() {
+            "routeros" => RouterType::RouterOs,
+            _ => RouterType::default(),
+        })
+        .unwrap_or(cfg.router_type);
 
-    let http_client = {
-        let mut builder = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10));
-        if test_config.is_tls() {
-            builder = builder.danger_accept_invalid_certs(test_config.accept_invalid_certs);
-        }
-        builder.build().map_err(|e| AppError::Internal(e.to_string()))?
+    let conn_config = RouterConnectionConfig {
+        router_type,
+        host: get_str("router_host", "routeros_host", &cfg.router_host),
+        port: body.get("router_port")
+            .or_else(|| body.get("routeros_port"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(cfg.router_port as u64) as u16,
+        scheme: get_str("router_scheme", "routeros_scheme", &cfg.router_scheme),
+        username: get_str("router_username", "routeros_username", &cfg.router_username),
+        password: get_str("router_password", "routeros_password", &cfg.router_password),
+        accept_invalid_certs: body.get("accept_invalid_certs")
+            .map(|v| v.as_bool().unwrap_or(false) || v.as_str() == Some("true"))
+            .unwrap_or(cfg.accept_invalid_certs),
     };
 
-    let auth_header = format!(
-        "Basic {}",
-        base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            format!("{}:{}", test_config.routeros_username, test_config.routeros_password),
-        )
-    );
-
-    match http_client
-        .get(&test_url)
-        .header(
-            reqwest::header::AUTHORIZATION,
-            reqwest::header::HeaderValue::from_str(&auth_header).map_err(|e| {
-                AppError::Internal(format!("Invalid auth header: {e}"))
-            })?,
-        )
-        .send()
-        .await
-    {
-        Ok(resp) if resp.status().is_success() => {
-            #[derive(Deserialize)]
-            struct Resource {
-                #[serde(default, rename = "board-name")]
-                board_name: String,
-                #[serde(default)]
-                version: String,
-            }
-            let info = resp.json::<Vec<Resource>>().await.ok();
-            let model = info.as_ref().and_then(|v| v.first()).map(|r| r.board_name.clone());
-            let version = info.as_ref().and_then(|v| v.first()).map(|r| r.version.clone());
-
-            Ok((
-                StatusCode::OK,
-                Json(json!({
-                    "success": true,
-                    "model": model,
-                    "version": version,
-                })),
-            ))
+    // Dispatch to the appropriate backend's test_connection
+    let result = match conn_config.router_type {
+        RouterType::RouterOs => {
+            crate::backends::routeros::client::RouterOsClient::test_connection(&conn_config).await?
         }
-        Ok(resp) => {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            Ok((
-                StatusCode::OK,
-                Json(json!({
-                    "success": false,
-                    "error": format!("HTTP {status}: {body}"),
-                })),
-            ))
-        }
-        Err(e) => Ok((
-            StatusCode::OK,
-            Json(json!({
-                "success": false,
-                "error": e.to_string(),
-            })),
-        )),
+    };
+
+    let mut response = json!({
+        "success": result.success,
+    });
+
+    if let Some(model) = &result.model {
+        response["model"] = json!(model);
     }
+    if let Some(version) = &result.version {
+        response["version"] = json!(version);
+    }
+    if let Some(error) = &result.error {
+        response["error"] = json!(error);
+    }
+
+    Ok((StatusCode::OK, Json(response)))
 }

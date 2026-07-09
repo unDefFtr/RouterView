@@ -7,8 +7,8 @@ mod router;
 mod state;
 
 mod api;
+mod backends;
 mod poller;
-mod routeros;
 mod ws;
 
 use std::sync::Arc;
@@ -43,9 +43,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let cfg = config.read().await;
         tracing::info!(
-            "RouterOS host: {}:{}, poll interval: {}s, theme: {}",
-            cfg.routeros_host,
-            cfg.routeros_port,
+            "Router host: {}:{}, poll interval: {}s, theme: {}",
+            cfg.router_host,
+            cfg.router_port,
             cfg.poll_interval_secs,
             cfg.theme,
         );

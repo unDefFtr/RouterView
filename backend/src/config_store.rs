@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use tracing::info;
 
+use crate::backends::RouterType;
 use crate::config::Config;
 use crate::db::TrafficDb;
 
@@ -9,12 +10,15 @@ use crate::db::TrafficDb;
 /// and database overrides. DB values take precedence over env values.
 #[derive(Clone, Debug)]
 pub struct MergedConfig {
-    // RouterOS connection
-    pub routeros_host: String,
-    pub routeros_port: u16,
-    pub routeros_scheme: String,
-    pub routeros_username: String,
-    pub routeros_password: String,
+    // Router type
+    pub router_type: RouterType,
+
+    // Router connection
+    pub router_host: String,
+    pub router_port: u16,
+    pub router_scheme: String,
+    pub router_username: String,
+    pub router_password: String,
     pub accept_invalid_certs: bool,
 
     // Polling
@@ -41,27 +45,44 @@ impl MergedConfig {
     pub fn from_env_and_db(env: &Config, db_overrides: &HashMap<String, String>) -> Self {
         let get = |key: &str| -> Option<&str> { db_overrides.get(key).map(|s| s.as_str()) };
 
+        let router_type = get("router_type")
+            .and_then(|s| {
+                match s.to_lowercase().as_str() {
+                    "routeros" => Some(RouterType::RouterOs),
+                    _ => None,
+                }
+            })
+            .unwrap_or(env.router_type);
+
         Self {
-            routeros_host: get("routeros_host")
+            router_type,
+
+            // Accept both new and legacy DB key names for router fields
+            router_host: get("router_host")
+                .or_else(|| get("routeros_host"))
                 .map(|s| s.to_string())
-                .unwrap_or_else(|| env.routeros_host.clone()),
+                .unwrap_or_else(|| env.router_host.clone()),
 
-            routeros_port: get("routeros_port")
+            router_port: get("router_port")
+                .or_else(|| get("routeros_port"))
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(env.routeros_port),
+                .unwrap_or(env.router_port),
 
-            routeros_scheme: get("routeros_scheme")
+            router_scheme: get("router_scheme")
+                .or_else(|| get("routeros_scheme"))
                 .map(|s| s.to_lowercase())
                 .filter(|s| s == "http" || s == "https")
-                .unwrap_or_else(|| env.routeros_scheme.clone()),
+                .unwrap_or_else(|| env.router_scheme.clone()),
 
-            routeros_username: get("routeros_username")
+            router_username: get("router_username")
+                .or_else(|| get("routeros_username"))
                 .map(|s| s.to_string())
-                .unwrap_or_else(|| env.routeros_username.clone()),
+                .unwrap_or_else(|| env.router_username.clone()),
 
-            routeros_password: get("routeros_password")
+            router_password: get("router_password")
+                .or_else(|| get("routeros_password"))
                 .map(|s| s.to_string())
-                .unwrap_or_else(|| env.routeros_password.clone()),
+                .unwrap_or_else(|| env.router_password.clone()),
 
             accept_invalid_certs: get("accept_invalid_certs")
                 .map(|s| s == "true" || s == "1")
@@ -101,19 +122,7 @@ impl MergedConfig {
 
     /// Whether the connection configuration has been filled in (credentials exist).
     pub fn has_connection_config(&self) -> bool {
-        !self.routeros_password.is_empty()
-    }
-
-    /// Build the RouterOS REST API base URL.
-    pub fn routeros_base_url(&self) -> String {
-        format!(
-            "{}://{}:{}/rest",
-            self.routeros_scheme, self.routeros_host, self.routeros_port
-        )
-    }
-
-    pub fn is_tls(&self) -> bool {
-        self.routeros_scheme == "https"
+        !self.router_password.is_empty()
     }
 }
 
