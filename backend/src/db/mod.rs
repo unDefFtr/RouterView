@@ -10,10 +10,17 @@ use crate::secrets::EncryptedSecret;
 
 mod maintenance;
 mod schema;
+mod traffic_v4;
 mod types;
 
 pub use maintenance::{
     backup_database, check_database, export_legacy, migrate_database, restore_database,
+};
+#[allow(unused_imports)]
+pub use traffic_v4::{
+    CounterCheckpoint, CounterCheckpointInput, RouterInterfaceRecord, RouterRecord, TrafficBucket,
+    TrafficCoverage, TrafficGapInput, TrafficQuality, TrafficQuery, TrafficQueryResult,
+    TrafficSampleInput, TrafficTotals,
 };
 #[allow(unused_imports)]
 pub use types::{
