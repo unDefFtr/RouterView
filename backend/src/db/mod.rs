@@ -586,6 +586,26 @@ impl TrafficDb {
         Ok(())
     }
 
+    pub fn setup_token_is_valid(
+        &self,
+        token_hash: &[u8],
+        now: i64,
+    ) -> Result<bool, rusqlite::Error> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM setup_tokens
+                 WHERE id = 1 AND token_hash = ?1
+                   AND used_at IS NULL AND expires_at > ?2
+             ) AND NOT EXISTS(SELECT 1 FROM admins)",
+            params![token_hash, now],
+            |row| row.get(0),
+        )
+    }
+
     pub fn consume_setup_and_create_admin(
         &self,
         token_hash: &[u8],
@@ -600,7 +620,8 @@ impl TrafficDb {
         let tx = conn.transaction()?;
         let changed = tx.execute(
             "UPDATE setup_tokens SET used_at = ?1
-             WHERE id = 1 AND token_hash = ?2 AND used_at IS NULL AND expires_at > ?1",
+             WHERE id = 1 AND token_hash = ?2 AND used_at IS NULL AND expires_at > ?1
+               AND NOT EXISTS(SELECT 1 FROM admins)",
             params![now, token_hash],
         )?;
         if changed != 1 {

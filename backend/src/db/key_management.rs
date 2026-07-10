@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use zeroize::Zeroizing;
 
 use super::TrafficDb;
 use crate::secrets::{EncryptedSecret, SecretCipher, SecretError};
@@ -66,17 +67,9 @@ struct StoredSecret {
     encrypted: EncryptedSecret,
 }
 
-struct Plaintext(Vec<u8>);
-
-impl Drop for Plaintext {
-    fn drop(&mut self) {
-        self.0.fill(0);
-    }
-}
-
 struct RotatedSecret {
     name: String,
-    plaintext: Plaintext,
+    plaintext: Zeroizing<Vec<u8>>,
     encrypted: EncryptedSecret,
 }
 
@@ -125,7 +118,7 @@ fn verify_transaction(
     let secrets = load_secrets(tx)?;
     if let Some(instance_id) = instance_id_for(tx, &secrets)? {
         for secret in &secrets {
-            let _plaintext = Plaintext(
+            let _plaintext = Zeroizing::new(
                 current_cipher
                     .decrypt(&instance_id, &secret.name, &secret.encrypted)
                     .map_err(|source| KeyManagementError::CurrentKey {
@@ -180,7 +173,7 @@ fn rotate_transaction(
     // Verify and prepare the complete replacement set before mutating any row.
     let mut replacements = Vec::with_capacity(stored.len());
     for secret in &stored {
-        let plaintext = Plaintext(
+        let plaintext = Zeroizing::new(
             current_cipher
                 .decrypt(&instance_id, &secret.name, &secret.encrypted)
                 .map_err(|source| KeyManagementError::CurrentKey {
@@ -189,7 +182,7 @@ fn rotate_transaction(
                 })?,
         );
         let encrypted = new_cipher
-            .encrypt(&instance_id, &secret.name, &plaintext.0)
+            .encrypt(&instance_id, &secret.name, plaintext.as_slice())
             .map_err(|source| KeyManagementError::Encrypt {
                 name: secret.name.clone(),
                 source,
@@ -227,7 +220,7 @@ fn rotate_transaction(
         if actual.name != expected.name {
             return Err(KeyManagementError::SecretSetChanged);
         }
-        let plaintext = Plaintext(
+        let plaintext = Zeroizing::new(
             new_cipher
                 .decrypt(&instance_id, &actual.name, &actual.encrypted)
                 .map_err(|source| KeyManagementError::ReadBack {
@@ -235,7 +228,7 @@ fn rotate_transaction(
                     source,
                 })?,
         );
-        if plaintext.0 != expected.plaintext.0 {
+        if plaintext.as_slice() != expected.plaintext.as_slice() {
             return Err(KeyManagementError::PlaintextMismatch {
                 name: actual.name.clone(),
             });

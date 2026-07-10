@@ -337,8 +337,7 @@ pub async fn login(
     } else {
         "invalid-password-input".to_string()
     };
-    let password_matches = verify_password(password, encoded_hash).await?;
-    drop(permit);
+    let password_matches = verify_password(password, encoded_hash, permit).await?;
 
     if !username_matches || !password_matches || !password_is_bounded {
         for key in failure_keys {
@@ -461,8 +460,7 @@ pub async fn create_pairing(
             return Err(AppError::Unauthorized);
         }
         let permit = state.auth_security.acquire_argon2().await?;
-        let verified = verify_password(password, admin.password_hash).await?;
-        drop(permit);
+        let verified = verify_password(password, admin.password_hash, permit).await?;
         if !verified {
             return Err(AppError::Unauthorized);
         }
@@ -532,9 +530,11 @@ pub async fn setup(
     }
     let username = normalize_username(&body.username)?;
     validate_password(&body.password)?;
-    let password_hash = hash_password(body.password).await?;
+    let setup_token_hash = validate_setup_token(&state.traffic_db, &body.token, unix_time())?;
+    let permit = state.auth_security.acquire_argon2().await?;
+    let password_hash = hash_password(body.password, permit).await?;
     let consumed = state.traffic_db.consume_setup_and_create_admin(
-        &hash_token(body.token.trim()),
+        &setup_token_hash,
         unix_time(),
         &username,
         &password_hash,
@@ -878,14 +878,36 @@ fn hash_password_sync(password: &str) -> Result<String, AppError> {
         .map_err(|_| AppError::Internal("password hashing failed".into()))
 }
 
-async fn hash_password(password: String) -> Result<String, AppError> {
-    tokio::task::spawn_blocking(move || hash_password_sync(&password))
-        .await
-        .map_err(|_| AppError::Internal("password hashing task failed".into()))?
+async fn run_argon2_task<T, F>(
+    permit: OwnedSemaphorePermit,
+    failure_message: &'static str,
+    task: F,
+) -> Result<T, AppError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, AppError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        task()
+    })
+    .await
+    .map_err(|_| AppError::Internal(failure_message.into()))?
 }
 
-async fn verify_password(password: String, encoded: String) -> Result<bool, AppError> {
-    tokio::task::spawn_blocking(move || {
+async fn hash_password(password: String, permit: OwnedSemaphorePermit) -> Result<String, AppError> {
+    run_argon2_task(permit, "password hashing task failed", move || {
+        hash_password_sync(&password)
+    })
+    .await
+}
+
+async fn verify_password(
+    password: String,
+    encoded: String,
+    permit: OwnedSemaphorePermit,
+) -> Result<bool, AppError> {
+    run_argon2_task(permit, "password verification task failed", move || {
         let parsed = PasswordHash::new(&encoded)
             .map_err(|_| AppError::Internal("stored password hash is invalid".into()))?;
         Ok(argon2()?
@@ -893,7 +915,22 @@ async fn verify_password(password: String, encoded: String) -> Result<bool, AppE
             .is_ok())
     })
     .await
-    .map_err(|_| AppError::Internal("password verification task failed".into()))?
+}
+
+fn validate_setup_token(db: &TrafficDb, token: &str, now: i64) -> Result<Vec<u8>, AppError> {
+    let token = token.trim();
+    if token.len() != 43
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(AppError::Unauthorized);
+    }
+    let token_hash = hash_token(token);
+    if !db.setup_token_is_valid(&token_hash, now)? {
+        return Err(AppError::Unauthorized);
+    }
+    Ok(token_hash)
 }
 
 fn normalize_username(value: &str) -> Result<String, AppError> {
@@ -1075,6 +1112,62 @@ mod tests {
         assert!(started.elapsed() >= ARGON2_WAIT_TIMEOUT);
         drop((second, third));
         assert!(security.acquire_argon2().await.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_waiter_does_not_release_running_argon2_permit() {
+        let slots = Arc::new(Semaphore::new(1));
+        let permit = slots.clone().acquire_owned().await.unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let waiter = tokio::spawn(run_argon2_task(
+            permit,
+            "test password task failed",
+            move || {
+                let _ = started_tx.send(());
+                release_rx.recv().unwrap();
+                Ok(())
+            },
+        ));
+        started_rx.await.unwrap();
+        waiter.abort();
+        let _ = waiter.await;
+
+        assert!(slots.clone().try_acquire_owned().is_err());
+        release_tx.send(()).unwrap();
+        let reacquired = tokio::time::timeout(Duration::from_secs(1), slots.acquire_owned())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(reacquired);
+    }
+
+    #[test]
+    fn setup_token_is_prechecked_and_atomically_rechecked() {
+        let database = TrafficDb::open(FsPath::new(":memory:")).unwrap();
+        let token = random_token();
+        let token_hash = hash_token(&token);
+        let now = unix_time();
+        database.store_setup_token(&token_hash, now + 60).unwrap();
+
+        assert!(matches!(
+            validate_setup_token(&database, "not-a-token", now),
+            Err(AppError::Unauthorized)
+        ));
+        assert_eq!(
+            validate_setup_token(&database, &token, now).unwrap(),
+            token_hash
+        );
+        assert!(database
+            .consume_setup_and_create_admin(&token_hash, now, "admin", "hash")
+            .unwrap());
+        assert!(matches!(
+            validate_setup_token(&database, &token, now),
+            Err(AppError::Unauthorized)
+        ));
+        assert!(!database
+            .consume_setup_and_create_admin(&token_hash, now, "admin", "other-hash")
+            .unwrap());
     }
 
     #[cfg(unix)]

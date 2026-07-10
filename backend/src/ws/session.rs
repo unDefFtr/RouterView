@@ -37,6 +37,12 @@ pub async fn run_session(socket: WebSocket, state: Arc<AppState>, auth_session: 
     // Subscribe to the broadcast channel
     let mut broadcast_rx = state.broadcast_tx.subscribe();
     let mut shutdown_rx = state.shutdown_tx.subscribe();
+    if *shutdown_rx.borrow() {
+        let _ = sender
+            .send(Message::Close(Some(shutdown_close_frame())))
+            .await;
+        return;
+    }
     let mut session_check =
         tokio::time::interval(std::time::Duration::from_secs(SESSION_REVALIDATE_SECS));
     session_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -176,5 +182,12 @@ mod tests {
         let frame = shutdown_close_frame();
         assert_eq!(frame.code, 1001);
         assert_eq!(frame.reason, "server shutting down");
+    }
+
+    #[test]
+    fn new_subscriber_observes_shutdown_that_was_already_requested() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        shutdown_tx.send_replace(true);
+        assert!(*shutdown_rx.borrow());
     }
 }
