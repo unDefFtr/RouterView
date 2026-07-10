@@ -185,14 +185,20 @@ and run a one-off backend container against the same volumes:
 ```bash
 docker compose stop caddy backend
 docker compose run --rm --no-deps backend db restore \
-  /var/backups/routerview/routerview-YYYYMMDDTHHMMSS.db
+  /var/backups/routerview/routerview-YYYYMMDDTHHMMSS.db \
+  --backup-dir /var/backups/routerview
+docker compose run --rm --no-deps backend db migrate \
+  --backup-dir /var/backups/routerview
 docker compose run --rm --no-deps backend db check
-docker compose up -d
+docker compose run --rm --no-deps backend keys verify
+docker compose up -d --wait
 ```
 
-The restore command preserves the replaced database in the backup volume.
-Retain it until the restored instance passes readiness and traffic sampling
-checks.
+The explicit backup directory keeps the pre-restore recovery backup in
+`routerview_backups` rather than under the live data volume. Restore does not
+migrate an older schema or verify encrypted credentials, so all three offline
+post-restore commands are required. Retain the recovery backup until the
+restored instance passes readiness and traffic sampling checks.
 
 ## Upgrade and migration
 
