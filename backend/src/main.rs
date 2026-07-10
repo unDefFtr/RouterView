@@ -79,7 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── Probe targets: load from DB, convert to engine format ──
-    let probe_rows = traffic_db.get_all_probe_targets();
+    let probe_rows = traffic_db.get_all_probe_targets()?;
     tracing::info!("Loaded {} probe targets from DB", probe_rows.len());
     let probe_targets: Vec<(String, String, String)> = probe_rows
         .iter()

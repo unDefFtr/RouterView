@@ -57,4 +57,26 @@ describe('ProbeTargetEditor keyboard ordering', () => {
 
     wrapper.unmount();
   });
+
+  it('enforces the target count and input length bounds', async () => {
+    apiMocks.fetchProbeTargets.mockResolvedValueOnce({
+      targets: Array.from({ length: 32 }, (_, index) => ({
+        name: `Target ${index + 1}`,
+        host: `host-${index + 1}.example`,
+        category: 'custom',
+        sort_order: index,
+      })),
+    });
+    const wrapper = mount(ProbeTargetEditor, {
+      global: { stubs: { FeatherIcon: true } },
+    });
+    await flushPromises();
+
+    expect(wrapper.get('input[aria-label="站点 1 名称"]').attributes('maxlength')).toBe('64');
+    expect(wrapper.get('input[aria-label="Target 1 目标地址"]').attributes('maxlength')).toBe('253');
+    const add = wrapper.get<HTMLButtonElement>('.btn-add');
+    expect(add.attributes('disabled')).toBeDefined();
+    await add.trigger('click');
+    expect(wrapper.findAll('.probe-row')).toHaveLength(32);
+  });
 });

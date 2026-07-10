@@ -9,6 +9,7 @@ import {
 import FeatherIcon from '@/components/shared/FeatherIcon.vue';
 
 const CATEGORIES = ['dns', 'cloud', 'cdn', 'repo', 'isp', 'custom'] as const;
+const MAX_TARGETS = 32;
 
 const targets = ref<ProbeTarget[]>([]);
 const loading = ref(true);
@@ -71,6 +72,7 @@ async function load() {
 }
 
 function addTarget() {
+  if (targets.value.length >= MAX_TARGETS) return;
   targets.value.push({
     name: '',
     host: '',
@@ -185,6 +187,7 @@ onMounted(load);
                 class="field-input"
                 type="text"
                 v-model="t.name"
+                maxlength="64"
                 :aria-label="`站点 ${i + 1} 名称`"
                 placeholder="名称"
               />
@@ -194,6 +197,7 @@ onMounted(load);
                 class="field-input mono"
                 type="text"
                 v-model="t.host"
+                maxlength="253"
                 :aria-label="`${t.name || `站点 ${i + 1}`} 目标地址`"
                 placeholder="IP 或域名"
               />
@@ -229,7 +233,12 @@ onMounted(load);
 
     <!-- Actions -->
     <div class="probe-actions">
-      <button type="button" class="btn-add" @click="addTarget">
+      <button
+        type="button"
+        class="btn-add"
+        :disabled="saving || targets.length >= MAX_TARGETS"
+        @click="addTarget"
+      >
         <FeatherIcon name="plus" :size="14" />
         <span>添加站点</span>
       </button>

@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -46,7 +46,7 @@ pub struct DeviceOverride {
 }
 
 /// A latency probe target stored in SQLite.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProbeTargetRow {
     pub id: i64,
     pub name: String,
@@ -102,10 +102,10 @@ impl TrafficDb {
     /// Open (or create) the SQLite database at the given path.
     #[cfg(test)]
     pub fn open(path: &Path) -> Result<Self, DatabaseError> {
-        let (conn, lock, migration) = maintenance::open_runtime(path)?;
+        let (mut conn, lock, migration) = maintenance::open_runtime(path)?;
 
         // Seed default probe targets (idempotent — skips if any exist)
-        seed_default_probe_targets_inner(&conn);
+        seed_default_probe_targets_inner(&mut conn)?;
 
         if let Some(backup) = &migration.backup {
             info!(
@@ -142,7 +142,7 @@ impl TrafficDb {
             .lock()
             .map_err(|_| rusqlite::Error::InvalidQuery)?;
         let migration = maintenance::finish_runtime_migration(&self.path, &mut conn)?;
-        seed_default_probe_targets_inner(&conn);
+        seed_default_probe_targets_inner(&mut conn)?;
         if let Some(backup) = &migration.backup {
             info!(
                 "Migrated traffic DB from v{} to v{}; verified backup: {} ({}, {} rows)",
@@ -234,95 +234,56 @@ impl TrafficDb {
     // ── Probe Targets ─────────────────────────────────────────
 
     /// Get all probe targets ordered by sort_order, then id.
-    pub fn get_all_probe_targets(&self) -> Vec<ProbeTargetRow> {
-        let conn = match self.conn.lock() {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("TrafficDB lock poisoned during get_all_probe_targets: {e}");
-                return vec![];
-            }
-        };
-        let mut stmt = match conn.prepare(
-            "SELECT id, name, host, category, sort_order FROM probe_targets ORDER BY sort_order, id",
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("TrafficDB prepare probe_targets query failed: {e}");
-                return vec![];
-            }
-        };
-        stmt.query_map([], |row| {
-            Ok(ProbeTargetRow {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                host: row.get(2)?,
-                category: row.get(3)?,
-                sort_order: row.get(4)?,
-            })
-        })
-        .ok()
-        .into_iter()
-        .flat_map(|r| r.filter_map(|x| x.ok()))
-        .collect()
+    pub fn get_all_probe_targets(&self) -> Result<Vec<ProbeTargetRow>, rusqlite::Error> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        query_probe_targets(&conn)
     }
 
     /// Replace all probe targets in a transaction (DELETE all + INSERT new).
-    pub fn replace_all_probe_targets(&self, targets: &[ProbeTargetRow]) {
-        let conn = match self.conn.lock() {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("TrafficDB lock poisoned during replace_all_probe_targets: {e}");
-                return;
-            }
-        };
-
-        // Wrap in a transaction for atomicity
-        if let Err(e) = conn.execute_batch("BEGIN") {
-            warn!("TrafficDB begin tx failed: {e}");
-            return;
-        }
-
-        if let Err(e) = conn.execute("DELETE FROM probe_targets", []) {
-            warn!("TrafficDB delete probe_targets failed: {e}");
-            let _ = conn.execute_batch("ROLLBACK");
-            return;
-        }
-
-        let mut insert_stmt = match conn.prepare(
-            "INSERT INTO probe_targets (name, host, category, sort_order) VALUES (?1, ?2, ?3, ?4)",
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("TrafficDB prepare insert probe_targets failed: {e}");
-                let _ = conn.execute_batch("ROLLBACK");
-                return;
-            }
-        };
-
-        for t in targets {
-            if let Err(e) = insert_stmt.execute(params![t.name, t.host, t.category, t.sort_order]) {
-                warn!("TrafficDB insert probe_target failed: {e}");
+    pub fn replace_all_probe_targets(
+        &self,
+        targets: &[ProbeTargetRow],
+    ) -> Result<Vec<ProbeTargetRow>, rusqlite::Error> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("DELETE FROM probe_targets", [])?;
+        {
+            let mut statement = tx.prepare(
+                "INSERT INTO probe_targets(name, host, category, sort_order)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for target in targets {
+                statement.execute(params![
+                    target.name,
+                    target.host,
+                    target.category,
+                    target.sort_order
+                ])?;
             }
         }
-
-        if let Err(e) = conn.execute_batch("COMMIT") {
-            warn!("TrafficDB commit tx failed: {e}");
-        }
+        let stored = query_probe_targets(&tx)?;
+        tx.commit()?;
+        Ok(stored)
     }
 
     /// Reset probe targets to defaults: DELETE all, re-seed.
-    pub fn reset_probe_targets(&self) {
-        let conn = match self.conn.lock() {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("TrafficDB lock poisoned during reset_probe_targets: {e}");
-                return;
-            }
-        };
-        if let Err(e) = conn.execute("DELETE FROM probe_targets", []) {
-            warn!("TrafficDB delete probe_targets for reset failed: {e}");
-        }
-        seed_default_probe_targets_inner(&conn);
+    pub fn reset_probe_targets(&self) -> Result<Vec<ProbeTargetRow>, rusqlite::Error> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("DELETE FROM probe_targets", [])?;
+        insert_default_probe_targets(&tx)?;
+        let stored = query_probe_targets(&tx)?;
+        tx.commit()?;
+        Ok(stored)
     }
 
     // ── Config Store ────────────────────────────────────────────
@@ -1023,33 +984,119 @@ pub fn apply_device_overrides(wifi: &mut WifiInfo, db: &TrafficDb) {
 // Probe target seed data
 // ═══════════════════════════════════════════════════════════════════
 
+fn query_probe_targets(conn: &Connection) -> Result<Vec<ProbeTargetRow>, rusqlite::Error> {
+    let mut statement = conn.prepare(
+        "SELECT id, name, host, category, sort_order
+         FROM probe_targets ORDER BY sort_order, id",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(ProbeTargetRow {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                host: row.get(2)?,
+                category: row.get(3)?,
+                sort_order: row.get(4)?,
+            })
+        })?
+        .collect();
+    rows
+}
+
 /// Seed default probe targets into the database.
 /// Idempotent: does nothing if any rows already exist.
-fn seed_default_probe_targets_inner(conn: &rusqlite::Connection) {
-    let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM probe_targets", [], |r| r.get(0))
-        .unwrap_or(0);
+fn seed_default_probe_targets_inner(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM probe_targets", [], |row| row.get(0))?;
     if count > 0 {
-        return;
+        return Ok(());
     }
 
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let inserted = insert_default_probe_targets(&tx)?;
+    tx.commit()?;
+    info!("Seeded {inserted} default probe targets");
+    Ok(())
+}
+
+fn insert_default_probe_targets(conn: &Connection) -> Result<usize, rusqlite::Error> {
     let defaults = crate::poller::transform::default_latency_probe_targets(&[]);
-    let mut stmt = match conn.prepare(
-        "INSERT INTO probe_targets (name, host, category, sort_order) VALUES (?1, ?2, ?3, ?4)",
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("Seed probe_targets prepare failed: {e}");
-            return;
-        }
-    };
-
+    let mut statement = conn.prepare(
+        "INSERT INTO probe_targets(name, host, category, sort_order)
+         VALUES (?1, ?2, ?3, ?4)",
+    )?;
     for (i, (name, host, category)) in defaults.iter().enumerate() {
-        if let Err(e) = stmt.execute(params![name, host, category, i as i64]) {
-            warn!("Seed probe_targets insert failed for {name}: {e}");
+        statement.execute(params![name, host, category, i as i64])?;
+    }
+    Ok(defaults.len())
+}
+
+#[cfg(test)]
+mod probe_target_tests {
+    use super::*;
+
+    fn memory_db() -> TrafficDb {
+        TrafficDb::open(&PathBuf::from(":memory:")).unwrap()
+    }
+
+    fn target(name: &str, host: &str, sort_order: i64) -> ProbeTargetRow {
+        ProbeTargetRow {
+            id: 0,
+            name: name.to_string(),
+            host: host.to_string(),
+            category: "custom".to_string(),
+            sort_order,
         }
     }
-    info!("Seeded {} default probe targets", defaults.len());
+
+    #[test]
+    fn probe_target_replacement_is_atomic_on_insert_failure() {
+        let db = memory_db();
+        let stored = db
+            .replace_all_probe_targets(&[
+                target("First", "192.0.2.1", 0),
+                target("Second", "192.0.2.2", 1),
+            ])
+            .unwrap();
+        assert_eq!(stored, db.get_all_probe_targets().unwrap());
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_probe_insert
+                 BEFORE INSERT ON probe_targets
+                 WHEN NEW.name = 'Fail'
+                 BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;",
+            )
+            .unwrap();
+
+        assert!(db
+            .replace_all_probe_targets(&[
+                target("Replacement", "198.51.100.1", 0),
+                target("Fail", "198.51.100.2", 1),
+            ])
+            .is_err());
+        assert_eq!(db.get_all_probe_targets().unwrap(), stored);
+    }
+
+    #[test]
+    fn probe_target_reset_rolls_back_when_default_seed_fails() {
+        let db = memory_db();
+        let stored = db
+            .replace_all_probe_targets(&[target("Existing", "192.0.2.1", 0)])
+            .unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_probe_reset
+                 BEFORE INSERT ON probe_targets
+                 BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;",
+            )
+            .unwrap();
+
+        assert!(db.reset_probe_targets().is_err());
+        assert_eq!(db.get_all_probe_targets().unwrap(), stored);
+    }
 }
 
 #[cfg(test)]
