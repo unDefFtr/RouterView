@@ -41,6 +41,13 @@ pub struct SystemIdentity {
     pub name: String,
 }
 
+/// Optional raw response from `/rest/system/routerboard`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RouterboardInfo {
+    #[serde(default, rename = "serial-number")]
+    pub serial_number: String,
+}
+
 /// Raw response from `/rest/ip/address`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct IpAddress {
@@ -52,7 +59,7 @@ pub struct IpAddress {
     pub network: String,
     #[serde(default)]
     pub interface: String,
-    #[serde(default)]
+    #[serde(default, rename = "actual-interface")]
     pub actual_interface: String,
     #[serde(default)]
     pub disabled: String,
@@ -73,7 +80,7 @@ pub struct Interface {
     pub iface_type: String,
     #[serde(default)]
     pub mtu: String,
-    #[serde(default)]
+    #[serde(default, rename = "mac-address")]
     pub mac_address: String,
     #[serde(default)]
     pub running: String,
@@ -97,7 +104,7 @@ pub struct Interface {
     pub last_link_up_time: String,
     #[serde(default)]
     pub comment: String,
-    #[serde(default)]
+    #[serde(default, rename = "default-name")]
     pub default_name: String,
 }
 
@@ -133,6 +140,8 @@ pub struct Route {
     pub dst_address: String,
     #[serde(default)]
     pub gateway: String,
+    #[serde(default, rename = "immediate-gw")]
+    pub immediate_gateway: String,
     #[serde(default, rename = "gateway-status")]
     pub gateway_status: String,
     #[serde(default)]
@@ -152,12 +161,6 @@ pub struct Route {
 pub struct DnsConfig {
     #[serde(default)]
     pub servers: String,
-    #[serde(default, rename = "allow-remote-requests")]
-    pub allow_remote_requests: String,
-    #[serde(default, rename = "cache-size")]
-    pub cache_size: String,
-    #[serde(default, rename = "cache-max-ttl")]
-    pub cache_max_ttl: String,
 }
 
 /// Raw response from `/rest/ip/dhcp-server/lease`.
@@ -185,19 +188,6 @@ pub struct DhcpLease {
     pub active_server: String,
 }
 
-/// Raw response from `/rest/system/health` (if available on the device).
-#[derive(Debug, Clone, Deserialize)]
-pub struct SystemHealth {
-    #[serde(rename = ".id")]
-    pub id: String,
-    #[serde(default)]
-    pub name: String,
-    #[serde(default)]
-    pub value: String,
-    #[serde(default, rename = "type")]
-    pub health_type: String,
-}
-
 /// Raw response from `/rest/interface/wireless/registration-table`
 /// (if WiFi interfaces exist).
 #[derive(Debug, Clone, Deserialize)]
@@ -220,8 +210,6 @@ pub struct WirelessRegistration {
     pub rx_rate: String,
     #[serde(default)]
     pub uptime: String,
-    #[serde(default, rename = "ack-timeout")]
-    pub ack_timeout: String,
     #[serde(default, rename = "tx-ccq")]
     pub tx_ccq: String,
     #[serde(default, rename = "rx-ccq")]
@@ -234,7 +222,7 @@ pub struct WirelessRegistration {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConnectionEntry {
     #[serde(rename = ".id")]
-    pub id: String,
+    pub _id: String,
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -252,7 +240,7 @@ pub struct Ipv6Address {
     pub network: String,
     #[serde(default)]
     pub interface: String,
-    #[serde(default)]
+    #[serde(default, rename = "actual-interface")]
     pub actual_interface: String,
     #[serde(default)]
     pub disabled: String,
@@ -279,6 +267,8 @@ pub struct Ipv6Route {
     pub dst_address: String,
     #[serde(default)]
     pub gateway: String,
+    #[serde(default, rename = "immediate-gw")]
+    pub immediate_gateway: String,
     #[serde(default, rename = "gateway-status")]
     pub gateway_status: String,
     #[serde(default)]
@@ -320,5 +310,41 @@ pub struct Ipv6Neighbor {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Ipv6ConnectionEntry {
     #[serde(rename = ".id")]
-    pub id: String,
+    pub _id: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn deserializes_hyphenated_routeros_properties() {
+        let interface: Interface = serde_json::from_value(json!({
+            ".id": "*1",
+            "mac-address": "00:11:22:33:44:55",
+            "default-name": "ether1"
+        }))
+        .unwrap();
+        let address: IpAddress = serde_json::from_value(json!({
+            ".id": "*2",
+            "actual-interface": "pppoe-out1"
+        }))
+        .unwrap();
+        let routerboard: RouterboardInfo = serde_json::from_value(json!({
+            "serial-number": "ABC123"
+        }))
+        .unwrap();
+        let route: Route = serde_json::from_value(json!({
+            ".id": "*3",
+            "immediate-gw": "192.0.2.1%ether1"
+        }))
+        .unwrap();
+
+        assert_eq!(interface.mac_address, "00:11:22:33:44:55");
+        assert_eq!(interface.default_name, "ether1");
+        assert_eq!(address.actual_interface, "pppoe-out1");
+        assert_eq!(routerboard.serial_number, "ABC123");
+        assert_eq!(route.immediate_gateway, "192.0.2.1%ether1");
+    }
 }

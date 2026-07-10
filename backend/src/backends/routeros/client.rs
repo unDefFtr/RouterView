@@ -1,16 +1,57 @@
-use std::{net::IpAddr, time::Duration};
+use std::{
+    net::IpAddr,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use base64::Engine;
 use reqwest::header::{HeaderValue, AUTHORIZATION};
 use serde::Deserialize;
+use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::backends::routeros::models::*;
 use crate::backends::{
-    ConnectionTestResult, RouterBackend, RouterConnectionConfig, RouterData, RouterType,
+    ConnectionTestResult, CounterSampleTime, RouterBackend, RouterConnectionConfig, RouterData,
+    RouterType,
 };
 use crate::error::AppError;
+
+const SYSTEM_RESOURCE_PATH: &str = "/system/resource?.proplist=uptime,cpu-load,free-memory,total-memory,free-hdd-space,total-hdd-space,cpu-count,cpu-frequency,architecture-name,board-name,version,platform";
+const SYSTEM_IDENTITY_PATH: &str = "/system/identity?.proplist=name";
+const SYSTEM_ROUTERBOARD_PATH: &str = "/system/routerboard?.proplist=serial-number";
+const IP_ADDRESS_PATH: &str =
+    "/ip/address?.proplist=.id,address,network,interface,actual-interface,disabled,dynamic,comment";
+const INTERFACE_PATH: &str = "/interface?.proplist=.id,name,type,mtu,mac-address,running,disabled,rx-byte,tx-byte,rx-packet,tx-packet,rx-drop,tx-drop,tx-queue-drop,last-link-up-time,comment,default-name";
+const IP_ROUTE_PATH: &str = "/ip/route?.proplist=.id,dst-address,gateway,immediate-gw,gateway-status,interface,active,disabled,distance,comment";
+const ARP_PATH: &str =
+    "/ip/arp?.proplist=.id,address,mac-address,interface,status,dynamic,disabled,comment,dhcp-name";
+const DNS_PATH: &str = "/ip/dns?.proplist=servers";
+const DHCP_LEASE_PATH: &str = "/ip/dhcp-server/lease?.proplist=.id,address,mac-address,host-name,server,status,expires-after,active-mac-address,active-address,active-server";
+const WIRELESS_REGISTRATION_PATH: &str = "/interface/wireless/registration-table?.proplist=.id,interface,mac-address,ap,signal-strength,signal-to-noise,tx-rate,rx-rate,uptime,tx-ccq,rx-ccq";
+const IPV6_ADDRESS_PATH: &str = "/ipv6/address?.proplist=.id,address,network,interface,actual-interface,disabled,dynamic,comment,advertise,eui-64,from-pool,no-dad";
+const IPV6_ROUTE_PATH: &str = "/ipv6/route?.proplist=.id,dst-address,gateway,immediate-gw,gateway-status,interface,active,disabled,distance,comment";
+const IPV6_NEIGHBOR_PATH: &str =
+    "/ipv6/neighbor?.proplist=.id,address,mac-address,interface,status,dynamic,disabled,comment";
+const FIREWALL_CONNECTION_IDS_PATH: &str = "/ip/firewall/connection?.proplist=.id";
+const IPV6_FIREWALL_CONNECTION_IDS_PATH: &str = "/ipv6/firewall/connection?.proplist=.id";
+const CONNECTION_COUNT_CACHE_TTL: Duration = Duration::from_secs(30);
+const HARDWARE_IDENTITY_RETRY_TTL: Duration = Duration::from_secs(10 * 60);
+const HARDWARE_IDENTITY_REFRESH_TTL: Duration = Duration::from_secs(60 * 60);
+
+#[derive(Default)]
+struct ConnectionCountCache {
+    ipv4_sampled_at: Option<Instant>,
+    ipv6_sampled_at: Option<Instant>,
+    ipv4: u32,
+    ipv6: u32,
+}
+
+#[derive(Default)]
+struct HardwareIdentityCache {
+    sampled_at: Option<Instant>,
+    value: Option<String>,
+}
 
 /// HTTP client wrapper for the MikroTik RouterOS REST API.
 ///
@@ -19,6 +60,8 @@ pub struct RouterOsClient {
     base_url: String,
     http_client: reqwest::Client,
     auth_header: String,
+    connection_counts: Mutex<ConnectionCountCache>,
+    hardware_identity: Mutex<HardwareIdentityCache>,
 }
 
 impl RouterOsClient {
@@ -86,8 +129,8 @@ impl RouterOsClient {
             return Ok(Vec::new());
         }
 
-        serde_json::from_str::<Vec<T>>(&body_text)
-            .or_else(|_| serde_json::from_str::<T>(&body_text).map(|item| vec![item]))
+        serde_json::from_str::<Vec<T>>(body_text)
+            .or_else(|_| serde_json::from_str::<T>(body_text).map(|item| vec![item]))
             .map_err(|e| {
                 warn!("Failed to deserialize RouterOS response: {e}");
                 AppError::RouterApi(format!("Failed to parse response from {path}: {e}"))
@@ -97,7 +140,7 @@ impl RouterOsClient {
     // ── Convenience Endpoint Methods ──────────────────────────
 
     async fn system_resource(&self) -> Result<SystemResource, AppError> {
-        let items = self.get::<SystemResource>("/system/resource").await?;
+        let items = self.get::<SystemResource>(SYSTEM_RESOURCE_PATH).await?;
         items
             .into_iter()
             .next()
@@ -105,31 +148,65 @@ impl RouterOsClient {
     }
 
     async fn system_identity(&self) -> Result<SystemIdentity, AppError> {
-        let items = self.get::<SystemIdentity>("/system/identity").await?;
+        let items = self.get::<SystemIdentity>(SYSTEM_IDENTITY_PATH).await?;
         items
             .into_iter()
             .next()
             .ok_or_else(|| AppError::InvalidData("Empty system identity response".into()))
     }
 
-    async fn ip_addresses(&self) -> Result<Vec<IpAddress>, AppError> {
-        self.get::<IpAddress>("/ip/address").await
+    async fn hardware_identity(&self) -> Option<String> {
+        let now = Instant::now();
+        {
+            let cache = self.hardware_identity.lock().await;
+            let ttl = if cache.value.is_some() {
+                HARDWARE_IDENTITY_REFRESH_TTL
+            } else {
+                HARDWARE_IDENTITY_RETRY_TTL
+            };
+            if connection_cache_is_fresh(cache.sampled_at, now, ttl) {
+                return cache.value.clone();
+            }
+        }
+
+        let value = match self.get::<RouterboardInfo>(SYSTEM_ROUTERBOARD_PATH).await {
+            Ok(items) => extract_hardware_identity(items),
+            Err(error) => {
+                debug!("RouterBOARD hardware identity not available: {error}");
+                None
+            }
+        };
+        let mut cache = self.hardware_identity.lock().await;
+        cache.sampled_at = Some(Instant::now());
+        cache.value = value.clone();
+        value
     }
 
-    async fn interfaces(&self) -> Result<Vec<Interface>, AppError> {
-        self.get::<Interface>("/interface").await
+    async fn ip_addresses(&self) -> Result<Vec<IpAddress>, AppError> {
+        self.get::<IpAddress>(IP_ADDRESS_PATH).await
+    }
+
+    async fn interfaces(&self) -> Result<(Vec<Interface>, CounterSampleTime), AppError> {
+        let interfaces = self.get::<Interface>(INTERFACE_PATH).await?;
+        Ok((
+            interfaces,
+            CounterSampleTime {
+                monotonic: Instant::now(),
+                unix_ms: chrono::Utc::now().timestamp_millis(),
+            },
+        ))
     }
 
     async fn routes(&self) -> Result<Vec<Route>, AppError> {
-        self.get::<Route>("/ip/route").await
+        self.get::<Route>(IP_ROUTE_PATH).await
     }
 
     async fn arp_table(&self) -> Result<Vec<ArpEntry>, AppError> {
-        self.get::<ArpEntry>("/ip/arp").await
+        self.get::<ArpEntry>(ARP_PATH).await
     }
 
     async fn dns_config(&self) -> Result<DnsConfig, AppError> {
-        let items = self.get::<DnsConfig>("/ip/dns").await?;
+        let items = self.get::<DnsConfig>(DNS_PATH).await?;
         items
             .into_iter()
             .next()
@@ -137,12 +214,12 @@ impl RouterOsClient {
     }
 
     async fn dhcp_leases(&self) -> Result<Vec<DhcpLease>, AppError> {
-        self.get::<DhcpLease>("/ip/dhcp-server/lease").await
+        self.get::<DhcpLease>(DHCP_LEASE_PATH).await
     }
 
     async fn wireless_registrations(&self) -> Result<Vec<WirelessRegistration>, AppError> {
         match self
-            .get::<WirelessRegistration>("/interface/wireless/registration-table")
+            .get::<WirelessRegistration>(WIRELESS_REGISTRATION_PATH)
             .await
         {
             Ok(regs) => Ok(regs),
@@ -153,20 +230,16 @@ impl RouterOsClient {
         }
     }
 
-    async fn firewall_connections(&self) -> Result<Vec<ConnectionEntry>, AppError> {
-        match self.get::<ConnectionEntry>("/ip/firewall/connection").await {
-            Ok(conns) => Ok(conns),
-            Err(e) => {
-                debug!("Firewall connection tracking not available: {e}");
-                Ok(Vec::new())
-            }
-        }
+    async fn firewall_connection_count(&self) -> Result<u32, AppError> {
+        self.get::<ConnectionEntry>(FIREWALL_CONNECTION_IDS_PATH)
+            .await
+            .map(|connections| connections.len() as u32)
     }
 
     // ── IPv6 Endpoint Methods ─────────────────────────────────
 
     async fn ipv6_addresses(&self) -> Result<Vec<Ipv6Address>, AppError> {
-        match self.get::<Ipv6Address>("/ipv6/address").await {
+        match self.get::<Ipv6Address>(IPV6_ADDRESS_PATH).await {
             Ok(addrs) => Ok(addrs),
             Err(e) => {
                 debug!("IPv6 addresses not available: {e}");
@@ -176,7 +249,7 @@ impl RouterOsClient {
     }
 
     async fn ipv6_routes(&self) -> Result<Vec<Ipv6Route>, AppError> {
-        match self.get::<Ipv6Route>("/ipv6/route").await {
+        match self.get::<Ipv6Route>(IPV6_ROUTE_PATH).await {
             Ok(routes) => Ok(routes),
             Err(e) => {
                 debug!("IPv6 routes not available: {e}");
@@ -186,7 +259,7 @@ impl RouterOsClient {
     }
 
     async fn ipv6_neighbors(&self) -> Result<Vec<Ipv6Neighbor>, AppError> {
-        match self.get::<Ipv6Neighbor>("/ipv6/neighbor").await {
+        match self.get::<Ipv6Neighbor>(IPV6_NEIGHBOR_PATH).await {
             Ok(neighbors) => Ok(neighbors),
             Err(e) => {
                 debug!("IPv6 neighbors not available: {e}");
@@ -195,18 +268,77 @@ impl RouterOsClient {
         }
     }
 
-    async fn ipv6_firewall_connections(&self) -> Result<Vec<Ipv6ConnectionEntry>, AppError> {
-        match self
-            .get::<Ipv6ConnectionEntry>("/ipv6/firewall/connection")
+    async fn ipv6_firewall_connection_count(&self) -> Result<u32, AppError> {
+        self.get::<Ipv6ConnectionEntry>(IPV6_FIREWALL_CONNECTION_IDS_PATH)
             .await
-        {
-            Ok(conns) => Ok(conns),
-            Err(e) => {
-                debug!("IPv6 firewall connection tracking not available: {e}");
-                Ok(Vec::new())
-            }
-        }
+            .map(|connections| connections.len() as u32)
     }
+
+    async fn cached_connection_counts(&self) -> (u32, u32) {
+        let now = Instant::now();
+        let (refresh_ipv4, refresh_ipv6, cached_ipv4, cached_ipv6) = {
+            let cache = self.connection_counts.lock().await;
+            (
+                !connection_cache_is_fresh(cache.ipv4_sampled_at, now, CONNECTION_COUNT_CACHE_TTL),
+                !connection_cache_is_fresh(cache.ipv6_sampled_at, now, CONNECTION_COUNT_CACHE_TTL),
+                cache.ipv4,
+                cache.ipv6,
+            )
+        };
+
+        let (ipv4, ipv6) = tokio::join!(
+            async {
+                if refresh_ipv4 {
+                    Some(self.firewall_connection_count().await)
+                } else {
+                    None
+                }
+            },
+            async {
+                if refresh_ipv6 {
+                    Some(self.ipv6_firewall_connection_count().await)
+                } else {
+                    None
+                }
+            }
+        );
+        if ipv4.is_none() && ipv6.is_none() {
+            return (cached_ipv4, cached_ipv6);
+        }
+
+        let mut cache = self.connection_counts.lock().await;
+        match ipv4 {
+            Some(Ok(count)) => {
+                cache.ipv4 = count;
+                cache.ipv4_sampled_at = Some(Instant::now());
+            }
+            Some(Err(error)) => debug!("Firewall connection tracking not available: {error}"),
+            None => {}
+        }
+        match ipv6 {
+            Some(Ok(count)) => {
+                cache.ipv6 = count;
+                cache.ipv6_sampled_at = Some(Instant::now());
+            }
+            Some(Err(error)) => {
+                debug!("IPv6 firewall connection tracking not available: {error}")
+            }
+            None => {}
+        }
+        (cache.ipv4, cache.ipv6)
+    }
+}
+
+fn extract_hardware_identity(items: Vec<RouterboardInfo>) -> Option<String> {
+    items
+        .into_iter()
+        .next()
+        .map(|item| item.serial_number.trim().to_string())
+        .filter(|serial| !serial.is_empty())
+}
+
+fn connection_cache_is_fresh(sampled_at: Option<Instant>, now: Instant, ttl: Duration) -> bool {
+    sampled_at.is_some_and(|sampled| now.saturating_duration_since(sampled) < ttl)
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -221,7 +353,7 @@ impl RouterBackend for RouterOsClient {
         let auth_header = build_basic_auth_header(&config.username, &config.password)?;
 
         // Quick sanity check: does a simple GET work with Basic auth?
-        let test_url = format!("{}/system/resource", base_url);
+        let test_url = format!("{base_url}{SYSTEM_RESOURCE_PATH}");
         match http_client
             .get(&test_url)
             .header(
@@ -268,11 +400,38 @@ impl RouterBackend for RouterOsClient {
             base_url,
             http_client,
             auth_header,
+            connection_counts: Mutex::new(ConnectionCountCache::default()),
+            hardware_identity: Mutex::new(HardwareIdentityCache::default()),
         })
     }
 
     async fn fetch_all(&self) -> Result<RouterData, AppError> {
-        // Fetch all IPv4 endpoints in parallel
+        let primary = async {
+            tokio::try_join!(
+                self.system_resource(),
+                self.system_identity(),
+                self.ip_addresses(),
+                self.interfaces(),
+                self.arp_table(),
+                self.dns_config(),
+                self.dhcp_leases(),
+                self.wireless_registrations(),
+                self.routes(),
+            )
+        };
+        let optional_ipv6 = async {
+            tokio::join!(
+                self.ipv6_addresses(),
+                self.ipv6_routes(),
+                self.ipv6_neighbors(),
+            )
+        };
+        let (primary_result, ipv6_result, hardware_identity, connection_counts) = tokio::join!(
+            primary,
+            optional_ipv6,
+            self.hardware_identity(),
+            self.cached_connection_counts()
+        );
         let (
             sys_result,
             identity_result,
@@ -283,49 +442,33 @@ impl RouterBackend for RouterOsClient {
             leases_result,
             wireless_result,
             routes_result,
-            connections_result,
-        ) = tokio::try_join!(
-            self.system_resource(),
-            self.system_identity(),
-            self.ip_addresses(),
-            self.interfaces(),
-            self.arp_table(),
-            self.dns_config(),
-            self.dhcp_leases(),
-            self.wireless_registrations(),
-            self.routes(),
-            self.firewall_connections(),
-        )?;
-
-        // Fetch IPv6 endpoints in a separate parallel batch
-        // IPv6 methods use graceful degradation (return Ok(empty) on error)
-        let (ipv6_ips_result, ipv6_routes_result, ipv6_neighbors_result, ipv6_connections_result) = tokio::join!(
-            self.ipv6_addresses(),
-            self.ipv6_routes(),
-            self.ipv6_neighbors(),
-            self.ipv6_firewall_connections(),
-        );
+        ) = primary_result?;
+        let (interfaces_result, counter_sample_time) = interfaces_result;
+        let (ipv6_ips_result, ipv6_routes_result, ipv6_neighbors_result) = ipv6_result;
         let ipv6_ips_result = ipv6_ips_result.unwrap_or_default();
         let ipv6_routes_result = ipv6_routes_result.unwrap_or_default();
         let ipv6_neighbors_result = ipv6_neighbors_result.unwrap_or_default();
-        let ipv6_connections_result = ipv6_connections_result.unwrap_or_default();
 
         Ok(
             crate::backends::routeros::transform::routeros_to_router_data(
-                sys_result,
-                identity_result,
-                ips_result,
-                interfaces_result,
-                arp_result,
-                dns_result,
-                leases_result,
-                wireless_result,
-                routes_result,
-                connections_result,
-                ipv6_ips_result,
-                ipv6_routes_result,
-                ipv6_neighbors_result,
-                ipv6_connections_result,
+                crate::backends::routeros::transform::RouterOsSnapshot {
+                    counter_sample_time,
+                    system: sys_result,
+                    hardware_identity,
+                    identity: identity_result,
+                    ip_addresses: ips_result,
+                    interfaces: interfaces_result,
+                    arp_entries: arp_result,
+                    dns: dns_result,
+                    dhcp_leases: leases_result,
+                    wireless_registrations: wireless_result,
+                    routes: routes_result,
+                    connection_count: connection_counts.0,
+                    ipv6_addresses: ipv6_ips_result,
+                    ipv6_routes: ipv6_routes_result,
+                    ipv6_neighbors: ipv6_neighbors_result,
+                    ipv6_connection_count: connection_counts.1,
+                },
             ),
         )
     }
@@ -333,12 +476,7 @@ impl RouterBackend for RouterOsClient {
     async fn test_connection(
         config: &RouterConnectionConfig,
     ) -> Result<ConnectionTestResult, AppError> {
-        let test_url = format!(
-            "{}://{}:{}/rest/system/resource",
-            config.scheme,
-            format_url_host(&config.host),
-            config.port
-        );
+        let test_url = format!("{}{}", Self::base_url(config)?, SYSTEM_RESOURCE_PATH);
 
         let http_client = build_http_client(config).await?;
 
@@ -444,10 +582,14 @@ async fn resolve_management_target(
     if config.host.trim().is_empty() || config.host != config.host.trim() {
         return Err(AppError::InvalidData("invalid router host".into()));
     }
-    let addresses: Vec<_> = tokio::net::lookup_host((config.host.as_str(), config.port))
-        .await
-        .map_err(|_| AppError::RouterUnreachable)?
-        .collect();
+    let addresses: Vec<_> = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::lookup_host((config.host.as_str(), config.port)),
+    )
+    .await
+    .map_err(|_| AppError::RouterUnreachable)?
+    .map_err(|_| AppError::RouterUnreachable)?
+    .collect();
     if addresses.is_empty() {
         return Err(AppError::RouterUnreachable);
     }
@@ -472,13 +614,6 @@ async fn resolve_management_target(
         }
     }
     Ok(addresses)
-}
-
-fn format_url_host(host: &str) -> String {
-    match host.parse::<IpAddr>() {
-        Ok(IpAddr::V6(address)) => format!("[{address}]"),
-        _ => host.to_string(),
-    }
 }
 
 async fn read_limited_body(
@@ -533,5 +668,69 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(addresses[0].ip().to_string(), "192.168.88.1");
+    }
+
+    #[test]
+    fn every_collection_endpoint_uses_a_property_list() {
+        let paths = [
+            SYSTEM_RESOURCE_PATH,
+            SYSTEM_IDENTITY_PATH,
+            SYSTEM_ROUTERBOARD_PATH,
+            IP_ADDRESS_PATH,
+            INTERFACE_PATH,
+            IP_ROUTE_PATH,
+            ARP_PATH,
+            DNS_PATH,
+            DHCP_LEASE_PATH,
+            WIRELESS_REGISTRATION_PATH,
+            IPV6_ADDRESS_PATH,
+            IPV6_ROUTE_PATH,
+            IPV6_NEIGHBOR_PATH,
+            FIREWALL_CONNECTION_IDS_PATH,
+            IPV6_FIREWALL_CONNECTION_IDS_PATH,
+        ];
+
+        assert!(paths
+            .iter()
+            .all(|path| path.contains("?.proplist=") && !path.ends_with(".proplist=")));
+        assert!(FIREWALL_CONNECTION_IDS_PATH.ends_with("=.id"));
+        assert!(IPV6_FIREWALL_CONNECTION_IDS_PATH.ends_with("=.id"));
+    }
+
+    #[test]
+    fn normalizes_optional_routerboard_serial_number() {
+        let identity = extract_hardware_identity(vec![RouterboardInfo {
+            serial_number: "  ABC123  ".to_string(),
+        }]);
+        let empty = extract_hardware_identity(vec![RouterboardInfo {
+            serial_number: "  ".to_string(),
+        }]);
+
+        assert_eq!(identity.as_deref(), Some("ABC123"));
+        assert_eq!(empty, None);
+        assert_eq!(extract_hardware_identity(Vec::new()), None);
+    }
+
+    #[test]
+    fn connection_count_cache_is_bounded_to_thirty_seconds() {
+        let now = Instant::now();
+        let recent = now.checked_sub(Duration::from_secs(29)).unwrap();
+        let expired = now.checked_sub(Duration::from_secs(30)).unwrap();
+
+        assert!(connection_cache_is_fresh(
+            Some(recent),
+            now,
+            CONNECTION_COUNT_CACHE_TTL
+        ));
+        assert!(!connection_cache_is_fresh(
+            Some(expired),
+            now,
+            CONNECTION_COUNT_CACHE_TTL
+        ));
+        assert!(!connection_cache_is_fresh(
+            None,
+            now,
+            CONNECTION_COUNT_CACHE_TTL
+        ));
     }
 }

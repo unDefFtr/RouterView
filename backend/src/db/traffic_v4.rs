@@ -142,6 +142,28 @@ pub struct TrafficQueryResult {
     pub coverage: TrafficCoverage,
 }
 
+#[derive(Debug)]
+struct RawTrafficSample {
+    id: i64,
+    router_id: i64,
+    interface_id: i64,
+    started_at_ms: i64,
+    ended_at_ms: i64,
+    duration_ms: i64,
+    download_bytes: i64,
+    upload_bytes: i64,
+    quality: String,
+}
+
+#[derive(Debug)]
+struct RawTrafficRemainder {
+    id: i64,
+    started_at_ms: i64,
+    ended_at_ms: i64,
+    download_bytes: i128,
+    upload_bytes: i128,
+}
+
 impl TrafficDb {
     pub fn resolve_router(
         &self,
@@ -196,6 +218,7 @@ impl TrafficDb {
         } else {
             insert_router(&tx, None, fallback_target, "fallback", observed_at_ms)?
         };
+        adopt_legacy_history(&tx, id, observed_at_ms)?;
         let router = router_by_id(&tx, id)?.ok_or_else(|| {
             DatabaseError::Verification("resolved router disappeared before commit".into())
         })?;
@@ -404,6 +427,38 @@ impl TrafficDb {
         checkpoint_for_connection(&conn, router_id, interface_id)
     }
 
+    /// Establish the first durable counter baseline without claiming traffic coverage.
+    ///
+    /// Returns `true` when the checkpoint was inserted and `false` when an existing
+    /// checkpoint was left untouched. Callers must handle an existing checkpoint as
+    /// a sampling discontinuity instead of deriving traffic across a process restart.
+    pub fn initialize_checkpoint_if_absent(
+        &self,
+        checkpoint: &CounterCheckpointInput<'_>,
+    ) -> DatabaseResult<bool> {
+        validate_checkpoint(checkpoint)?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        ensure_interface_owner(&conn, checkpoint.router_id, Some(checkpoint.interface_id))?;
+        let inserted = conn.execute(
+            "INSERT INTO counter_checkpoints(
+                 router_id, interface_id, rx_counter, tx_counter, observed_at_ms, reboot_marker
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(router_id, interface_id) DO NOTHING",
+            params![
+                checkpoint.router_id,
+                checkpoint.interface_id,
+                checkpoint.rx_counter,
+                checkpoint.tx_counter,
+                checkpoint.observed_at_ms,
+                checkpoint.reboot_marker,
+            ],
+        )?;
+        Ok(inserted == 1)
+    }
+
     pub fn record_traffic_gap(&self, gap: &TrafficGapInput<'_>) -> DatabaseResult<bool> {
         validate_gap(gap)?;
         let conn = self
@@ -549,60 +604,380 @@ impl TrafficDb {
             .lock()
             .map_err(|_| rusqlite::Error::InvalidQuery)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
-            "INSERT INTO traffic_rollups(
-                 router_id, interface_id, bucket_start_ms, bucket_end_ms, bucket_size_ms,
-                 exact_download_bytes, exact_upload_bytes,
-                 estimated_download_bytes, estimated_upload_bytes,
-                 exact_duration_ms, estimated_duration_ms, sample_count,
-                 download_avg_bps, upload_avg_bps, source, created_at_ms
-             )
-             SELECT router_id, interface_id,
-                    ((ended_at_ms - 1) / ?2) * ?2 AS bucket_start,
-                    (((ended_at_ms - 1) / ?2) + 1) * ?2 AS bucket_end,
-                    ?2,
-                    SUM(CASE WHEN quality = 'exact' THEN download_bytes ELSE 0 END),
-                    SUM(CASE WHEN quality = 'exact' THEN upload_bytes ELSE 0 END),
-                    SUM(CASE WHEN quality = 'estimated' THEN download_bytes ELSE 0 END),
-                    SUM(CASE WHEN quality = 'estimated' THEN upload_bytes ELSE 0 END),
-                    SUM(CASE WHEN quality = 'exact' THEN duration_ms ELSE 0 END),
-                    SUM(CASE WHEN quality = 'estimated' THEN duration_ms ELSE 0 END),
-                    COUNT(*),
-                    SUM(download_bytes) * 8000.0 / MAX(1, SUM(duration_ms)),
-                    SUM(upload_bytes) * 8000.0 / MAX(1, SUM(duration_ms)),
-                    'raw-rollup', ?1
-             FROM traffic_samples
-             WHERE ended_at_ms < ?1
-             GROUP BY router_id, interface_id, bucket_start
-             ON CONFLICT(router_id, interface_id, bucket_size_ms, bucket_start_ms, source)
-             DO UPDATE SET
-                 exact_download_bytes = traffic_rollups.exact_download_bytes + excluded.exact_download_bytes,
-                 exact_upload_bytes = traffic_rollups.exact_upload_bytes + excluded.exact_upload_bytes,
-                 estimated_download_bytes = traffic_rollups.estimated_download_bytes + excluded.estimated_download_bytes,
-                 estimated_upload_bytes = traffic_rollups.estimated_upload_bytes + excluded.estimated_upload_bytes,
-                 exact_duration_ms = traffic_rollups.exact_duration_ms + excluded.exact_duration_ms,
-                 estimated_duration_ms = traffic_rollups.estimated_duration_ms + excluded.estimated_duration_ms,
-                 sample_count = traffic_rollups.sample_count + excluded.sample_count,
-                 download_avg_bps =
-                     (traffic_rollups.exact_download_bytes + traffic_rollups.estimated_download_bytes +
-                      excluded.exact_download_bytes + excluded.estimated_download_bytes) * 8000.0 /
-                     MAX(1, traffic_rollups.exact_duration_ms + traffic_rollups.estimated_duration_ms +
-                            excluded.exact_duration_ms + excluded.estimated_duration_ms),
-                 upload_avg_bps =
-                     (traffic_rollups.exact_upload_bytes + traffic_rollups.estimated_upload_bytes +
-                      excluded.exact_upload_bytes + excluded.estimated_upload_bytes) * 8000.0 /
-                     MAX(1, traffic_rollups.exact_duration_ms + traffic_rollups.estimated_duration_ms +
-                            excluded.exact_duration_ms + excluded.estimated_duration_ms),
-                 bucket_end_ms = excluded.bucket_end_ms,
-                 created_at_ms = excluded.created_at_ms",
-            params![before_ms, bucket_size_ms],
+        let rollup_end_ms = before_ms;
+        let samples = {
+            let mut statement = tx.prepare(
+                "SELECT id, router_id, interface_id, started_at_ms, ended_at_ms,
+                        duration_ms, download_bytes, upload_bytes, quality
+                 FROM traffic_samples
+                 WHERE started_at_ms < ?1
+                 ORDER BY router_id, interface_id, started_at_ms, ended_at_ms, id",
+            )?;
+            let rows = statement.query_map(params![rollup_end_ms], |row| {
+                Ok(RawTrafficSample {
+                    id: row.get(0)?,
+                    router_id: row.get(1)?,
+                    interface_id: row.get(2)?,
+                    started_at_ms: row.get(3)?,
+                    ended_at_ms: row.get(4)?,
+                    duration_ms: row.get(5)?,
+                    download_bytes: row.get(6)?,
+                    upload_bytes: row.get(7)?,
+                    quality: row.get(8)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        let mut buckets: BTreeMap<(i64, i64, i64), (TrafficBucketAccumulator, i64)> =
+            BTreeMap::new();
+        let mut fully_consumed = Vec::new();
+        let mut remainders = Vec::new();
+        for sample in &samples {
+            validate_raw_sample_for_rollup(sample)?;
+            let consumed_end = sample.ended_at_ms.min(rollup_end_ms);
+            if consumed_end <= sample.started_at_ms {
+                continue;
+            }
+            let split_sample = sample.started_at_ms.div_euclid(bucket_size_ms)
+                != (consumed_end - 1).div_euclid(bucket_size_ms)
+                || consumed_end != sample.ended_at_ms;
+            let mut segment_start = sample.started_at_ms;
+            while segment_start < consumed_end {
+                let bucket_start = segment_start.div_euclid(bucket_size_ms) * bucket_size_ms;
+                let bucket_end = bucket_start.saturating_add(bucket_size_ms);
+                let segment_end = consumed_end.min(bucket_end);
+                let download_bytes = proportional_slice(
+                    i128::from(sample.download_bytes),
+                    sample.duration_ms,
+                    segment_start.saturating_sub(sample.started_at_ms),
+                    segment_end.saturating_sub(sample.started_at_ms),
+                )?;
+                let upload_bytes = proportional_slice(
+                    i128::from(sample.upload_bytes),
+                    sample.duration_ms,
+                    segment_start.saturating_sub(sample.started_at_ms),
+                    segment_end.saturating_sub(sample.started_at_ms),
+                )?;
+                let segment_duration = segment_end.saturating_sub(segment_start);
+                let (bucket, accumulated_end) = buckets
+                    .entry((sample.router_id, sample.interface_id, bucket_start))
+                    .or_insert_with(|| (TrafficBucketAccumulator::default(), segment_end));
+                *accumulated_end = (*accumulated_end).max(segment_end);
+                if sample.quality == "exact" && !split_sample {
+                    bucket.exact_download_bytes += download_bytes;
+                    bucket.exact_upload_bytes += upload_bytes;
+                    bucket.exact_duration_ms =
+                        bucket.exact_duration_ms.saturating_add(segment_duration);
+                } else {
+                    bucket.estimated_download_bytes += download_bytes;
+                    bucket.estimated_upload_bytes += upload_bytes;
+                    bucket.estimated_duration_ms = bucket
+                        .estimated_duration_ms
+                        .saturating_add(segment_duration);
+                }
+                bucket.sample_count = bucket.sample_count.saturating_add(1);
+                segment_start = segment_end;
+            }
+
+            if consumed_end == sample.ended_at_ms {
+                fully_consumed.push(sample.id);
+            } else {
+                let consumed_download = proportional_slice(
+                    i128::from(sample.download_bytes),
+                    sample.duration_ms,
+                    0,
+                    consumed_end.saturating_sub(sample.started_at_ms),
+                )?;
+                let consumed_upload = proportional_slice(
+                    i128::from(sample.upload_bytes),
+                    sample.duration_ms,
+                    0,
+                    consumed_end.saturating_sub(sample.started_at_ms),
+                )?;
+                remainders.push(RawTrafficRemainder {
+                    id: sample.id,
+                    started_at_ms: consumed_end,
+                    ended_at_ms: sample.ended_at_ms,
+                    download_bytes: i128::from(sample.download_bytes) - consumed_download,
+                    upload_bytes: i128::from(sample.upload_bytes) - consumed_upload,
+                });
+            }
+        }
+
+        for ((router_id, interface_id, bucket_start), (bucket, bucket_end)) in buckets {
+            let exact_download = i64::try_from(bucket.exact_download_bytes).map_err(|_| {
+                DatabaseError::Verification("rollup download byte total overflowed SQLite".into())
+            })?;
+            let exact_upload = i64::try_from(bucket.exact_upload_bytes).map_err(|_| {
+                DatabaseError::Verification("rollup upload byte total overflowed SQLite".into())
+            })?;
+            let estimated_download =
+                i64::try_from(bucket.estimated_download_bytes).map_err(|_| {
+                    DatabaseError::Verification(
+                        "estimated rollup download byte total overflowed SQLite".into(),
+                    )
+                })?;
+            let estimated_upload = i64::try_from(bucket.estimated_upload_bytes).map_err(|_| {
+                DatabaseError::Verification(
+                    "estimated rollup upload byte total overflowed SQLite".into(),
+                )
+            })?;
+            let covered_duration = bucket
+                .exact_duration_ms
+                .saturating_add(bucket.estimated_duration_ms);
+            if covered_duration <= 0 || covered_duration > bucket_size_ms {
+                return Err(DatabaseError::Verification(
+                    "rollup bucket contains invalid or overlapping sample coverage".into(),
+                ));
+            }
+            tx.execute(
+                "INSERT INTO traffic_rollups(
+                     router_id, interface_id, bucket_start_ms, bucket_end_ms, bucket_size_ms,
+                     exact_download_bytes, exact_upload_bytes,
+                     estimated_download_bytes, estimated_upload_bytes,
+                     exact_duration_ms, estimated_duration_ms, sample_count,
+                     download_avg_bps, upload_avg_bps, source, created_at_ms
+                 ) VALUES (
+                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                     (?6 + ?8) * 8000.0 / MAX(1, ?10 + ?11),
+                     (?7 + ?9) * 8000.0 / MAX(1, ?10 + ?11),
+                     'raw-rollup', ?13
+                 )
+                 ON CONFLICT(router_id, interface_id, bucket_size_ms, bucket_start_ms, source)
+                 DO UPDATE SET
+                     exact_download_bytes = traffic_rollups.exact_download_bytes + excluded.exact_download_bytes,
+                     exact_upload_bytes = traffic_rollups.exact_upload_bytes + excluded.exact_upload_bytes,
+                     estimated_download_bytes = traffic_rollups.estimated_download_bytes + excluded.estimated_download_bytes,
+                     estimated_upload_bytes = traffic_rollups.estimated_upload_bytes + excluded.estimated_upload_bytes,
+                     exact_duration_ms = traffic_rollups.exact_duration_ms + excluded.exact_duration_ms,
+                     estimated_duration_ms = traffic_rollups.estimated_duration_ms + excluded.estimated_duration_ms,
+                     sample_count = traffic_rollups.sample_count + excluded.sample_count,
+                     download_avg_bps =
+                         (traffic_rollups.exact_download_bytes + traffic_rollups.estimated_download_bytes +
+                          excluded.exact_download_bytes + excluded.estimated_download_bytes) * 8000.0 /
+                         MAX(1, traffic_rollups.exact_duration_ms + traffic_rollups.estimated_duration_ms +
+                                excluded.exact_duration_ms + excluded.estimated_duration_ms),
+                     upload_avg_bps =
+                         (traffic_rollups.exact_upload_bytes + traffic_rollups.estimated_upload_bytes +
+                          excluded.exact_upload_bytes + excluded.estimated_upload_bytes) * 8000.0 /
+                         MAX(1, traffic_rollups.exact_duration_ms + traffic_rollups.estimated_duration_ms +
+                                excluded.exact_duration_ms + excluded.estimated_duration_ms),
+                     bucket_end_ms = MAX(traffic_rollups.bucket_end_ms, excluded.bucket_end_ms),
+                     created_at_ms = excluded.created_at_ms",
+                params![
+                    router_id,
+                    interface_id,
+                    bucket_start,
+                    bucket_end,
+                    bucket_size_ms,
+                    exact_download,
+                    exact_upload,
+                    estimated_download,
+                    estimated_upload,
+                    bucket.exact_duration_ms,
+                    bucket.estimated_duration_ms,
+                    bucket.sample_count,
+                    before_ms,
+                ],
+            )?;
+        }
+
+        for remainder in remainders {
+            let duration_ms = remainder
+                .ended_at_ms
+                .saturating_sub(remainder.started_at_ms);
+            let download_bytes = i64::try_from(remainder.download_bytes).map_err(|_| {
+                DatabaseError::Verification("raw download remainder overflowed SQLite".into())
+            })?;
+            let upload_bytes = i64::try_from(remainder.upload_bytes).map_err(|_| {
+                DatabaseError::Verification("raw upload remainder overflowed SQLite".into())
+            })?;
+            let changed = tx.execute(
+                "UPDATE traffic_samples
+                 SET started_at_ms = ?1, duration_ms = ?2,
+                     download_bytes = ?3, upload_bytes = ?4,
+                     download_bps = ?3 * 8000.0 / ?2,
+                     upload_bps = ?4 * 8000.0 / ?2,
+                     quality = 'estimated'
+                 WHERE id = ?5",
+                params![
+                    remainder.started_at_ms,
+                    duration_ms,
+                    download_bytes,
+                    upload_bytes,
+                    remainder.id,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(DatabaseError::Verification(
+                    "raw traffic remainder disappeared during rollup".into(),
+                ));
+            }
+        }
+        for id in &fully_consumed {
+            if tx.execute("DELETE FROM traffic_samples WHERE id = ?1", params![id])? != 1 {
+                return Err(DatabaseError::Verification(
+                    "raw traffic sample disappeared during rollup".into(),
+                ));
+            }
+        }
+        tx.commit()?;
+        Ok(fully_consumed.len())
+    }
+
+    /// Delete v4 traffic history that is entirely older than the retention boundary.
+    /// Checkpoints remain intact so the next counter sample can continue atomically.
+    pub fn prune_exact_history(&self, before_ms: i64) -> DatabaseResult<usize> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let samples = tx.execute(
+            "DELETE FROM traffic_samples WHERE ended_at_ms <= ?1",
+            params![before_ms],
         )?;
-        let deleted = tx.execute(
-            "DELETE FROM traffic_samples WHERE ended_at_ms < ?1",
+        let rollups = tx.execute(
+            "DELETE FROM traffic_rollups WHERE bucket_end_ms <= ?1",
+            params![before_ms],
+        )?;
+        let gaps = tx.execute(
+            "DELETE FROM traffic_gaps WHERE ended_at_ms <= ?1",
             params![before_ms],
         )?;
         tx.commit()?;
-        Ok(deleted)
+        Ok(samples.saturating_add(rollups).saturating_add(gaps))
+    }
+
+    /// Find the router whose history should be exposed by the traffic API.
+    ///
+    /// The configured management target is authoritative once the poller has
+    /// resolved it. Before that happens, fall back deterministically to the
+    /// most recently observed router that already has traffic. This keeps a
+    /// v4-migrated legacy history visible without creating a router as a side
+    /// effect of a read request.
+    pub fn current_router_for_target(
+        &self,
+        fallback_target: &str,
+    ) -> DatabaseResult<Option<RouterRecord>> {
+        let fallback_target = fallback_target.trim();
+        if fallback_target.is_empty() {
+            return Err(DatabaseError::InvalidCommand(
+                "router fallback target must not be empty".into(),
+            ));
+        }
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        if let Some(router) = router_by_fallback_target(&conn, fallback_target)? {
+            return Ok(Some(router));
+        }
+
+        router_query(
+            &conn,
+            "SELECT id, internal_uuid, hardware_identity, fallback_target, identity_source,
+                    first_seen_at_ms, last_seen_at_ms
+             FROM routers AS router
+             WHERE EXISTS(
+                       SELECT 1 FROM traffic_samples AS sample
+                       WHERE sample.router_id = router.id
+                   )
+                OR EXISTS(
+                       SELECT 1 FROM traffic_rollups AS rollup
+                       WHERE rollup.router_id = router.id
+                   )
+             ORDER BY last_seen_at_ms DESC, id DESC
+             LIMIT 1",
+            params![],
+        )
+    }
+
+    /// Resolve exactly one interface for a traffic query.
+    ///
+    /// Omitting `wan_name` selects the synthetic aggregate interface. A WAN
+    /// name never falls through to aggregate data, preserving the one-query,
+    /// one-interface coverage invariant used by `query_traffic_v4`.
+    pub fn traffic_interface_for_query(
+        &self,
+        router_id: i64,
+        wan_name: Option<&str>,
+    ) -> DatabaseResult<Option<RouterInterfaceRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let interface = match wan_name {
+            Some(name) => conn
+                .query_row(
+                    "SELECT id, router_id, interface_key, name, kind, hardware_id,
+                            first_seen_at_ms, last_seen_at_ms
+                     FROM router_interfaces
+                     WHERE router_id = ?1 AND name = ?2 AND kind <> 'aggregate'
+                     ORDER BY last_seen_at_ms DESC, id DESC
+                     LIMIT 1",
+                    params![router_id, name],
+                    map_interface,
+                )
+                .optional()?,
+            None => conn
+                .query_row(
+                    "SELECT id, router_id, interface_key, name, kind, hardware_id,
+                            first_seen_at_ms, last_seen_at_ms
+                     FROM router_interfaces
+                     WHERE router_id = ?1 AND kind = 'aggregate'
+                     ORDER BY (interface_key = '__aggregate__') DESC,
+                              last_seen_at_ms DESC, id DESC
+                     LIMIT 1",
+                    params![router_id],
+                    map_interface,
+                )
+                .optional()?,
+        };
+        Ok(interface)
+    }
+
+    pub fn traffic_interface_by_key(
+        &self,
+        router_id: i64,
+        interface_key: &str,
+    ) -> DatabaseResult<Option<RouterInterfaceRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        Ok(conn
+            .query_row(
+                "SELECT id, router_id, interface_key, name, kind, hardware_id,
+                        first_seen_at_ms, last_seen_at_ms
+                 FROM router_interfaces
+                 WHERE router_id = ?1 AND interface_key = ?2",
+                params![router_id, interface_key],
+                map_interface,
+            )
+            .optional()?)
+    }
+
+    /// List queryable WAN interfaces for response metadata and selectors.
+    pub fn router_wan_interfaces(
+        &self,
+        router_id: i64,
+    ) -> DatabaseResult<Vec<RouterInterfaceRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let mut statement = conn.prepare(
+            "SELECT id, router_id, interface_key, name, kind, hardware_id,
+                    first_seen_at_ms, last_seen_at_ms
+             FROM router_interfaces
+             WHERE router_id = ?1 AND kind <> 'aggregate'
+             ORDER BY name COLLATE NOCASE, interface_key, id",
+        )?;
+        let rows = statement.query_map(params![router_id], map_interface)?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     pub fn query_traffic_v4(&self, query: &TrafficQuery) -> DatabaseResult<TrafficQueryResult> {
@@ -617,12 +992,28 @@ impl TrafficDb {
             .checked_div(query.max_points as i64)
             .unwrap_or(1)
             .max(1);
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| rusqlite::Error::InvalidQuery)?;
-        ensure_interface_owner(&conn, query.router_id, Some(query.interface_id))?;
-        let mut contributions = load_traffic_contributions(&conn, query)?;
+        let (mut contributions, gap_count) = {
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+            ensure_interface_owner(&conn, query.router_id, Some(query.interface_id))?;
+            let contributions = load_traffic_contributions(&conn, query)?;
+            let gap_count: u64 = conn.query_row(
+                "SELECT COUNT(*) FROM traffic_gaps
+                 WHERE router_id = ?1
+                   AND (interface_id IS NULL OR interface_id = ?2)
+                   AND ended_at_ms > ?3 AND started_at_ms < ?4",
+                params![
+                    query.router_id,
+                    query.interface_id,
+                    query.from_ms,
+                    query.to_ms
+                ],
+                |row| row.get(0),
+            )?;
+            (contributions, gap_count)
+        };
         contributions.sort_by_key(|item| (item.started_at_ms, item.ended_at_ms));
         validate_non_overlapping_contributions(&contributions)?;
         let source_resolution_ms = contributions
@@ -633,9 +1024,11 @@ impl TrafficDb {
         let bucket_size_ms = minimum_bucket_size_ms.max(source_resolution_ms);
 
         let mut buckets: BTreeMap<i64, TrafficBucketAccumulator> = BTreeMap::new();
+        let mut totals = TrafficBucketAccumulator::default();
         for contribution in &contributions {
             let clipped_start = contribution.started_at_ms.max(query.from_ms);
             let clipped_end = contribution.ended_at_ms.min(query.to_ms);
+            totals.add_segment(contribution, clipped_start, clipped_end)?;
             let mut segment_start = clipped_start;
             while segment_start < clipped_end {
                 let bucket_index = (segment_start - query.from_ms) / bucket_size_ms;
@@ -649,19 +1042,7 @@ impl TrafficDb {
         }
 
         let mut points = Vec::with_capacity(buckets.len());
-        let mut exact_download = 0_i128;
-        let mut exact_upload = 0_i128;
-        let mut estimated_download = 0_i128;
-        let mut estimated_upload = 0_i128;
-        let mut exact_duration = 0_i64;
-        let mut estimated_duration = 0_i64;
         for (started_at_ms, bucket) in buckets {
-            exact_download += bucket.exact_download_bytes;
-            exact_upload += bucket.exact_upload_bytes;
-            estimated_download += bucket.estimated_download_bytes;
-            estimated_upload += bucket.estimated_upload_bytes;
-            exact_duration = exact_duration.saturating_add(bucket.exact_duration_ms);
-            estimated_duration = estimated_duration.saturating_add(bucket.estimated_duration_ms);
             let duration = bucket
                 .exact_duration_ms
                 .saturating_add(bucket.estimated_duration_ms)
@@ -687,20 +1068,9 @@ impl TrafficDb {
                 sample_count: bucket.sample_count,
             });
         }
-        let gap_count: u64 = conn.query_row(
-            "SELECT COUNT(*) FROM traffic_gaps
-             WHERE router_id = ?1
-               AND (interface_id IS NULL OR interface_id = ?2)
-               AND ended_at_ms > ?3 AND started_at_ms < ?4",
-            params![
-                query.router_id,
-                query.interface_id,
-                query.from_ms,
-                query.to_ms
-            ],
-            |row| row.get(0),
-        )?;
-        let covered_duration = exact_duration.saturating_add(estimated_duration);
+        let covered_duration = totals
+            .exact_duration_ms
+            .saturating_add(totals.estimated_duration_ms);
         if covered_duration > range {
             return Err(DatabaseError::Verification(format!(
                 "traffic coverage {covered_duration}ms exceeds requested range {range}ms"
@@ -711,17 +1081,19 @@ impl TrafficDb {
             bucket_size_ms,
             points,
             totals: TrafficTotals {
-                download_bytes: (exact_download + estimated_download).to_string(),
-                upload_bytes: (exact_upload + estimated_upload).to_string(),
-                exact_download_bytes: exact_download.to_string(),
-                exact_upload_bytes: exact_upload.to_string(),
-                estimated_download_bytes: estimated_download.to_string(),
-                estimated_upload_bytes: estimated_upload.to_string(),
+                download_bytes: (totals.exact_download_bytes + totals.estimated_download_bytes)
+                    .to_string(),
+                upload_bytes: (totals.exact_upload_bytes + totals.estimated_upload_bytes)
+                    .to_string(),
+                exact_download_bytes: totals.exact_download_bytes.to_string(),
+                exact_upload_bytes: totals.exact_upload_bytes.to_string(),
+                estimated_download_bytes: totals.estimated_download_bytes.to_string(),
+                estimated_upload_bytes: totals.estimated_upload_bytes.to_string(),
             },
             coverage: TrafficCoverage {
                 requested_duration_ms: range,
-                exact_duration_ms: exact_duration,
-                estimated_duration_ms: estimated_duration,
+                exact_duration_ms: totals.exact_duration_ms,
+                estimated_duration_ms: totals.estimated_duration_ms,
                 covered_duration_ms: covered_duration,
                 completeness,
                 gap_count,
@@ -955,6 +1327,20 @@ fn validate_sample(sample: &TrafficSampleInput<'_>) -> DatabaseResult<()> {
     Ok(())
 }
 
+fn validate_raw_sample_for_rollup(sample: &RawTrafficSample) -> DatabaseResult<()> {
+    if sample.ended_at_ms <= sample.started_at_ms
+        || sample.duration_ms != sample.ended_at_ms.saturating_sub(sample.started_at_ms)
+        || sample.download_bytes < 0
+        || sample.upload_bytes < 0
+        || !matches!(sample.quality.as_str(), "exact" | "estimated")
+    {
+        return Err(DatabaseError::Verification(
+            "raw traffic sample is invalid during rollup".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_checkpoint(checkpoint: &CounterCheckpointInput<'_>) -> DatabaseResult<()> {
     let valid_counter =
         |value: &str| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit());
@@ -1058,6 +1444,114 @@ fn checkpoint_matches(current: &CounterCheckpoint, candidate: &CounterCheckpoint
         && current.tx_counter == candidate.tx_counter
         && current.observed_at_ms == candidate.observed_at_ms
         && current.reboot_marker.as_deref() == candidate.reboot_marker
+}
+
+fn adopt_legacy_history(
+    conn: &rusqlite::Connection,
+    target_router_id: i64,
+    observed_at_ms: i64,
+) -> DatabaseResult<()> {
+    let legacy_router_ids = {
+        let mut statement = conn.prepare(
+            "SELECT id FROM routers
+             WHERE fallback_target = 'legacy://unidentified' AND id <> ?1
+             ORDER BY id",
+        )?;
+        let rows = statement.query_map(params![target_router_id], |row| row.get::<_, i64>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
+    for legacy_router_id in legacy_router_ids {
+        let legacy_interfaces = {
+            let mut statement = conn.prepare(
+                "SELECT id, interface_key FROM router_interfaces
+                 WHERE router_id = ?1 ORDER BY id",
+            )?;
+            let rows = statement.query_map(params![legacy_router_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        for (legacy_interface_id, interface_key) in legacy_interfaces {
+            let target_interface_id = conn
+                .query_row(
+                    "SELECT id FROM router_interfaces
+                     WHERE router_id = ?1 AND interface_key = ?2",
+                    params![target_router_id, interface_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+
+            if let Some(target_interface_id) = target_interface_id {
+                for table in ["traffic_samples", "traffic_rollups", "traffic_gaps"] {
+                    conn.execute(
+                        &format!(
+                            "UPDATE {table} SET router_id = ?1, interface_id = ?2
+                             WHERE router_id = ?3 AND interface_id = ?4"
+                        ),
+                        params![
+                            target_router_id,
+                            target_interface_id,
+                            legacy_router_id,
+                            legacy_interface_id
+                        ],
+                    )?;
+                }
+                conn.execute(
+                    "DELETE FROM counter_checkpoints
+                     WHERE router_id = ?1 AND interface_id = ?2",
+                    params![legacy_router_id, legacy_interface_id],
+                )?;
+                conn.execute(
+                    "DELETE FROM router_interfaces WHERE id = ?1",
+                    params![legacy_interface_id],
+                )?;
+            } else {
+                conn.execute(
+                    "UPDATE router_interfaces
+                     SET router_id = ?1, last_seen_at_ms = MAX(last_seen_at_ms, ?2)
+                     WHERE id = ?3",
+                    params![target_router_id, observed_at_ms, legacy_interface_id],
+                )?;
+                for table in [
+                    "traffic_samples",
+                    "traffic_rollups",
+                    "traffic_gaps",
+                    "counter_checkpoints",
+                ] {
+                    conn.execute(
+                        &format!(
+                            "UPDATE {table} SET router_id = ?1
+                             WHERE router_id = ?2 AND interface_id = ?3"
+                        ),
+                        params![target_router_id, legacy_router_id, legacy_interface_id],
+                    )?;
+                }
+            }
+        }
+
+        conn.execute(
+            "UPDATE traffic_gaps SET router_id = ?1
+             WHERE router_id = ?2 AND interface_id IS NULL",
+            params![target_router_id, legacy_router_id],
+        )?;
+        conn.execute(
+            "UPDATE routers
+             SET first_seen_at_ms = MIN(
+                     first_seen_at_ms,
+                     COALESCE((SELECT first_seen_at_ms FROM routers WHERE id = ?2), first_seen_at_ms)
+                 ),
+                 last_seen_at_ms = MAX(last_seen_at_ms, ?3)
+             WHERE id = ?1",
+            params![target_router_id, legacy_router_id, observed_at_ms],
+        )?;
+        conn.execute(
+            "DELETE FROM routers WHERE id = ?1",
+            params![legacy_router_id],
+        )?;
+    }
+    Ok(())
 }
 
 fn insert_router(
@@ -1169,20 +1663,22 @@ fn interface_by_key(
                     first_seen_at_ms, last_seen_at_ms
              FROM router_interfaces WHERE router_id = ?1 AND interface_key = ?2",
             params![router_id, interface_key],
-            |row| {
-                Ok(RouterInterfaceRecord {
-                    id: row.get(0)?,
-                    router_id: row.get(1)?,
-                    interface_key: row.get(2)?,
-                    name: row.get(3)?,
-                    kind: row.get(4)?,
-                    hardware_id: row.get(5)?,
-                    first_seen_at_ms: row.get(6)?,
-                    last_seen_at_ms: row.get(7)?,
-                })
-            },
+            map_interface,
         )
         .optional()?)
+}
+
+fn map_interface(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouterInterfaceRecord> {
+    Ok(RouterInterfaceRecord {
+        id: row.get(0)?,
+        router_id: row.get(1)?,
+        interface_key: row.get(2)?,
+        name: row.get(3)?,
+        kind: row.get(4)?,
+        hardware_id: row.get(5)?,
+        first_seen_at_ms: row.get(6)?,
+        last_seen_at_ms: row.get(7)?,
+    })
 }
 
 #[cfg(test)]
@@ -1281,6 +1777,68 @@ mod tests {
     }
 
     #[test]
+    fn rollup_splits_cutoff_and_bucket_boundaries_without_overlap_or_byte_loss() {
+        let db = database();
+        let router = db.resolve_router(None, "192.0.2.1", 1_000).unwrap();
+        let interface = db
+            .upsert_router_interface(router.id, "ether1", "WAN", "wan", None, 1_000)
+            .unwrap();
+        let sample = TrafficSampleInput {
+            router_id: router.id,
+            interface_id: interface.id,
+            started_at_ms: 50_000,
+            ended_at_ms: 70_000,
+            duration_ms: 20_000,
+            download_bytes: 1_001,
+            upload_bytes: 501,
+            download_bps: 400.4,
+            upload_bps: 200.4,
+            quality: TrafficQuality::Exact,
+            source: "fixture",
+        };
+        let checkpoint = CounterCheckpointInput {
+            router_id: router.id,
+            interface_id: interface.id,
+            rx_counter: "1001",
+            tx_counter: "501",
+            observed_at_ms: 70_000,
+            reboot_marker: Some("boot-a"),
+        };
+        assert!(db
+            .commit_sample_and_checkpoint(&sample, &checkpoint)
+            .unwrap());
+
+        assert_eq!(db.rollup_exact_samples(63_000, 60_000).unwrap(), 0);
+        let partially_rolled = db
+            .query_traffic_v4(&TrafficQuery {
+                router_id: router.id,
+                interface_id: interface.id,
+                from_ms: 0,
+                to_ms: 70_000,
+                max_points: 100,
+            })
+            .unwrap();
+        assert_eq!(partially_rolled.totals.download_bytes, "1001");
+        assert_eq!(partially_rolled.totals.upload_bytes, "501");
+        assert_eq!(partially_rolled.coverage.covered_duration_ms, 20_000);
+        assert_eq!(partially_rolled.totals.exact_download_bytes, "0");
+
+        assert_eq!(db.rollup_exact_samples(80_000, 60_000).unwrap(), 1);
+        let fully_rolled = db
+            .query_traffic_v4(&TrafficQuery {
+                router_id: router.id,
+                interface_id: interface.id,
+                from_ms: 0,
+                to_ms: 80_000,
+                max_points: 100,
+            })
+            .unwrap();
+        assert_eq!(fully_rolled.totals.download_bytes, "1001");
+        assert_eq!(fully_rolled.totals.upload_bytes, "501");
+        assert_eq!(fully_rolled.coverage.covered_duration_ms, 20_000);
+    }
+
+    #[test]
     fn transiently_missing_hardware_identity_reuses_router_history() {
         let db = database();
         let identified = db
@@ -1324,6 +1882,57 @@ mod tests {
         assert_eq!(result.coverage.exact_duration_ms, 0);
         assert_eq!(result.coverage.estimated_duration_ms, 2_000);
         assert_eq!(result.coverage.completeness, 1.0);
+    }
+
+    #[test]
+    fn downsampling_does_not_change_exact_totals_or_coverage() {
+        let db = database();
+        let router = db.resolve_router(None, "192.0.2.1", 1_000).unwrap();
+        let interface = db
+            .upsert_router_interface(router.id, "ether1", "WAN", "wan", None, 1_000)
+            .unwrap();
+        let sample = TrafficSampleInput {
+            router_id: router.id,
+            interface_id: interface.id,
+            started_at_ms: 5_000,
+            ended_at_ms: 15_000,
+            duration_ms: 10_000,
+            download_bytes: 2_000,
+            upload_bytes: 1_000,
+            download_bps: 1_600.0,
+            upload_bps: 800.0,
+            quality: TrafficQuality::Exact,
+            source: "fixture",
+        };
+        let checkpoint = CounterCheckpointInput {
+            router_id: router.id,
+            interface_id: interface.id,
+            rx_counter: "2000",
+            tx_counter: "1000",
+            observed_at_ms: 15_000,
+            reboot_marker: Some("boot-a"),
+        };
+        db.commit_sample_and_checkpoint(&sample, &checkpoint)
+            .unwrap();
+
+        let query = |max_points| {
+            db.query_traffic_v4(&TrafficQuery {
+                router_id: router.id,
+                interface_id: interface.id,
+                from_ms: 0,
+                to_ms: 20_000,
+                max_points,
+            })
+            .unwrap()
+        };
+        let one_bucket = query(1);
+        let split_buckets = query(2);
+        assert_eq!(one_bucket.totals.exact_download_bytes, "2000");
+        assert_eq!(split_buckets.totals.exact_download_bytes, "2000");
+        assert_eq!(one_bucket.totals.estimated_download_bytes, "0");
+        assert_eq!(split_buckets.totals.estimated_download_bytes, "0");
+        assert_eq!(one_bucket.coverage.exact_duration_ms, 10_000);
+        assert_eq!(split_buckets.coverage.exact_duration_ms, 10_000);
     }
 
     #[test]
@@ -1473,5 +2082,103 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM traffic_samples", [], |row| row.get(0))
             .unwrap();
         assert_eq!(raw_count, 1);
+    }
+
+    #[test]
+    fn traffic_router_selection_prefers_configured_target_and_falls_back_to_history() {
+        let db = database();
+        let legacy = db
+            .resolve_router(None, "legacy://unidentified", 2_000)
+            .unwrap();
+        let legacy_aggregate = db
+            .upsert_router_interface(
+                legacy.id,
+                "__aggregate__",
+                "Aggregate",
+                "aggregate",
+                None,
+                2_000,
+            )
+            .unwrap();
+        insert_sample(
+            &db,
+            legacy.id,
+            legacy_aggregate.id,
+            10_000,
+            TrafficQuality::Estimated,
+        );
+
+        let fallback = db.current_router_for_target("192.0.2.1").unwrap().unwrap();
+        assert_eq!(fallback.id, legacy.id);
+
+        let configured = db.resolve_router(None, "192.0.2.1", 1_000).unwrap();
+        let selected = db.current_router_for_target("192.0.2.1").unwrap().unwrap();
+        assert_eq!(selected.id, configured.id);
+        let adopted_aggregate = db
+            .traffic_interface_for_query(configured.id, None)
+            .unwrap()
+            .unwrap();
+        let adopted_history = db
+            .query_traffic_v4(&TrafficQuery {
+                router_id: configured.id,
+                interface_id: adopted_aggregate.id,
+                from_ms: 10_000,
+                to_ms: 15_000,
+                max_points: 10,
+            })
+            .unwrap();
+        assert_eq!(adopted_history.totals.estimated_download_bytes, "1000");
+        assert_eq!(adopted_history.coverage.estimated_duration_ms, 5_000);
+    }
+
+    #[test]
+    fn traffic_interface_selection_never_conflates_wan_and_aggregate() {
+        let db = database();
+        let router = db.resolve_router(None, "192.0.2.1", 1_000).unwrap();
+        let aggregate = db
+            .upsert_router_interface(
+                router.id,
+                "__aggregate__",
+                "Aggregate",
+                "aggregate",
+                None,
+                1_000,
+            )
+            .unwrap();
+        let stale_wan = db
+            .upsert_router_interface(router.id, "*1", "WAN", "wan", None, 1_000)
+            .unwrap();
+        let current_wan = db
+            .upsert_router_interface(router.id, "*2", "WAN", "wan", None, 2_000)
+            .unwrap();
+        db.upsert_router_interface(router.id, "*3", "Backup", "wan", None, 2_000)
+            .unwrap();
+
+        assert_eq!(
+            db.traffic_interface_for_query(router.id, None)
+                .unwrap()
+                .unwrap()
+                .id,
+            aggregate.id
+        );
+        let selected_wan = db
+            .traffic_interface_for_query(router.id, Some("WAN"))
+            .unwrap()
+            .unwrap();
+        assert_ne!(selected_wan.id, stale_wan.id);
+        assert_eq!(selected_wan.id, current_wan.id);
+        assert!(db
+            .traffic_interface_for_query(router.id, Some("Aggregate"))
+            .unwrap()
+            .is_none());
+
+        let interfaces = db.router_wan_interfaces(router.id).unwrap();
+        assert_eq!(
+            interfaces
+                .iter()
+                .map(|interface| interface.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Backup", "WAN", "WAN"]
+        );
     }
 }

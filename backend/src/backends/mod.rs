@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 
 use crate::error::AppError;
 
@@ -28,6 +29,7 @@ pub enum RouterType {
 /// the corresponding data type (graceful degradation at the transform layer).
 #[derive(Debug, Clone)]
 pub struct RouterData {
+    pub counter_sample_time: CounterSampleTime,
     // ── System ────────────────────────────────────
     pub system: SystemData,
     pub identity: IdentityData,
@@ -61,12 +63,21 @@ pub struct RouterData {
     pub ipv6_connection_count: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct CounterSampleTime {
+    pub monotonic: Instant,
+    pub unix_ms: i64,
+}
+
 // ── Sub-structs ────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct SystemData {
+    /// Stable hardware identity when the backend exposes one (for example,
+    /// RouterBOARD's serial number). Virtual routers may not have one.
+    pub hardware_identity: Option<String>,
     pub uptime: String,
-    pub uptime_seconds: u64,
+    pub uptime_seconds: Option<u64>,
     pub cpu_load: f64,
     pub free_memory: u64,
     pub total_memory: u64,
@@ -122,8 +133,8 @@ pub struct InterfaceEntry {
     pub mac_address: String,
     pub running: bool,
     pub disabled: bool,
-    pub rx_byte: u64,
-    pub tx_byte: u64,
+    pub rx_byte: Option<u64>,
+    pub tx_byte: Option<u64>,
     pub rx_packet: u64,
     pub tx_packet: u64,
     pub rx_drop: u64,
