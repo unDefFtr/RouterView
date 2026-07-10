@@ -104,9 +104,5 @@ ENV ROUTERVIEW_DOMAIN=routerview.local
 USER ${APP_UID}:${APP_GID}
 EXPOSE 80 443
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD wget --no-check-certificate --quiet --spider \
-        --header="Host: ${ROUTERVIEW_DOMAIN}" https://127.0.0.1/api/health
-
 ENTRYPOINT ["caddy"]
 CMD ["run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]

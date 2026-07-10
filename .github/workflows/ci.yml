@@ -94,6 +94,11 @@ jobs:
         run: docker compose --env-file .env.compose.example config --quiet
       - name: Build Caddy runtime image
         run: docker build --target caddy-runtime --tag routerview-caddy:ci .
+      - name: Verify Caddy image delegates health to Compose
+        run: >-
+          docker image inspect routerview-caddy:ci
+          --format '{{json .Config.Healthcheck}}'
+          | grep --fixed-strings --line-regexp 'null'
       - name: Validate hardened Caddy runtime
         run: >-
           docker run --rm
