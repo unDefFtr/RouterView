@@ -459,39 +459,6 @@ impl TrafficDb {
         Ok(inserted == 1)
     }
 
-    pub fn record_traffic_gap(&self, gap: &TrafficGapInput<'_>) -> DatabaseResult<bool> {
-        validate_gap(gap)?;
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| rusqlite::Error::InvalidQuery)?;
-        ensure_interface_owner(&conn, gap.router_id, gap.interface_id)?;
-        let inserted = conn.execute(
-            "INSERT INTO traffic_gaps(
-                 router_id, interface_id, started_at_ms, ended_at_ms,
-                 reason, details, created_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?4)
-             ON CONFLICT(router_id, interface_id, started_at_ms, ended_at_ms, reason)
-             DO NOTHING",
-            params![
-                gap.router_id,
-                gap.interface_id,
-                gap.started_at_ms,
-                gap.ended_at_ms,
-                gap.reason,
-                gap.details,
-            ],
-        )?;
-        if inserted == 0
-            && gap_details_for_connection(&conn, gap)?.as_deref() != Some(gap.details.unwrap_or(""))
-        {
-            return Err(DatabaseError::Verification(
-                "duplicate traffic gap key contains different details".into(),
-            ));
-        }
-        Ok(inserted == 1)
-    }
-
     pub fn commit_gap_and_checkpoint(
         &self,
         gap: &TrafficGapInput<'_>,

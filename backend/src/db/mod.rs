@@ -1,8 +1,7 @@
-use chrono::{Datelike, Timelike};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tracing::{info, warn};
 
@@ -32,16 +31,6 @@ pub use types::{
     BackupArtifact, DatabaseError, DatabaseReport, MigrationReport, RestoreReport,
     CURRENT_SCHEMA_VERSION,
 };
-
-/// Traffic data point as returned by queries (from either raw or aggregated table).
-#[derive(Debug, Clone)]
-pub struct TrafficRecord {
-    pub timestamp_ms: i64, // unix milliseconds
-    pub download_bps: f64,
-    pub upload_bps: f64,
-    /// WAN interface name (empty string = aggregate)
-    pub wan_name: String,
-}
 
 /// A user-assigned device override stored in SQLite.
 #[derive(Debug, Clone)]
@@ -107,7 +96,8 @@ pub struct TrafficDb {
 
 impl TrafficDb {
     /// Open (or create) the SQLite database at the given path.
-    pub fn open(path: &PathBuf) -> Result<Self, DatabaseError> {
+    #[cfg(test)]
+    pub fn open(path: &Path) -> Result<Self, DatabaseError> {
         let (conn, lock, migration) = maintenance::open_runtime(path)?;
 
         // Seed default probe targets (idempotent — skips if any exist)
@@ -115,29 +105,30 @@ impl TrafficDb {
 
         if let Some(backup) = &migration.backup {
             info!(
-                "Migrated traffic DB from v{} to v{}; verified backup: {} ({})",
+                "Migrated traffic DB from v{} to v{}; verified backup: {} ({}, {} rows)",
                 migration.from_version,
                 migration.to_version,
                 backup.path.display(),
-                backup.sha256
+                backup.sha256,
+                backup.table_counts.values().sum::<u64>()
             );
         }
         info!("Traffic DB opened at {}", path.display());
         Ok(Self {
             conn: Mutex::new(conn),
             _lock: lock,
-            path: path.clone(),
+            path: path.to_path_buf(),
         })
     }
 
     /// Open only the configuration and security schema. The caller must load
     /// encrypted secrets and then call `finish_migrations` before serving.
-    pub fn open_for_bootstrap(path: &PathBuf) -> Result<Self, DatabaseError> {
+    pub fn open_for_bootstrap(path: &Path) -> Result<Self, DatabaseError> {
         let (conn, lock) = maintenance::open_bootstrap_runtime(path)?;
         Ok(Self {
             conn: Mutex::new(conn),
             _lock: lock,
-            path: path.clone(),
+            path: path.to_path_buf(),
         })
     }
 
@@ -150,420 +141,15 @@ impl TrafficDb {
         seed_default_probe_targets_inner(&conn);
         if let Some(backup) = &migration.backup {
             info!(
-                "Migrated traffic DB from v{} to v{}; verified backup: {} ({})",
+                "Migrated traffic DB from v{} to v{}; verified backup: {} ({}, {} rows)",
                 migration.from_version,
                 migration.to_version,
                 backup.path.display(),
-                backup.sha256
+                backup.sha256,
+                backup.table_counts.values().sum::<u64>()
             );
         }
         Ok(migration)
-    }
-
-    /// Insert a single raw traffic point (idempotent on composite PK).
-    /// Pass `""` for aggregate traffic, or the WAN interface name.
-    pub fn insert(&self, ts_ms: i64, download_bps: f64, upload_bps: f64, wan_name: &str) {
-        let conn = match self.conn.lock() {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("TrafficDB lock poisoned: {e}");
-                return;
-            }
-        };
-        if let Err(e) = conn.execute(
-            "INSERT OR IGNORE INTO traffic_points (ts, download_bps, upload_bps, wan_name) VALUES (?1, ?2, ?3, ?4)",
-            params![ts_ms, download_bps, upload_bps, wan_name],
-        ) {
-            warn!("TrafficDB insert failed: {e}");
-        }
-    }
-
-    /// Query traffic records between `from_ms` (inclusive) and `to_ms` (exclusive).
-    ///
-    /// Merges raw `traffic_points` (recent) and `traffic_1m` (older history).
-    /// Returns records ordered by timestamp ascending. Caps at 14400 rows.
-    pub fn query(&self, from_ms: i64, to_ms: i64) -> Vec<TrafficRecord> {
-        let conn = match self.conn.lock() {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("TrafficDB lock poisoned: {e}");
-                return vec![];
-            }
-        };
-
-        let now_ms = current_time_ms();
-        let raw_cutoff = now_ms - 7 * 86400 * 1000;
-
-        let mut records: Vec<TrafficRecord> = Vec::new();
-
-        // Query raw points (aggregate only: wan_name = '')
-        {
-            let mut stmt = match conn.prepare(
-                "SELECT ts, download_bps, upload_bps, wan_name
-                 FROM traffic_points
-                 WHERE ts >= ?1 AND ts < ?2 AND wan_name = ''
-                 ORDER BY ts ASC
-                 LIMIT 14400",
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("TrafficDB prepare raw query failed: {e}");
-                    return vec![];
-                }
-            };
-
-            let raw_rows: Vec<TrafficRecord> = stmt
-                .query_map(params![from_ms, to_ms], |row| {
-                    Ok(TrafficRecord {
-                        timestamp_ms: row.get(0)?,
-                        download_bps: row.get(1)?,
-                        upload_bps: row.get(2)?,
-                        wan_name: row.get(3)?,
-                    })
-                })
-                .ok()
-                .into_iter()
-                .flat_map(|r| r.filter_map(|x| x.ok()))
-                .collect();
-
-            records.extend(raw_rows);
-        }
-
-        // Query 1-minute aggregated points for older range
-        let agg_to = to_ms.min(raw_cutoff);
-        if from_ms < agg_to {
-            let mut stmt = match conn.prepare(
-                "SELECT bucket, download_avg, upload_avg, wan_name
-                 FROM traffic_1m
-                 WHERE bucket >= ?1 AND bucket < ?2 AND wan_name = ''
-                 ORDER BY bucket ASC
-                 LIMIT 14400",
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("TrafficDB prepare 1m query failed: {e}");
-                    return records;
-                }
-            };
-
-            let agg_rows: Vec<TrafficRecord> = stmt
-                .query_map(params![from_ms, agg_to], |row| {
-                    Ok(TrafficRecord {
-                        timestamp_ms: row.get(0)?,
-                        download_bps: row.get(1)?,
-                        upload_bps: row.get(2)?,
-                        wan_name: row.get(3)?,
-                    })
-                })
-                .ok()
-                .into_iter()
-                .flat_map(|r| r.filter_map(|x| x.ok()))
-                .collect();
-
-            records.extend(agg_rows);
-        }
-
-        records.sort_by_key(|r| r.timestamp_ms);
-        records.dedup_by_key(|r| r.timestamp_ms);
-        if records.len() > 14400 {
-            records.truncate(14400);
-        }
-
-        records
-    }
-
-    /// Query traffic records for a specific WAN interface.
-    ///
-    /// Same merge logic as `query()` but filtered to a single wan_name.
-    pub fn query_by_wan(&self, from_ms: i64, to_ms: i64, wan_name: &str) -> Vec<TrafficRecord> {
-        let conn = match self.conn.lock() {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("TrafficDB lock poisoned: {e}");
-                return vec![];
-            }
-        };
-
-        let now_ms = current_time_ms();
-        let raw_cutoff = now_ms - 7 * 86400 * 1000;
-
-        let mut records: Vec<TrafficRecord> = Vec::new();
-
-        // Query raw points for this WAN
-        {
-            let mut stmt = match conn.prepare(
-                "SELECT ts, download_bps, upload_bps, wan_name
-                 FROM traffic_points
-                 WHERE ts >= ?1 AND ts < ?2 AND wan_name = ?3
-                 ORDER BY ts ASC
-                 LIMIT 14400",
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("TrafficDB prepare query_by_wan raw failed: {e}");
-                    return vec![];
-                }
-            };
-
-            let raw_rows: Vec<TrafficRecord> = stmt
-                .query_map(params![from_ms, to_ms, wan_name], |row| {
-                    Ok(TrafficRecord {
-                        timestamp_ms: row.get(0)?,
-                        download_bps: row.get(1)?,
-                        upload_bps: row.get(2)?,
-                        wan_name: row.get(3)?,
-                    })
-                })
-                .ok()
-                .into_iter()
-                .flat_map(|r| r.filter_map(|x| x.ok()))
-                .collect();
-
-            records.extend(raw_rows);
-        }
-
-        // Query 1-minute aggregated points for this WAN
-        let agg_to = to_ms.min(raw_cutoff);
-        if from_ms < agg_to {
-            let mut stmt = match conn.prepare(
-                "SELECT bucket, download_avg, upload_avg, wan_name
-                 FROM traffic_1m
-                 WHERE bucket >= ?1 AND bucket < ?2 AND wan_name = ?3
-                 ORDER BY bucket ASC
-                 LIMIT 14400",
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("TrafficDB prepare query_by_wan 1m failed: {e}");
-                    return records;
-                }
-            };
-
-            let agg_rows: Vec<TrafficRecord> = stmt
-                .query_map(params![from_ms, agg_to, wan_name], |row| {
-                    Ok(TrafficRecord {
-                        timestamp_ms: row.get(0)?,
-                        download_bps: row.get(1)?,
-                        upload_bps: row.get(2)?,
-                        wan_name: row.get(3)?,
-                    })
-                })
-                .ok()
-                .into_iter()
-                .flat_map(|r| r.filter_map(|x| x.ok()))
-                .collect();
-
-            records.extend(agg_rows);
-        }
-
-        records.sort_by_key(|r| r.timestamp_ms);
-        records.dedup_by_key(|r| r.timestamp_ms);
-        if records.len() > 14400 {
-            records.truncate(14400);
-        }
-
-        records
-    }
-
-    /// Aggregate raw data older than `raw_days` into 1-minute AVG buckets,
-    /// then delete raw + old aggregated data beyond `total_days`.
-    pub fn aggregate_and_prune(&self, raw_days: i64, total_days: i64) {
-        let now_ms = current_time_ms();
-        let raw_cutoff = now_ms - raw_days * 86400 * 1000;
-        let total_cutoff = now_ms - total_days * 86400 * 1000;
-
-        let conn = match self.conn.lock() {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("TrafficDB lock poisoned during aggregate: {e}");
-                return;
-            }
-        };
-
-        // Aggregate raw points older than raw_cutoff into 1-minute buckets
-        let raw_rows: Vec<(i64, f64, f64, String)> = {
-            let mut stmt = match conn.prepare(
-                "SELECT ts, download_bps, upload_bps, wan_name
-                 FROM traffic_points
-                 WHERE ts < ?1
-                 ORDER BY ts ASC",
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("TrafficDB aggregate select failed: {e}");
-                    return;
-                }
-            };
-
-            stmt.query_map(params![raw_cutoff], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, f64>(1)?,
-                    row.get::<_, f64>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })
-            .ok()
-            .into_iter()
-            .flat_map(|r| r.filter_map(|x| x.ok()))
-            .collect()
-        };
-
-        // Build 1-minute buckets keyed by (bucket, wan_name)
-        let mut bucket_sums: Vec<(i64, String, f64, f64, i64)> = Vec::new();
-        for (ts, dl, ul, wan_name) in &raw_rows {
-            let bucket = ts / 60000 * 60000;
-            if let Some(last) = bucket_sums.last_mut() {
-                if last.0 == bucket && last.1 == *wan_name {
-                    last.2 += dl;
-                    last.3 += ul;
-                    last.4 += 1;
-                    continue;
-                }
-            }
-            bucket_sums.push((bucket, wan_name.clone(), *dl, *ul, 1));
-        }
-
-        if !bucket_sums.is_empty() {
-            let mut insert_stmt = match conn.prepare(
-                "INSERT OR REPLACE INTO traffic_1m (bucket, download_avg, upload_avg, wan_name)
-                 VALUES (?1, ?2, ?3, ?4)",
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("TrafficDB aggregate insert prepare failed: {e}");
-                    return;
-                }
-            };
-
-            for (bucket, wan_name, dl_sum, ul_sum, count) in &bucket_sums {
-                let c = *count as f64;
-                if let Err(e) =
-                    insert_stmt.execute(params![bucket, dl_sum / c, ul_sum / c, wan_name.as_str()])
-                {
-                    warn!("TrafficDB aggregate insert failed: {e}");
-                }
-            }
-
-            let total_points: i64 = bucket_sums.iter().map(|(_, _, _, _, c)| c).sum();
-            info!(
-                "TrafficDB aggregated {} buckets ({} raw points)",
-                bucket_sums.len(),
-                total_points,
-            );
-        }
-
-        // Delete old raw points
-        match conn.execute(
-            "DELETE FROM traffic_points WHERE ts < ?1",
-            params![raw_cutoff],
-        ) {
-            Ok(deleted) => {
-                if deleted > 0 {
-                    info!(
-                        "TrafficDB deleted {} raw points older than {} ms",
-                        deleted, raw_cutoff
-                    );
-                }
-            }
-            Err(e) => warn!("TrafficDB delete raw failed: {e}"),
-        }
-
-        // Delete old 1-minute buckets
-        match conn.execute(
-            "DELETE FROM traffic_1m WHERE bucket < ?1",
-            params![total_cutoff],
-        ) {
-            Ok(deleted) => {
-                if deleted > 0 {
-                    info!(
-                        "TrafficDB deleted {} aggregated buckets older than {} ms",
-                        deleted, total_cutoff
-                    );
-                }
-            }
-            Err(e) => warn!("TrafficDB delete 1m failed: {e}"),
-        }
-    }
-
-    // ── Monthly usage ────────────────────────────────────────────
-
-    /// Calendar-month data usage (download + upload) in GB — actual measured
-    /// bytes, not an extrapolation.
-    ///
-    /// Raw samples (`traffic_points`) are taken every `poll_interval_secs`
-    /// seconds; each contributes `bps × interval / 8` bytes.
-    /// Aggregated buckets (`traffic_1m`) each cover 60 seconds; each
-    /// contributes `avg_bps × 60 / 8` bytes.
-    ///
-    /// Only aggregate traffic (`wan_name = ''`) is counted.
-    /// Returns `(dl_gb, ul_gb)`.
-    pub fn monthly_usage_gb(&self, poll_interval_secs: f64) -> (f64, f64) {
-        let conn = match self.conn.lock() {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("TrafficDB lock poisoned during monthly_usage: {e}");
-                return (0.0, 0.0);
-            }
-        };
-
-        let now = chrono::Utc::now();
-        let month_start = match now
-            .with_day(1)
-            .and_then(|d| d.with_hour(0))
-            .and_then(|d| d.with_minute(0))
-            .and_then(|d| d.with_second(0))
-            .and_then(|d| d.with_nanosecond(0))
-        {
-            Some(dt) => dt,
-            None => return (0.0, 0.0),
-        };
-
-        let now_ms = now.timestamp_millis();
-        let month_start_ms = month_start.timestamp_millis();
-        if month_start_ms >= now_ms {
-            return (0.0, 0.0);
-        }
-
-        let raw_cutoff = now_ms - 7 * 86400 * 1000;
-
-        // ── Raw samples: sum(bps) × interval → bits, then convert to GB ──
-        let raw_start = month_start_ms.max(raw_cutoff);
-        let (raw_dl_sum, raw_ul_sum): (f64, f64) = conn
-            .query_row(
-                "SELECT COALESCE(SUM(download_bps), 0.0), COALESCE(SUM(upload_bps), 0.0)
-                 FROM traffic_points
-                 WHERE ts >= ?1 AND ts < ?2 AND wan_name = ''",
-                rusqlite::params![raw_start, now_ms],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap_or((0.0, 0.0));
-
-        let raw_dl_gb = raw_dl_sum * poll_interval_secs / 8.0 / 1_000_000_000.0;
-        let raw_ul_gb = raw_ul_sum * poll_interval_secs / 8.0 / 1_000_000_000.0;
-
-        // ── Aggregated 1m buckets: sum(avg_bps) × 60s → bits → GB ──
-        let (agg_dl_gb, agg_ul_gb) = if month_start_ms < raw_cutoff {
-            let agg_end = raw_cutoff.min(now_ms);
-            let (agg_dl, agg_ul): (f64, f64) = conn
-                .query_row(
-                    "SELECT COALESCE(SUM(download_avg), 0.0), COALESCE(SUM(upload_avg), 0.0)
-                     FROM traffic_1m
-                     WHERE bucket >= ?1 AND bucket < ?2 AND wan_name = ''",
-                    rusqlite::params![month_start_ms, agg_end],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .unwrap_or((0.0, 0.0));
-
-            (
-                agg_dl * 60.0 / 8.0 / 1_000_000_000.0,
-                agg_ul * 60.0 / 8.0 / 1_000_000_000.0,
-            )
-        } else {
-            (0.0, 0.0)
-        };
-
-        (raw_dl_gb + agg_dl_gb, raw_ul_gb + agg_ul_gb)
     }
 
     // ── Device Overrides ─────────────────────────────────────────
@@ -738,6 +324,7 @@ impl TrafficDb {
     // ── Config Store ────────────────────────────────────────────
 
     /// Set a config key/value (INSERT OR REPLACE).
+    #[cfg(test)]
     pub fn set_config(&self, key: &str, value: &str) -> Result<(), rusqlite::Error> {
         let conn = self
             .conn
@@ -1028,6 +615,7 @@ impl TrafficDb {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub fn insert_session(&self, session: &AuthSessionRecord) -> Result<(), rusqlite::Error> {
         let conn = self
             .conn
@@ -1437,14 +1025,6 @@ fn seed_default_probe_targets_inner(conn: &rusqlite::Connection) {
         }
     }
     info!("Seeded {} default probe targets", defaults.len());
-}
-
-/// Get current unix time in milliseconds.
-fn current_time_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

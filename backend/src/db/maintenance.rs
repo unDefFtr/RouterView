@@ -34,6 +34,7 @@ impl DatabaseLock {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .mode(0o600)
             .open(&path)?;
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
@@ -61,6 +62,7 @@ impl Drop for DatabaseLock {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn open_runtime(
     path: &Path,
 ) -> DatabaseResult<(Connection, Option<DatabaseLock>, MigrationReport)> {
@@ -862,7 +864,7 @@ fn ensure_available_space(path: &Path, required_bytes: u64) -> DatabaseResult<()
         return Err(DatabaseError::Io(std::io::Error::last_os_error()));
     }
     let stats = unsafe { stats.assume_init() };
-    let available_bytes = (stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64);
+    let available_bytes = (stats.f_bavail as u64).saturating_mul(stats.f_frsize);
     if available_bytes < required_bytes {
         return Err(DatabaseError::InsufficientSpace {
             path: path.to_path_buf(),

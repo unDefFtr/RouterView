@@ -1205,50 +1205,29 @@ mod tests {
             id: format!("*{name}"),
             name: name.to_string(),
             iface_type: "ether".to_string(),
-            mtu: 1500,
             mac_address: String::new(),
             running,
-            disabled: false,
             rx_byte: Some(0),
             tx_byte: Some(0),
-            rx_packet: 0,
-            tx_packet: 0,
-            rx_drop: 0,
-            tx_drop: 0,
-            tx_queue_drop: 0,
-            last_link_up_time: String::new(),
-            comment: String::new(),
             default_name: name.to_string(),
         }
     }
 
     fn ipv4_address(address: &str, interface: &str) -> IpAddrEntry {
         IpAddrEntry {
-            id: format!("*{interface}"),
             address: address.to_string(),
-            network: String::new(),
             interface: interface.to_string(),
             actual_interface: String::new(),
             disabled: false,
-            dynamic: true,
-            comment: String::new(),
         }
     }
 
     fn ipv6_address(address: &str, interface: &str) -> Ipv6AddrEntry {
         Ipv6AddrEntry {
-            id: format!("*{interface}"),
             address: address.to_string(),
-            network: String::new(),
             interface: interface.to_string(),
             actual_interface: String::new(),
             disabled: false,
-            dynamic: true,
-            comment: String::new(),
-            advertise: false,
-            eui_64: false,
-            from_pool: false,
-            no_dad: false,
         }
     }
 
@@ -1270,7 +1249,6 @@ mod tests {
             active,
             disabled: false,
             distance,
-            comment: String::new(),
         }
     }
 

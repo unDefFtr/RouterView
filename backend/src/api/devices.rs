@@ -60,7 +60,7 @@ pub async fn update_override(
             body.custom_name.as_deref(),
             body.custom_type.as_deref(),
         )
-        .map_err(|e| AppError::Database(e))?;
+        .map_err(AppError::Database)?;
 
     // Re-read current snapshot, apply overrides, cache, and broadcast
     let updated_snapshot = {

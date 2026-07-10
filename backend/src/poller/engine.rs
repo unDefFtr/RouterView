@@ -115,6 +115,7 @@ impl PollEngineControl {
         self.readiness_tx.borrow().clone()
     }
 
+    #[cfg(test)]
     pub fn subscribe_readiness(&self) -> watch::Receiver<PollReadiness> {
         self.readiness_tx.subscribe()
     }
@@ -1726,8 +1727,7 @@ mod tests {
     fn observation(
         router_id: i64,
         interface_id: i64,
-        rx_counter: u64,
-        tx_counter: u64,
+        counters: (u64, u64),
         observed_at_ms: i64,
         monotonic: Instant,
         uptime_seconds: u64,
@@ -1736,8 +1736,8 @@ mod tests {
         CounterObservation {
             router_id,
             interface_id,
-            rx_counter,
-            tx_counter,
+            rx_counter: counters.0,
+            tx_counter: counters.1,
             observed_at_ms,
             monotonic,
             uptime_seconds: Some(uptime_seconds),
@@ -1779,19 +1779,10 @@ mod tests {
             id: id.into(),
             name: name.into(),
             iface_type: "ether".into(),
-            mtu: 1_500,
             mac_address: format!("00:11:22:33:44:{id}"),
             running: true,
-            disabled: false,
             rx_byte: Some(counters.0),
             tx_byte: Some(counters.1),
-            rx_packet: 0,
-            tx_packet: 0,
-            rx_drop: 0,
-            tx_drop: 0,
-            tx_queue_drop: 0,
-            last_link_up_time: String::new(),
-            comment: String::new(),
             default_name: name.into(),
         };
         let route = |id: &str, interface: &str, distance| crate::backends::RouteEntry {
@@ -1803,7 +1794,6 @@ mod tests {
             active: true,
             disabled: false,
             distance,
-            comment: String::new(),
         };
         RouterData {
             counter_sample_time: crate::backends::CounterSampleTime {
@@ -1819,12 +1809,9 @@ mod tests {
                 total_memory: 0,
                 free_hdd: 0,
                 total_hdd: 0,
-                cpu_count: 1,
-                cpu_frequency: String::new(),
                 architecture_name: String::new(),
                 board_name: String::new(),
                 version: String::new(),
-                platform: String::new(),
             },
             identity: crate::backends::IdentityData {
                 name: "router".into(),
@@ -1839,7 +1826,6 @@ mod tests {
             ipv6_routes: vec![],
             arp_entries: vec![],
             ipv6_neighbors: vec![],
-            dns_servers: vec![],
             dhcp_leases: vec![],
             wireless_clients: vec![],
             connection_count: 0,
@@ -1901,8 +1887,7 @@ mod tests {
             &observation(
                 router_id,
                 interface_id,
-                1_000,
-                2_000,
+                (1_000, 2_000),
                 1_000,
                 started,
                 100,
@@ -1928,8 +1913,7 @@ mod tests {
             &observation(
                 router_id,
                 interface_id,
-                1_500,
-                2_750,
+                (1_500, 2_750),
                 6_000,
                 started + Duration::from_secs(5),
                 105,
@@ -1960,7 +1944,7 @@ mod tests {
         persist_counter_observation(
             &db,
             &mut original_process,
-            &observation(router_id, interface_id, 10, 20, 1_000, started, 100, None),
+            &observation(router_id, interface_id, (10, 20), 1_000, started, 100, None),
         )
         .unwrap();
 
@@ -1971,8 +1955,7 @@ mod tests {
             &observation(
                 router_id,
                 interface_id,
-                110,
-                220,
+                (110, 220),
                 6_000,
                 started + Duration::from_secs(5),
                 105,
@@ -1998,8 +1981,7 @@ mod tests {
             &observation(
                 router_id,
                 interface_id,
-                160,
-                300,
+                (160, 300),
                 11_000,
                 started + Duration::from_secs(10),
                 110,
@@ -2031,8 +2013,7 @@ mod tests {
             &observation(
                 router_id,
                 interface_id,
-                100,
-                200,
+                (100, 200),
                 1_000,
                 started,
                 10_000,
@@ -2046,8 +2027,7 @@ mod tests {
             &observation(
                 router_id,
                 interface_id,
-                500,
-                700,
+                (500, 700),
                 6_000,
                 started + Duration::from_secs(5),
                 5,
@@ -2080,8 +2060,7 @@ mod tests {
             &observation(
                 router_id,
                 interface_id,
-                100,
-                200,
+                (100, 200),
                 1_000,
                 started,
                 10_000,
@@ -2097,8 +2076,7 @@ mod tests {
             &observation(
                 router_id,
                 interface_id,
-                50_000,
-                70_000,
+                (50_000, 70_000),
                 30_001_000,
                 started + elapsed,
                 20_000,
@@ -2241,7 +2219,15 @@ mod tests {
         persist_counter_observation(
             &db,
             &mut baselines,
-            &observation(router_id, interface_id, 100, 200, 1_000, started, 100, None),
+            &observation(
+                router_id,
+                interface_id,
+                (100, 200),
+                1_000,
+                started,
+                100,
+                None,
+            ),
         )
         .unwrap();
         let before = baselines.get(&interface_id).unwrap().clone();
@@ -2252,8 +2238,7 @@ mod tests {
             &observation(
                 router_id,
                 interface_id,
-                150,
-                250,
+                (150, 250),
                 1_000,
                 started + Duration::from_secs(5),
                 105,

@@ -13,26 +13,26 @@ use tracing::{debug, info, warn};
 use crate::backends::routeros::models::*;
 use crate::backends::{
     ConnectionTestResult, CounterSampleTime, RouterBackend, RouterConnectionConfig, RouterData,
-    RouterType,
 };
 use crate::error::AppError;
 
-const SYSTEM_RESOURCE_PATH: &str = "/system/resource?.proplist=uptime,cpu-load,free-memory,total-memory,free-hdd-space,total-hdd-space,cpu-count,cpu-frequency,architecture-name,board-name,version,platform";
+const SYSTEM_RESOURCE_PATH: &str = "/system/resource?.proplist=uptime,cpu-load,free-memory,total-memory,free-hdd-space,total-hdd-space,architecture-name,board-name,version";
 const SYSTEM_IDENTITY_PATH: &str = "/system/identity?.proplist=name";
 const SYSTEM_ROUTERBOARD_PATH: &str = "/system/routerboard?.proplist=serial-number";
-const IP_ADDRESS_PATH: &str =
-    "/ip/address?.proplist=.id,address,network,interface,actual-interface,disabled,dynamic,comment";
-const INTERFACE_PATH: &str = "/interface?.proplist=.id,name,type,mtu,mac-address,running,disabled,rx-byte,tx-byte,rx-packet,tx-packet,rx-drop,tx-drop,tx-queue-drop,last-link-up-time,comment,default-name";
-const IP_ROUTE_PATH: &str = "/ip/route?.proplist=.id,dst-address,gateway,immediate-gw,gateway-status,interface,active,disabled,distance,comment";
-const ARP_PATH: &str =
-    "/ip/arp?.proplist=.id,address,mac-address,interface,status,dynamic,disabled,comment,dhcp-name";
-const DNS_PATH: &str = "/ip/dns?.proplist=servers";
-const DHCP_LEASE_PATH: &str = "/ip/dhcp-server/lease?.proplist=.id,address,mac-address,host-name,server,status,expires-after,active-mac-address,active-address,active-server";
-const WIRELESS_REGISTRATION_PATH: &str = "/interface/wireless/registration-table?.proplist=.id,interface,mac-address,ap,signal-strength,signal-to-noise,tx-rate,rx-rate,uptime,tx-ccq,rx-ccq";
-const IPV6_ADDRESS_PATH: &str = "/ipv6/address?.proplist=.id,address,network,interface,actual-interface,disabled,dynamic,comment,advertise,eui-64,from-pool,no-dad";
-const IPV6_ROUTE_PATH: &str = "/ipv6/route?.proplist=.id,dst-address,gateway,immediate-gw,gateway-status,interface,active,disabled,distance,comment";
+const IP_ADDRESS_PATH: &str = "/ip/address?.proplist=address,interface,actual-interface,disabled";
+const INTERFACE_PATH: &str =
+    "/interface?.proplist=.id,name,type,mac-address,running,rx-byte,tx-byte,default-name";
+const IP_ROUTE_PATH: &str = "/ip/route?.proplist=.id,dst-address,gateway,immediate-gw,gateway-status,interface,active,disabled,distance";
+const ARP_PATH: &str = "/ip/arp?.proplist=address,mac-address,interface,status,disabled";
+const DHCP_LEASE_PATH: &str =
+    "/ip/dhcp-server/lease?.proplist=mac-address,host-name,status,expires-after,active-mac-address";
+const WIRELESS_REGISTRATION_PATH: &str =
+    "/interface/wireless/registration-table?.proplist=mac-address,signal-strength,uptime";
+const IPV6_ADDRESS_PATH: &str =
+    "/ipv6/address?.proplist=address,interface,actual-interface,disabled";
+const IPV6_ROUTE_PATH: &str = "/ipv6/route?.proplist=.id,dst-address,gateway,immediate-gw,gateway-status,interface,active,disabled,distance";
 const IPV6_NEIGHBOR_PATH: &str =
-    "/ipv6/neighbor?.proplist=.id,address,mac-address,interface,status,dynamic,disabled,comment";
+    "/ipv6/neighbor?.proplist=address,mac-address,interface,status,disabled";
 const FIREWALL_CONNECTION_IDS_PATH: &str = "/ip/firewall/connection?.proplist=.id";
 const IPV6_FIREWALL_CONNECTION_IDS_PATH: &str = "/ipv6/firewall/connection?.proplist=.id";
 const CONNECTION_COUNT_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -203,14 +203,6 @@ impl RouterOsClient {
 
     async fn arp_table(&self) -> Result<Vec<ArpEntry>, AppError> {
         self.get::<ArpEntry>(ARP_PATH).await
-    }
-
-    async fn dns_config(&self) -> Result<DnsConfig, AppError> {
-        let items = self.get::<DnsConfig>(DNS_PATH).await?;
-        items
-            .into_iter()
-            .next()
-            .ok_or_else(|| AppError::InvalidData("Empty DNS config response".into()))
     }
 
     async fn dhcp_leases(&self) -> Result<Vec<DhcpLease>, AppError> {
@@ -413,7 +405,6 @@ impl RouterBackend for RouterOsClient {
                 self.ip_addresses(),
                 self.interfaces(),
                 self.arp_table(),
-                self.dns_config(),
                 self.dhcp_leases(),
                 self.wireless_registrations(),
                 self.routes(),
@@ -438,7 +429,6 @@ impl RouterBackend for RouterOsClient {
             ips_result,
             interfaces_result,
             arp_result,
-            dns_result,
             leases_result,
             wireless_result,
             routes_result,
@@ -459,7 +449,6 @@ impl RouterBackend for RouterOsClient {
                     ip_addresses: ips_result,
                     interfaces: interfaces_result,
                     arp_entries: arp_result,
-                    dns: dns_result,
                     dhcp_leases: leases_result,
                     wireless_registrations: wireless_result,
                     routes: routes_result,
@@ -534,10 +523,6 @@ impl RouterBackend for RouterOsClient {
                 error: Some("Router connection failed".to_string()),
             }),
         }
-    }
-
-    fn router_type() -> RouterType {
-        RouterType::RouterOs
     }
 }
 
@@ -642,7 +627,7 @@ mod tests {
 
     fn config(host: &str, cidr: &str) -> RouterConnectionConfig {
         RouterConnectionConfig {
-            router_type: RouterType::RouterOs,
+            router_type: crate::backends::RouterType::RouterOs,
             host: host.to_string(),
             port: 443,
             scheme: "https".to_string(),
@@ -680,7 +665,6 @@ mod tests {
             INTERFACE_PATH,
             IP_ROUTE_PATH,
             ARP_PATH,
-            DNS_PATH,
             DHCP_LEASE_PATH,
             WIRELESS_REGISTRATION_PATH,
             IPV6_ADDRESS_PATH,
@@ -695,6 +679,94 @@ mod tests {
             .all(|path| path.contains("?.proplist=") && !path.ends_with(".proplist=")));
         assert!(FIREWALL_CONNECTION_IDS_PATH.ends_with("=.id"));
         assert!(IPV6_FIREWALL_CONNECTION_IDS_PATH.ends_with("=.id"));
+    }
+
+    #[test]
+    fn collection_property_lists_only_request_consumed_fields() {
+        fn properties(path: &str) -> Vec<&str> {
+            path.split_once("?.proplist=")
+                .expect("collection path must include .proplist")
+                .1
+                .split(',')
+                .collect()
+        }
+
+        assert_eq!(
+            properties(SYSTEM_RESOURCE_PATH),
+            [
+                "uptime",
+                "cpu-load",
+                "free-memory",
+                "total-memory",
+                "free-hdd-space",
+                "total-hdd-space",
+                "architecture-name",
+                "board-name",
+                "version",
+            ]
+        );
+        assert_eq!(properties(SYSTEM_IDENTITY_PATH), ["name"]);
+        assert_eq!(properties(SYSTEM_ROUTERBOARD_PATH), ["serial-number"]);
+        assert_eq!(
+            properties(IP_ADDRESS_PATH),
+            ["address", "interface", "actual-interface", "disabled"]
+        );
+        assert_eq!(
+            properties(INTERFACE_PATH),
+            [
+                ".id",
+                "name",
+                "type",
+                "mac-address",
+                "running",
+                "rx-byte",
+                "tx-byte",
+                "default-name",
+            ]
+        );
+        assert_eq!(
+            properties(IP_ROUTE_PATH),
+            [
+                ".id",
+                "dst-address",
+                "gateway",
+                "immediate-gw",
+                "gateway-status",
+                "interface",
+                "active",
+                "disabled",
+                "distance",
+            ]
+        );
+        assert_eq!(
+            properties(ARP_PATH),
+            ["address", "mac-address", "interface", "status", "disabled",]
+        );
+        assert_eq!(
+            properties(DHCP_LEASE_PATH),
+            [
+                "mac-address",
+                "host-name",
+                "status",
+                "expires-after",
+                "active-mac-address",
+            ]
+        );
+        assert_eq!(
+            properties(WIRELESS_REGISTRATION_PATH),
+            ["mac-address", "signal-strength", "uptime"]
+        );
+        assert_eq!(
+            properties(IPV6_ADDRESS_PATH),
+            ["address", "interface", "actual-interface", "disabled"]
+        );
+        assert_eq!(properties(IPV6_ROUTE_PATH), properties(IP_ROUTE_PATH));
+        assert_eq!(
+            properties(IPV6_NEIGHBOR_PATH),
+            ["address", "mac-address", "interface", "status", "disabled",]
+        );
+        assert_eq!(properties(FIREWALL_CONNECTION_IDS_PATH), [".id"]);
+        assert_eq!(properties(IPV6_FIREWALL_CONNECTION_IDS_PATH), [".id"]);
     }
 
     #[test]

@@ -342,13 +342,3 @@ pub struct StabilitySegment {
     /// Optional label
     pub label: Option<String>,
 }
-
-// ── Connection State (for the initial handshake) ─────────────
-
-/// Sent by the server on initial WS connection to confirm state.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ConnectionState {
-    pub routeros_connected: bool,
-    pub server_version: String,
-    pub poll_interval_secs: u64,
-}
