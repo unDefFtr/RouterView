@@ -26,6 +26,10 @@ pub use traffic_v4::{
     TrafficCoverage, TrafficGapInput, TrafficQuality, TrafficQuery, TrafficQueryResult,
     TrafficSampleInput, TrafficTotals,
 };
+pub(crate) use traffic_v4::{
+    TrafficHistoryLookup, TrafficHistoryRequest, TrafficHistorySnapshot, TrafficInterfaceSelector,
+    TrafficQueryControl,
+};
 #[allow(unused_imports)]
 pub use types::{
     BackupArtifact, DatabaseError, DatabaseReport, MigrationReport, RestoreReport,

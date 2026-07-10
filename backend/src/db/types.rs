@@ -33,6 +33,8 @@ pub enum DatabaseError {
     TrafficQueryTooLarge { max_source_rows: usize },
     #[error("traffic query was cancelled")]
     TrafficQueryCancelled,
+    #[error("traffic query exceeded its processing deadline")]
+    TrafficQueryTimedOut,
 }
 
 pub type DatabaseResult<T> = Result<T, DatabaseError>;

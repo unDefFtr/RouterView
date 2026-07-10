@@ -726,7 +726,7 @@ fn table_counts(conn: &Connection) -> DatabaseResult<BTreeMap<String, u64>> {
     Ok(result)
 }
 
-fn open_read_only(path: &Path) -> DatabaseResult<Connection> {
+pub(super) fn open_read_only(path: &Path) -> DatabaseResult<Connection> {
     if !path.exists() {
         return Err(DatabaseError::InvalidCommand(format!(
             "database does not exist: {}",

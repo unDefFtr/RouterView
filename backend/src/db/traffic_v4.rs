@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
+use std::ops::Deref;
+use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, MutexGuard, TryLockError,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::{params, Connection, OptionalExtension, Rows, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -182,6 +184,73 @@ pub struct TrafficQueryResult {
     pub points: Vec<TrafficBucket>,
     pub totals: TrafficTotals,
     pub coverage: TrafficCoverage,
+}
+
+#[derive(Debug)]
+pub(crate) enum TrafficHistoryLookup {
+    RouterNotFound,
+    InterfaceNotFound,
+    Found(Box<TrafficHistorySnapshot>),
+}
+
+#[derive(Debug)]
+pub(crate) struct TrafficHistorySnapshot {
+    pub router: RouterRecord,
+    pub interface: RouterInterfaceRecord,
+    pub wan_interfaces: Vec<RouterInterfaceRecord>,
+    pub result: TrafficQueryResult,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TrafficInterfaceSelector<'a> {
+    Aggregate,
+    InterfaceKey(&'a str),
+    WanName(&'a str),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TrafficHistoryRequest<'a> {
+    pub fallback_target: &'a str,
+    pub selector: TrafficInterfaceSelector<'a>,
+    pub from_ms: i64,
+    pub to_ms: i64,
+    pub max_points: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TrafficQueryControl {
+    cancelled: Arc<AtomicBool>,
+    deadline: Option<Instant>,
+}
+
+impl TrafficQueryControl {
+    pub(crate) fn with_deadline(cancelled: Arc<AtomicBool>, deadline: Instant) -> Self {
+        Self {
+            cancelled,
+            deadline: Some(deadline),
+        }
+    }
+
+    #[cfg(test)]
+    fn cancellable(cancelled: Arc<AtomicBool>) -> Self {
+        Self {
+            cancelled,
+            deadline: None,
+        }
+    }
+
+    fn interruption(&self) -> Option<DatabaseError> {
+        if self.cancelled.load(Ordering::Relaxed) {
+            Some(DatabaseError::TrafficQueryCancelled)
+        } else if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            Some(DatabaseError::TrafficQueryTimedOut)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -936,42 +1005,16 @@ impl TrafficDb {
     /// most recently observed router that already has traffic. This keeps a
     /// v4-migrated legacy history visible without creating a router as a side
     /// effect of a read request.
+    #[cfg(test)]
     pub fn current_router_for_target(
         &self,
         fallback_target: &str,
     ) -> DatabaseResult<Option<RouterRecord>> {
-        let fallback_target = fallback_target.trim();
-        if fallback_target.is_empty() {
-            return Err(DatabaseError::InvalidCommand(
-                "router fallback target must not be empty".into(),
-            ));
-        }
-
         let conn = self
             .conn
             .lock()
             .map_err(|_| rusqlite::Error::InvalidQuery)?;
-        if let Some(router) = router_by_fallback_target(&conn, fallback_target)? {
-            return Ok(Some(router));
-        }
-
-        router_query(
-            &conn,
-            "SELECT id, internal_uuid, hardware_identity, fallback_target, identity_source,
-                    first_seen_at_ms, last_seen_at_ms
-             FROM routers AS router
-             WHERE EXISTS(
-                       SELECT 1 FROM traffic_samples AS sample
-                       WHERE sample.router_id = router.id
-                   )
-                OR EXISTS(
-                       SELECT 1 FROM traffic_rollups AS rollup
-                       WHERE rollup.router_id = router.id
-                   )
-             ORDER BY last_seen_at_ms DESC, id DESC
-             LIMIT 1",
-            params![],
-        )
+        current_router_for_target_on_connection(&conn, fallback_target)
     }
 
     /// Resolve exactly one interface for a traffic query.
@@ -979,6 +1022,7 @@ impl TrafficDb {
     /// Omitting `wan_name` selects the synthetic aggregate interface. A WAN
     /// name never falls through to aggregate data, preserving the one-query,
     /// one-interface coverage invariant used by `query_traffic_v4`.
+    #[cfg(test)]
     pub fn traffic_interface_for_query(
         &self,
         router_id: i64,
@@ -988,58 +1032,11 @@ impl TrafficDb {
             .conn
             .lock()
             .map_err(|_| rusqlite::Error::InvalidQuery)?;
-        let interface = match wan_name {
-            Some(name) => conn
-                .query_row(
-                    "SELECT id, router_id, interface_key, name, kind, hardware_id,
-                            first_seen_at_ms, last_seen_at_ms
-                     FROM router_interfaces
-                     WHERE router_id = ?1 AND name = ?2 AND kind <> 'aggregate'
-                     ORDER BY last_seen_at_ms DESC, id DESC
-                     LIMIT 1",
-                    params![router_id, name],
-                    map_interface,
-                )
-                .optional()?,
-            None => conn
-                .query_row(
-                    "SELECT id, router_id, interface_key, name, kind, hardware_id,
-                            first_seen_at_ms, last_seen_at_ms
-                     FROM router_interfaces
-                     WHERE router_id = ?1 AND kind = 'aggregate'
-                     ORDER BY (interface_key = '__aggregate__') DESC,
-                              last_seen_at_ms DESC, id DESC
-                     LIMIT 1",
-                    params![router_id],
-                    map_interface,
-                )
-                .optional()?,
-        };
-        Ok(interface)
-    }
-
-    pub fn traffic_interface_by_key(
-        &self,
-        router_id: i64,
-        interface_key: &str,
-    ) -> DatabaseResult<Option<RouterInterfaceRecord>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| rusqlite::Error::InvalidQuery)?;
-        Ok(conn
-            .query_row(
-                "SELECT id, router_id, interface_key, name, kind, hardware_id,
-                        first_seen_at_ms, last_seen_at_ms
-                 FROM router_interfaces
-                 WHERE router_id = ?1 AND interface_key = ?2",
-                params![router_id, interface_key],
-                map_interface,
-            )
-            .optional()?)
+        traffic_interface_for_query_on_connection(&conn, router_id, wan_name)
     }
 
     /// List queryable WAN interfaces for response metadata and selectors.
+    #[cfg(test)]
     pub fn router_wan_interfaces(
         &self,
         router_id: i64,
@@ -1048,71 +1045,148 @@ impl TrafficDb {
             .conn
             .lock()
             .map_err(|_| rusqlite::Error::InvalidQuery)?;
-        let mut statement = conn.prepare(
-            "SELECT id, router_id, interface_key, name, kind, hardware_id,
-                    first_seen_at_ms, last_seen_at_ms
-             FROM router_interfaces
-             WHERE router_id = ?1 AND kind <> 'aggregate'
-             ORDER BY name COLLATE NOCASE, interface_key, id",
+        router_wan_interfaces_on_connection(&conn, router_id)
+    }
+
+    pub(crate) fn query_traffic_history_cancellable(
+        &self,
+        request: &TrafficHistoryRequest<'_>,
+        control: TrafficQueryControl,
+    ) -> DatabaseResult<TrafficHistoryLookup> {
+        validate_traffic_query(
+            &TrafficQuery {
+                router_id: 0,
+                interface_id: 0,
+                from_ms: request.from_ms,
+                to_ms: request.to_ms,
+                max_points: request.max_points,
+            },
+            MAX_TRAFFIC_SOURCE_ROWS,
         )?;
-        let rows = statement.query_map(params![router_id], map_interface)?;
-        Ok(rows.collect::<Result<_, _>>()?)
+
+        self.with_traffic_read_snapshot(Some(control), |conn| {
+            let Some(router) =
+                current_router_for_target_on_connection(conn, request.fallback_target)?
+            else {
+                return Ok(TrafficHistoryLookup::RouterNotFound);
+            };
+            let interface = match request.selector {
+                TrafficInterfaceSelector::InterfaceKey(interface_key) => {
+                    traffic_interface_by_key_on_connection(conn, router.id, interface_key)?
+                }
+                TrafficInterfaceSelector::WanName(wan_name) => {
+                    traffic_interface_for_query_on_connection(conn, router.id, Some(wan_name))?
+                }
+                TrafficInterfaceSelector::Aggregate => {
+                    traffic_interface_for_query_on_connection(conn, router.id, None)?
+                }
+            };
+            let Some(interface) = interface else {
+                return Ok(TrafficHistoryLookup::InterfaceNotFound);
+            };
+            let wan_interfaces = router_wan_interfaces_on_connection(conn, router.id)?;
+            let result = query_traffic_v4_on_connection(
+                conn,
+                &TrafficQuery {
+                    router_id: router.id,
+                    interface_id: interface.id,
+                    from_ms: request.from_ms,
+                    to_ms: request.to_ms,
+                    max_points: request.max_points,
+                },
+                MAX_TRAFFIC_SOURCE_ROWS,
+            )?;
+            Ok(TrafficHistoryLookup::Found(Box::new(
+                TrafficHistorySnapshot {
+                    router,
+                    interface,
+                    wan_interfaces,
+                    result,
+                },
+            )))
+        })
     }
 
     pub fn query_traffic_v4(&self, query: &TrafficQuery) -> DatabaseResult<TrafficQueryResult> {
         self.query_traffic_v4_with_options(query, MAX_TRAFFIC_SOURCE_ROWS, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn query_traffic_v4_cancellable(
         &self,
         query: &TrafficQuery,
         cancelled: Arc<AtomicBool>,
     ) -> DatabaseResult<TrafficQueryResult> {
-        self.query_traffic_v4_with_options(query, MAX_TRAFFIC_SOURCE_ROWS, Some(cancelled))
+        self.query_traffic_v4_with_options(
+            query,
+            MAX_TRAFFIC_SOURCE_ROWS,
+            Some(TrafficQueryControl::cancellable(cancelled)),
+        )
     }
 
     fn query_traffic_v4_with_options(
         &self,
         query: &TrafficQuery,
         source_row_budget: usize,
-        cancelled: Option<Arc<AtomicBool>>,
+        control: Option<TrafficQueryControl>,
     ) -> DatabaseResult<TrafficQueryResult> {
-        if query.to_ms <= query.from_ms
-            || query.max_points == 0
-            || query.max_points > 50_000
-            || source_row_budget == 0
-        {
-            return Err(DatabaseError::InvalidCommand(
-                "traffic query requires an increasing range, 1..=50000 max_points, and a positive source-row budget"
-                    .into(),
-            ));
-        }
-        if cancellation_requested(cancelled.as_deref()) {
-            return Err(DatabaseError::TrafficQueryCancelled);
+        validate_traffic_query(query, source_row_budget)?;
+        self.with_traffic_read_snapshot(control, |conn| {
+            query_traffic_v4_on_connection(conn, query, source_row_budget)
+        })
+    }
+
+    fn with_traffic_read_snapshot<T>(
+        &self,
+        control: Option<TrafficQueryControl>,
+        operation: impl FnOnce(&Connection) -> DatabaseResult<T>,
+    ) -> DatabaseResult<T> {
+        if let Some(error) = traffic_query_interruption(control.as_ref()) {
+            return Err(error);
         }
 
-        let conn = self.lock_for_traffic_query(cancelled.as_deref())?;
-        if cancellation_requested(cancelled.as_deref()) {
-            return Err(DatabaseError::TrafficQueryCancelled);
+        let conn = self.traffic_read_connection(control.as_ref())?;
+        if let Some(error) = traffic_query_interruption(control.as_ref()) {
+            return Err(error);
         }
-        let progress_guard = cancelled
+        let progress_guard = control
             .clone()
-            .map(|flag| TrafficQueryProgressGuard::install(&conn, flag));
-        let result = query_traffic_v4_on_connection(&conn, query, source_row_budget);
+            .map(|control| TrafficQueryProgressGuard::install(&conn, control));
+        let transaction = TrafficReadTransactionGuard::begin(&conn)?;
+        let result = operation(&conn);
         drop(progress_guard);
+        transaction.rollback()?;
 
-        if cancellation_requested(cancelled.as_deref()) {
-            Err(DatabaseError::TrafficQueryCancelled)
+        if let Some(error) = traffic_query_interruption(control.as_ref()) {
+            Err(error)
         } else {
             result
         }
     }
 
+    fn traffic_read_connection(
+        &self,
+        control: Option<&TrafficQueryControl>,
+    ) -> DatabaseResult<TrafficReadConnection<'_>> {
+        if self.path == Path::new(":memory:") {
+            return self
+                .lock_for_traffic_query(control)
+                .map(TrafficReadConnection::Shared);
+        }
+        if let Some(error) = traffic_query_interruption(control) {
+            return Err(error);
+        }
+        let conn = super::maintenance::open_read_only(&self.path)?;
+        conn.busy_timeout(Duration::from_millis(50))?;
+        conn.execute_batch("PRAGMA query_only=ON;")?;
+        Ok(TrafficReadConnection::Dedicated(conn))
+    }
+
     fn lock_for_traffic_query(
         &self,
-        cancelled: Option<&AtomicBool>,
+        control: Option<&TrafficQueryControl>,
     ) -> DatabaseResult<MutexGuard<'_, Connection>> {
-        let Some(cancelled) = cancelled else {
+        let Some(control) = control else {
             return self
                 .conn
                 .lock()
@@ -1120,8 +1194,8 @@ impl TrafficDb {
         };
 
         loop {
-            if cancelled.load(Ordering::Relaxed) {
-                return Err(DatabaseError::TrafficQueryCancelled);
+            if let Some(error) = control.interruption() {
+                return Err(error);
             }
             match self.conn.try_lock() {
                 Ok(conn) => return Ok(conn),
@@ -1136,15 +1210,57 @@ impl TrafficDb {
     }
 }
 
+enum TrafficReadConnection<'a> {
+    Dedicated(Connection),
+    Shared(MutexGuard<'a, Connection>),
+}
+
+impl Deref for TrafficReadConnection<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Dedicated(conn) => conn,
+            Self::Shared(conn) => conn,
+        }
+    }
+}
+
+struct TrafficReadTransactionGuard<'a> {
+    conn: &'a Connection,
+    active: bool,
+}
+
+impl<'a> TrafficReadTransactionGuard<'a> {
+    fn begin(conn: &'a Connection) -> DatabaseResult<Self> {
+        conn.execute_batch("BEGIN DEFERRED TRANSACTION;")?;
+        Ok(Self { conn, active: true })
+    }
+
+    fn rollback(mut self) -> DatabaseResult<()> {
+        self.conn.execute_batch("ROLLBACK;")?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for TrafficReadTransactionGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.conn.execute_batch("ROLLBACK;");
+        }
+    }
+}
+
 struct TrafficQueryProgressGuard<'a> {
     conn: &'a Connection,
 }
 
 impl<'a> TrafficQueryProgressGuard<'a> {
-    fn install(conn: &'a Connection, cancelled: Arc<AtomicBool>) -> Self {
+    fn install(conn: &'a Connection, control: TrafficQueryControl) -> Self {
         conn.progress_handler(
             TRAFFIC_QUERY_PROGRESS_INTERVAL,
-            Some(move || cancelled.load(Ordering::Relaxed)),
+            Some(move || control.interruption().is_some()),
         );
         Self { conn }
     }
@@ -1156,8 +1272,22 @@ impl Drop for TrafficQueryProgressGuard<'_> {
     }
 }
 
-fn cancellation_requested(cancelled: Option<&AtomicBool>) -> bool {
-    cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed))
+fn traffic_query_interruption(control: Option<&TrafficQueryControl>) -> Option<DatabaseError> {
+    control.and_then(TrafficQueryControl::interruption)
+}
+
+fn validate_traffic_query(query: &TrafficQuery, source_row_budget: usize) -> DatabaseResult<()> {
+    if query.to_ms <= query.from_ms
+        || query.max_points == 0
+        || query.max_points > 50_000
+        || source_row_budget == 0
+    {
+        return Err(DatabaseError::InvalidCommand(
+            "traffic query requires an increasing range, 1..=50000 max_points, and a positive source-row budget"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn query_traffic_v4_on_connection(
@@ -1980,6 +2110,38 @@ fn router_by_fallback_target(
     )
 }
 
+fn current_router_for_target_on_connection(
+    conn: &Connection,
+    fallback_target: &str,
+) -> DatabaseResult<Option<RouterRecord>> {
+    let fallback_target = fallback_target.trim();
+    if fallback_target.is_empty() {
+        return Err(DatabaseError::InvalidCommand(
+            "router fallback target must not be empty".into(),
+        ));
+    }
+    if let Some(router) = router_by_fallback_target(conn, fallback_target)? {
+        return Ok(Some(router));
+    }
+    router_query(
+        conn,
+        "SELECT id, internal_uuid, hardware_identity, fallback_target, identity_source,
+                first_seen_at_ms, last_seen_at_ms
+         FROM routers AS router
+         WHERE EXISTS(
+                   SELECT 1 FROM traffic_samples AS sample
+                   WHERE sample.router_id = router.id
+               )
+            OR EXISTS(
+                   SELECT 1 FROM traffic_rollups AS rollup
+                   WHERE rollup.router_id = router.id
+               )
+         ORDER BY last_seen_at_ms DESC, id DESC
+         LIMIT 1",
+        params![],
+    )
+}
+
 fn router_by_id(conn: &rusqlite::Connection, id: i64) -> DatabaseResult<Option<RouterRecord>> {
     Ok(conn
         .query_row(
@@ -2026,6 +2188,63 @@ fn interface_by_key(
             map_interface,
         )
         .optional()?)
+}
+
+fn traffic_interface_for_query_on_connection(
+    conn: &Connection,
+    router_id: i64,
+    wan_name: Option<&str>,
+) -> DatabaseResult<Option<RouterInterfaceRecord>> {
+    Ok(match wan_name {
+        Some(name) => conn
+            .query_row(
+                "SELECT id, router_id, interface_key, name, kind, hardware_id,
+                        first_seen_at_ms, last_seen_at_ms
+                 FROM router_interfaces
+                 WHERE router_id = ?1 AND name = ?2 AND kind <> 'aggregate'
+                 ORDER BY last_seen_at_ms DESC, id DESC
+                 LIMIT 1",
+                params![router_id, name],
+                map_interface,
+            )
+            .optional()?,
+        None => conn
+            .query_row(
+                "SELECT id, router_id, interface_key, name, kind, hardware_id,
+                        first_seen_at_ms, last_seen_at_ms
+                 FROM router_interfaces
+                 WHERE router_id = ?1 AND kind = 'aggregate'
+                 ORDER BY (interface_key = '__aggregate__') DESC,
+                          last_seen_at_ms DESC, id DESC
+                 LIMIT 1",
+                params![router_id],
+                map_interface,
+            )
+            .optional()?,
+    })
+}
+
+fn traffic_interface_by_key_on_connection(
+    conn: &Connection,
+    router_id: i64,
+    interface_key: &str,
+) -> DatabaseResult<Option<RouterInterfaceRecord>> {
+    interface_by_key(conn, router_id, interface_key)
+}
+
+fn router_wan_interfaces_on_connection(
+    conn: &Connection,
+    router_id: i64,
+) -> DatabaseResult<Vec<RouterInterfaceRecord>> {
+    let mut statement = conn.prepare(
+        "SELECT id, router_id, interface_key, name, kind, hardware_id,
+                first_seen_at_ms, last_seen_at_ms
+         FROM router_interfaces
+         WHERE router_id = ?1 AND kind <> 'aggregate'
+         ORDER BY name COLLATE NOCASE, interface_key, id",
+    )?;
+    let rows = statement.query_map(params![router_id], map_interface)?;
+    Ok(rows.collect::<Result<_, _>>()?)
 }
 
 fn map_interface(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouterInterfaceRecord> {
@@ -2083,6 +2302,123 @@ mod tests {
                 },
             )
             .unwrap());
+    }
+
+    #[test]
+    fn history_lookup_reads_metadata_and_totals_from_one_snapshot() {
+        let db = database();
+        let router = db.resolve_router(None, "192.0.2.1", 1_000).unwrap();
+        let interface = db
+            .upsert_router_interface(router.id, "ether1", "WAN", "wan", None, 1_000)
+            .unwrap();
+        insert_sample(&db, router.id, interface.id, 0, TrafficQuality::Exact);
+
+        let lookup = db
+            .query_traffic_history_cancellable(
+                &TrafficHistoryRequest {
+                    fallback_target: "192.0.2.1",
+                    selector: TrafficInterfaceSelector::InterfaceKey("ether1"),
+                    from_ms: 0,
+                    to_ms: 5_000,
+                    max_points: 10,
+                },
+                TrafficQueryControl::with_deadline(
+                    Arc::new(AtomicBool::new(false)),
+                    Instant::now() + Duration::from_secs(1),
+                ),
+            )
+            .unwrap();
+        let TrafficHistoryLookup::Found(snapshot) = lookup else {
+            panic!("traffic history was not found");
+        };
+        let TrafficHistorySnapshot {
+            router: selected_router,
+            interface: selected_interface,
+            wan_interfaces,
+            result,
+        } = *snapshot;
+        assert_eq!(selected_router.id, router.id);
+        assert_eq!(selected_interface.id, interface.id);
+        assert_eq!(wan_interfaces.len(), 1);
+        assert_eq!(result.totals.download_bytes, "1000");
+        assert_eq!(result.coverage.exact_duration_ms, 5_000);
+    }
+
+    #[test]
+    fn filesystem_history_snapshot_does_not_block_writes_and_stays_consistent() {
+        let directory = std::env::temp_dir().join(format!(
+            "routerview-history-reader-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("routerview.db");
+        let db = Arc::new(TrafficDb::open(&path).unwrap());
+        let router = db.resolve_router(None, "192.0.2.1", 1_000).unwrap();
+        let interface = db
+            .upsert_router_interface(router.id, "ether1", "WAN", "wan", None, 1_000)
+            .unwrap();
+        insert_sample(&db, router.id, interface.id, 0, TrafficQuality::Exact);
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let reader_db = db.clone();
+        let reader = std::thread::spawn(move || {
+            reader_db.with_traffic_read_snapshot(None, |conn| {
+                let initial_count: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM traffic_samples", [], |row| row.get(0))?;
+                ready_tx.send(initial_count).unwrap();
+                release_rx.recv().unwrap();
+                Ok(conn.query_row(
+                    "SELECT
+                         (SELECT COUNT(*) FROM traffic_samples),
+                         (SELECT name FROM router_interfaces WHERE id = ?1)",
+                    [interface.id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )?)
+            })
+        });
+        assert_eq!(ready_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+
+        let (writer_tx, writer_rx) = std::sync::mpsc::channel();
+        let writer_db = db.clone();
+        let writer = std::thread::spawn(move || {
+            writer_db
+                .upsert_router_interface(router.id, "ether1", "WAN updated", "wan", None, 10_000)
+                .unwrap();
+            insert_sample(
+                &writer_db,
+                router.id,
+                interface.id,
+                5_000,
+                TrafficQuality::Exact,
+            );
+            let _ = writer_tx.send(());
+        });
+        let writer_completed = writer_rx.recv_timeout(Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+        let stale_snapshot = reader.join().unwrap().unwrap();
+        writer.join().unwrap();
+
+        assert!(
+            writer_completed.is_ok(),
+            "history reader blocked the writer"
+        );
+        assert_eq!(stale_snapshot, (1, "WAN".to_string()));
+        let fresh_snapshot = db
+            .with_traffic_read_snapshot(None, |conn| {
+                Ok(conn.query_row(
+                    "SELECT
+                         (SELECT COUNT(*) FROM traffic_samples),
+                         (SELECT name FROM router_interfaces WHERE id = ?1)",
+                    [interface.id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(fresh_snapshot, (2, "WAN updated".to_string()));
+
+        drop(db);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     fn seed_retention_history(db: &TrafficDb, ended_at_values: &[i64]) -> (i64, i64) {
@@ -2903,10 +3239,46 @@ mod tests {
     }
 
     #[test]
+    fn traffic_query_deadline_stops_waiting_for_the_memory_connection() {
+        let db = Arc::new(database());
+        let conn_guard = db.conn.lock().unwrap();
+        let worker_db = db.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = worker_db.query_traffic_history_cancellable(
+                &TrafficHistoryRequest {
+                    fallback_target: "192.0.2.1",
+                    selector: TrafficInterfaceSelector::Aggregate,
+                    from_ms: 0,
+                    to_ms: 1,
+                    max_points: 1,
+                },
+                TrafficQueryControl::with_deadline(
+                    Arc::new(AtomicBool::new(false)),
+                    Instant::now() + Duration::from_millis(20),
+                ),
+            );
+            let _ = result_tx.send(result);
+        });
+
+        let result = result_rx.recv_timeout(Duration::from_secs(1));
+        drop(conn_guard);
+        worker.join().unwrap();
+
+        assert!(matches!(
+            result.unwrap().unwrap_err(),
+            DatabaseError::TrafficQueryTimedOut
+        ));
+    }
+
+    #[test]
     fn sqlite_progress_handler_interrupts_and_is_removed_after_query() {
         let conn = Connection::open_in_memory().unwrap();
         let cancelled = Arc::new(AtomicBool::new(false));
-        let guard = TrafficQueryProgressGuard::install(&conn, cancelled.clone());
+        let guard = TrafficQueryProgressGuard::install(
+            &conn,
+            TrafficQueryControl::cancellable(cancelled.clone()),
+        );
         cancelled.store(true, Ordering::Relaxed);
         let error = conn
             .query_row(

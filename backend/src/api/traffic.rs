@@ -2,13 +2,15 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use std::time::{Duration, Instant};
 
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 
 use crate::db::{
     DatabaseError, RouterInterfaceRecord, RouterRecord, TrafficBucket, TrafficCoverage,
-    TrafficQuery, TrafficQueryResult, TrafficTotals,
+    TrafficHistoryLookup, TrafficHistoryRequest, TrafficHistorySnapshot, TrafficInterfaceSelector,
+    TrafficQueryControl, TrafficQueryResult, TrafficTotals,
 };
 use crate::error::{ApiQuery, AppError};
 use crate::state::AppState;
@@ -16,6 +18,7 @@ use crate::state::AppState;
 const DEFAULT_MAX_POINTS: usize = 1_200;
 const MAX_POINTS: usize = 5_000;
 const MAX_RANGE_MS: i64 = 90 * 86_400 * 1_000;
+const TRAFFIC_QUERY_DEADLINE: Duration = Duration::from_secs(10);
 
 fn default_max_points() -> usize {
     DEFAULT_MAX_POINTS
@@ -179,54 +182,66 @@ pub async fn query_traffic(
     let cancellation = Arc::new(AtomicBool::new(false));
     let query_cancellation = cancellation.clone();
     let mut cancellation_guard = TrafficQueryCancellationGuard::new(cancellation);
+    let query_deadline_at = Instant::now() + TRAFFIC_QUERY_DEADLINE;
     let shutdown_rx = state.shutdown_tx.subscribe();
     let query_task =
         spawn_blocking_with_permit(permit, move || -> Result<TrafficResponse, AppError> {
-            let router = traffic_db
-                .current_router_for_target(&fallback_target)
-                .map_err(map_database_error)?
-                .ok_or_else(|| traffic_not_found("traffic history has not been initialized"))?;
-            let interface = match interface_id.as_deref() {
-                Some(interface_id) => traffic_db
-                    .traffic_interface_by_key(router.id, interface_id)
-                    .map_err(map_database_error)?,
-                None => traffic_db
-                    .traffic_interface_for_query(router.id, wan_name.as_deref())
-                    .map_err(map_database_error)?,
-            }
-            .ok_or_else(|| {
-                let message = if let Some(interface_id) = interface_id.as_deref() {
-                    format!("interface '{interface_id}' has no traffic history")
-                } else if let Some(name) = wan_name.as_deref() {
-                    format!("WAN interface '{name}' has no traffic history")
-                } else {
-                    "aggregate traffic history has not been initialized".into()
-                };
-                traffic_not_found(message)
-            })?;
-            let wan_interfaces = traffic_db
-                .router_wan_interfaces(router.id)
-                .map_err(map_database_error)?;
-            let result = traffic_db
-                .query_traffic_v4_cancellable(
-                    &TrafficQuery {
-                        router_id: router.id,
-                        interface_id: interface.id,
+            let selector = match (interface_id.as_deref(), wan_name.as_deref()) {
+                (Some(interface_id), None) => TrafficInterfaceSelector::InterfaceKey(interface_id),
+                (None, Some(wan_name)) => TrafficInterfaceSelector::WanName(wan_name),
+                (None, None) => TrafficInterfaceSelector::Aggregate,
+                (Some(_), Some(_)) => unreachable!("selectors were validated before dispatch"),
+            };
+            match traffic_db
+                .query_traffic_history_cancellable(
+                    &TrafficHistoryRequest {
+                        fallback_target: &fallback_target,
+                        selector,
                         from_ms: start,
                         to_ms: end,
                         max_points,
                     },
-                    query_cancellation,
+                    TrafficQueryControl::with_deadline(query_cancellation, query_deadline_at),
                 )
-                .map_err(map_database_error)?;
-            build_traffic_response(router, interface, wan_interfaces, result)
+                .map_err(map_database_error)?
+            {
+                TrafficHistoryLookup::RouterNotFound => Err(traffic_not_found(
+                    "traffic history has not been initialized",
+                )),
+                TrafficHistoryLookup::InterfaceNotFound => {
+                    let message = if let Some(interface_id) = interface_id.as_deref() {
+                        format!("interface '{interface_id}' has no traffic history")
+                    } else if let Some(name) = wan_name.as_deref() {
+                        format!("WAN interface '{name}' has no traffic history")
+                    } else {
+                        "aggregate traffic history has not been initialized".into()
+                    };
+                    Err(traffic_not_found(message))
+                }
+                TrafficHistoryLookup::Found(snapshot) => {
+                    let TrafficHistorySnapshot {
+                        router,
+                        interface,
+                        wan_interfaces,
+                        result,
+                    } = *snapshot;
+                    build_traffic_response(router, interface, wan_interfaces, result)
+                }
+            }
         });
     tokio::pin!(query_task);
+    let query_deadline =
+        tokio::time::sleep_until(tokio::time::Instant::from_std(query_deadline_at));
+    tokio::pin!(query_deadline);
     let query_result = tokio::select! {
         result = &mut query_task => result,
         () = wait_for_traffic_query_shutdown(shutdown_rx) => {
             cancellation_guard.cancel();
             return Err(traffic_query_unavailable());
+        }
+        () = &mut query_deadline => {
+            cancellation_guard.cancel();
+            return Err(traffic_query_timed_out());
         }
     };
     cancellation_guard.disarm();
@@ -442,6 +457,17 @@ fn traffic_query_unavailable() -> AppError {
     }
 }
 
+fn traffic_query_timed_out() -> AppError {
+    AppError::InvalidRequest {
+        status: StatusCode::GATEWAY_TIMEOUT,
+        code: "traffic_query_timeout",
+        message: format!(
+            "Traffic query exceeded the {} second processing limit",
+            TRAFFIC_QUERY_DEADLINE.as_secs()
+        ),
+    }
+}
+
 fn map_database_error(error: DatabaseError) -> AppError {
     match error {
         DatabaseError::Sqlite(error) => AppError::Database(error),
@@ -454,6 +480,7 @@ fn map_database_error(error: DatabaseError) -> AppError {
             ),
         },
         DatabaseError::TrafficQueryCancelled => traffic_query_unavailable(),
+        DatabaseError::TrafficQueryTimedOut => traffic_query_timed_out(),
         other => AppError::Internal(other.to_string()),
     }
 }
@@ -539,6 +566,23 @@ mod tests {
                 assert!(message.contains("narrower"));
             }
             other => panic!("unexpected traffic query error: {other}"),
+        }
+    }
+
+    #[test]
+    fn traffic_query_timeout_has_a_stable_gateway_error() {
+        let error = map_database_error(DatabaseError::TrafficQueryTimedOut);
+        match error {
+            AppError::InvalidRequest {
+                status,
+                code,
+                message,
+            } => {
+                assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+                assert_eq!(code, "traffic_query_timeout");
+                assert!(message.contains("10 second"));
+            }
+            other => panic!("unexpected traffic timeout error: {other}"),
         }
     }
 
