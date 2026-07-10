@@ -798,6 +798,34 @@ impl TrafficDb {
         Ok(true)
     }
 
+    /// Read-only preflight for anonymous pairing. Successful candidates are
+    /// rechecked and consumed atomically by `consume_pairing_and_insert_session`.
+    pub fn pairing_is_eligible(&self, code_hash: &[u8], now: i64) -> Result<bool, rusqlite::Error> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM pairing_codes AS pairing
+                 JOIN auth_sessions AS creator
+                   ON creator.id = pairing.created_by_session_id
+                 JOIN admins AS admin ON admin.id = 1
+                 WHERE pairing.code_hash = ?1
+                   AND pairing.used_at IS NULL
+                   AND pairing.expires_at > ?2
+                   AND creator.username = admin.username
+                   AND creator.role = 'admin'
+                   AND creator.revoked_at IS NULL
+                   AND creator.absolute_expires_at > ?2
+                   AND (creator.idle_expires_at IS NULL OR creator.idle_expires_at > ?2)
+             )",
+            params![code_hash, now],
+            |row| row.get(0),
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn consume_pairing_and_insert_session(
         &self,
@@ -1269,6 +1297,7 @@ mod security_tests {
         assert!(!db
             .session_is_active("creator", "admin", "admin", "standard", 200)
             .unwrap());
+        assert!(!db.pairing_is_eligible(&[9; 32], 200).unwrap());
         assert!(db
             .consume_pairing_and_insert_session(
                 &[9; 32], 200, "fixed", &[10; 32], &[11; 32], 1_000, 1_000,
@@ -1289,6 +1318,7 @@ mod security_tests {
             9,
             &expiring_creator,
         );
+        assert!(!expired_db.pairing_is_eligible(&[9; 32], 200).unwrap());
         assert!(expired_db
             .consume_pairing_and_insert_session(
                 &[9; 32],
@@ -1313,6 +1343,7 @@ mod security_tests {
             &revoked_creator,
         );
         revoked_db.revoke_session("revoked", 150).unwrap();
+        assert!(!revoked_db.pairing_is_eligible(&[9; 32], 200).unwrap());
         assert!(revoked_db
             .consume_pairing_and_insert_session(
                 &[9; 32],
@@ -1335,6 +1366,9 @@ mod security_tests {
         db.insert_session(&creator).unwrap();
         insert_pairing(&db, &pairing("pairing-1", "viewer", 1_000), 9, &creator);
 
+        assert!(!db.pairing_is_eligible(&[8; 32], 200).unwrap());
+        assert!(db.pairing_is_eligible(&[9; 32], 200).unwrap());
+
         assert!(db
             .consume_pairing_and_insert_session(
                 &[9; 32], 200, "creator", &[10; 32], &[11; 32], 1_000, 1_000,
@@ -1353,6 +1387,37 @@ mod security_tests {
             )
             .unwrap()
             .is_none());
+        assert!(!db.pairing_is_eligible(&[9; 32], 200).unwrap());
+    }
+
+    #[test]
+    fn pairing_preflight_remains_read_only_while_another_connection_is_writing() {
+        let directory = std::env::temp_dir().join(format!(
+            "routerview-pairing-preflight-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("routerview.db");
+        let db = TrafficDb::open(&path).unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .busy_timeout(std::time::Duration::from_millis(50))
+            .unwrap();
+        db.create_admin("admin", "hash").unwrap();
+        let creator = standard_session("creator", 1, 999_999);
+        db.insert_session(&creator).unwrap();
+        insert_pairing(&db, &pairing("pairing-1", "viewer", 1_000), 9, &creator);
+
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(!db.pairing_is_eligible(&[8; 32], 200).unwrap());
+        assert!(db.pairing_is_eligible(&[9; 32], 200).unwrap());
+        writer.execute_batch("ROLLBACK").unwrap();
+
+        drop(writer);
+        drop(db);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

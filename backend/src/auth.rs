@@ -31,7 +31,7 @@ use ipnet::IpNet;
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 use crate::{
     db::{AdminRecord, AuthSessionRecord, PairingRecord, TrafficDb},
@@ -50,6 +50,7 @@ pub const SETUP_TOKEN_TTL_SECS: u64 = 15 * 60;
 const SETUP_SECS: i64 = SETUP_TOKEN_TTL_SECS as i64;
 const ARGON2_CONCURRENCY: usize = 2;
 const ARGON2_WAIT_TIMEOUT: Duration = Duration::from_millis(250);
+const PAIRING_CONCURRENCY: usize = 1;
 const HTTP_SESSION_TOUCH_SECS: i64 = 5 * 60;
 const AUTH_FAILURE_CAPACITY: usize = 1_024;
 const AUTH_FAILURE_TTL: Duration = Duration::from_secs(15 * 60);
@@ -59,6 +60,7 @@ const CLIENT_IP_HEADER: &str = "x-real-ip";
 /// Process-wide authentication work limits and source-aware timing state.
 pub struct AuthSecurity {
     argon2_slots: Arc<Semaphore>,
+    pairing_slots: Arc<Semaphore>,
     dummy_password_hash: String,
     login_failures: FailureLimiter<LoginFailureKey>,
     pairing_attempts: FailureLimiter<PairingFailureKey>,
@@ -69,6 +71,7 @@ impl AuthSecurity {
     pub fn new(trusted_proxy_cidrs: Vec<IpNet>) -> Result<Self, AppError> {
         Ok(Self {
             argon2_slots: Arc::new(Semaphore::new(ARGON2_CONCURRENCY)),
+            pairing_slots: Arc::new(Semaphore::new(PAIRING_CONCURRENCY)),
             dummy_password_hash: hash_password_sync(&random_token())?,
             login_failures: FailureLimiter::default(),
             pairing_attempts: FailureLimiter::default(),
@@ -90,6 +93,18 @@ impl AuthSecurity {
             Err(_) => Err(AppError::RateLimited {
                 retry_after_secs: 1,
             }),
+        }
+    }
+
+    fn acquire_pairing_slot(&self) -> Result<OwnedSemaphorePermit, AppError> {
+        match self.pairing_slots.clone().try_acquire_owned() {
+            Ok(permit) => Ok(permit),
+            Err(TryAcquireError::NoPermits) => Err(AppError::RateLimited {
+                retry_after_secs: 1,
+            }),
+            Err(TryAcquireError::Closed) => Err(AppError::Internal(
+                "pairing admission semaphore is closed".into(),
+            )),
         }
     }
 
@@ -648,6 +663,13 @@ pub async fn pair(
         .begin_pairing_attempt(source, Instant::now())
         .map_err(|retry_after_secs| AppError::RateLimited { retry_after_secs })?;
     let code_hash = validated_token_hash(&body.code)?;
+    let _pairing_slot = state.auth_security.acquire_pairing_slot()?;
+    if !state
+        .traffic_db
+        .pairing_is_eligible(&code_hash, unix_time())?
+    {
+        return Err(AppError::Unauthorized);
+    }
     let token = random_token();
     let csrf = random_token();
     let session = state
@@ -1210,6 +1232,17 @@ mod tests {
         LoginFailureKey::Username(username.to_string())
     }
 
+    fn test_auth_security(argon2_slots: usize) -> Arc<AuthSecurity> {
+        Arc::new(AuthSecurity {
+            argon2_slots: Arc::new(Semaphore::new(argon2_slots)),
+            pairing_slots: Arc::new(Semaphore::new(PAIRING_CONCURRENCY)),
+            dummy_password_hash: String::new(),
+            login_failures: FailureLimiter::default(),
+            pairing_attempts: FailureLimiter::default(),
+            trusted_proxy_cidrs: Vec::new(),
+        })
+    }
+
     #[test]
     fn validates_admin_identifiers() {
         assert_eq!(normalize_username(" Admin.User ").unwrap(), "admin.user");
@@ -1527,13 +1560,7 @@ mod tests {
 
     #[tokio::test]
     async fn argon2_gate_waits_fairly_and_bounds_queue_time() {
-        let security = Arc::new(AuthSecurity {
-            argon2_slots: Arc::new(Semaphore::new(ARGON2_CONCURRENCY)),
-            dummy_password_hash: String::new(),
-            login_failures: FailureLimiter::default(),
-            pairing_attempts: FailureLimiter::default(),
-            trusted_proxy_cidrs: Vec::new(),
-        });
+        let security = test_auth_security(ARGON2_CONCURRENCY);
         let first = security.acquire_argon2().await.unwrap();
         let second = security.acquire_argon2().await.unwrap();
         let waiting_security = security.clone();
@@ -1552,6 +1579,21 @@ mod tests {
         assert!(started.elapsed() >= ARGON2_WAIT_TIMEOUT);
         drop((second, third));
         assert!(security.acquire_argon2().await.is_ok());
+    }
+
+    #[test]
+    fn pairing_gate_rejects_parallel_database_work_without_queueing() {
+        let security = test_auth_security(ARGON2_CONCURRENCY);
+        let first = security.acquire_pairing_slot().unwrap();
+        assert!(matches!(
+            security.acquire_pairing_slot(),
+            Err(AppError::RateLimited {
+                retry_after_secs: 1
+            })
+        ));
+
+        drop(first);
+        assert!(security.acquire_pairing_slot().is_ok());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1584,13 +1626,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_login_remains_counted_after_verification_starts() {
-        let security = Arc::new(AuthSecurity {
-            argon2_slots: Arc::new(Semaphore::new(1)),
-            dummy_password_hash: String::new(),
-            login_failures: FailureLimiter::default(),
-            pairing_attempts: FailureLimiter::default(),
-            trusted_proxy_cidrs: Vec::new(),
-        });
+        let security = test_auth_security(1);
         let permit = security.acquire_argon2().await.unwrap();
         let username = LoginFailureKey::Username("admin".into());
         let source = LoginFailureKey::Source("192.0.2.10".parse().unwrap());
