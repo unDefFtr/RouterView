@@ -4,6 +4,11 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+patchedDependencies:
+  '@vue/devtools-api@6.6.4':
+    hash: 2803fe8e1994f67389572430c8cfaafba4dcd3a50bfac57d91ddbf82a0d03314
+    path: patches/@vue__devtools-api@6.6.4.patch
+
 importers:
 
   .:
@@ -1455,7 +1460,7 @@ snapshots:
       de-indent: 1.0.2
       he: 1.2.0
 
-  '@vue/devtools-api@6.6.4': {}
+  '@vue/devtools-api@6.6.4(patch_hash=2803fe8e1994f67389572430c8cfaafba4dcd3a50bfac57d91ddbf82a0d03314)': {}
 
   '@vue/language-core@2.2.12(typescript@5.6.3)':
     dependencies:
@@ -1770,7 +1775,7 @@ snapshots:
 
   pinia@2.3.1(typescript@5.6.3)(vue@3.5.38(typescript@5.6.3)):
     dependencies:
-      '@vue/devtools-api': 6.6.4
+      '@vue/devtools-api': 6.6.4(patch_hash=2803fe8e1994f67389572430c8cfaafba4dcd3a50bfac57d91ddbf82a0d03314)
       vue: 3.5.38(typescript@5.6.3)
       vue-demi: 0.14.10(vue@3.5.38(typescript@5.6.3))
     optionalDependencies:
@@ -1948,7 +1953,7 @@ snapshots:
 
   vue-router@4.6.4(vue@3.5.38(typescript@5.6.3)):
     dependencies:
-      '@vue/devtools-api': 6.6.4
+      '@vue/devtools-api': 6.6.4(patch_hash=2803fe8e1994f67389572430c8cfaafba4dcd3a50bfac57d91ddbf82a0d03314)
       vue: 3.5.38(typescript@5.6.3)
 
   vue-tsc@2.2.12(typescript@5.6.3):

@@ -1,0 +1,14 @@
+[
+  {
+    "name": "fixture-root",
+    "version": "1.0.0",
+    "path": "__FIXTURE_ROOT__/packages/root",
+    "private": true,
+    "dependencies": {
+      "missing-license": {
+        "version": "1.0.0",
+        "path": "__FIXTURE_ROOT__/packages/missing-license"
+      }
+    }
+  }
+]

@@ -43,6 +43,7 @@ backups/
 cargo-metadata.json
 pnpm-licenses.json
 THIRD-PARTY-LICENSES.md
+/third-party-licenses/
 *.spdx.json
 SHA256SUMS
 release/

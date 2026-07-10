@@ -1,0 +1,57 @@
+{
+  "packages": [
+    {
+      "id": "path+file:///fixture/root#routerview-backend@0.2.0",
+      "name": "routerview-backend",
+      "version": "0.2.0",
+      "manifest_path": "__FIXTURE_ROOT__/packages/root/Cargo.toml",
+      "license": "MIT"
+    },
+    {
+      "id": "registry#normal-dependency@1.0.0",
+      "name": "normal-dependency",
+      "version": "1.0.0",
+      "manifest_path": "__FIXTURE_ROOT__/packages/normal-dependency/Cargo.toml",
+      "license": "MIT"
+    },
+    {
+      "id": "registry#build-dependency@2.0.0",
+      "name": "build-dependency",
+      "version": "2.0.0",
+      "manifest_path": "__FIXTURE_ROOT__/packages/build-dependency/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "id": "registry#dev-dependency@3.0.0",
+      "name": "dev-dependency",
+      "version": "3.0.0",
+      "manifest_path": "__FIXTURE_ROOT__/packages/dev-dependency/Cargo.toml",
+      "license": "MIT"
+    }
+  ],
+  "workspace_members": ["path+file:///fixture/root#routerview-backend@0.2.0"],
+  "resolve": {
+    "nodes": [
+      {
+        "id": "path+file:///fixture/root#routerview-backend@0.2.0",
+        "deps": [
+          {
+            "pkg": "registry#normal-dependency@1.0.0",
+            "dep_kinds": [{ "kind": null, "target": null }]
+          },
+          {
+            "pkg": "registry#build-dependency@2.0.0",
+            "dep_kinds": [{ "kind": "build", "target": null }]
+          },
+          {
+            "pkg": "registry#dev-dependency@3.0.0",
+            "dep_kinds": [{ "kind": "dev", "target": null }]
+          }
+        ]
+      },
+      { "id": "registry#normal-dependency@1.0.0", "deps": [] },
+      { "id": "registry#build-dependency@2.0.0", "deps": [] },
+      { "id": "registry#dev-dependency@3.0.0", "deps": [] }
+    ]
+  }
+}

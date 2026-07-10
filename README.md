@@ -72,14 +72,20 @@ administrator CLI is an offline writer: stop the backend before using
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-targets --all-features --locked
-cd frontend && pnpm install --frozen-lockfile && pnpm typecheck && pnpm test --run && pnpm build
+pnpm --dir frontend install --frozen-lockfile
+pnpm --dir frontend typecheck
+pnpm --dir frontend test --run
+pnpm --dir frontend build
+pnpm --dir frontend run licenses:test && pnpm --dir frontend run licenses:bundle
 docker compose --env-file .env.compose.example config --quiet
 ```
 
 Release builds are produced from the root `Dockerfile`; tracked frontend
 archives are not used. Tagged releases publish amd64/arm64 backend and Caddy
 images, a standalone Linux amd64 backend archive, a frontend archive, checksums,
-an SPDX SBOM, and a generated third-party dependency inventory.
+artifact-specific SPDX SBOMs, a generated dependency inventory, and the
+corresponding third-party license and notice texts. Container images expose the
+texts below `/usr/share/licenses/routerview/third-party/`.
 
 ## License
 

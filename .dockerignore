@@ -17,6 +17,8 @@ frontend/dist.tar
 coverage
 playwright-report
 test-results
+/third-party-licenses
+/release
 
 *.db
 *.db-shm

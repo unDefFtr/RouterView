@@ -8,6 +8,9 @@
     "dev": "vite",
     "build": "pnpm typecheck && vite build && pnpm bundle:check",
     "bundle:check": "node scripts/check-bundle-budget.mjs",
+    "licenses:bundle": "node ../scripts/prepare-third-party-licenses.mjs",
+    "licenses:release": "node ../scripts/prepare-third-party-licenses.mjs --cargo-output ../release/backend/third-party-licenses --pnpm-output ../release/frontend/third-party-licenses",
+    "licenses:test": "node --test ../scripts/generate-third-party-licenses.test.mjs",
     "preview": "vite preview",
     "typecheck": "vue-tsc --noEmit && tsc -p tsconfig.node.json --noEmit",
     "test": "vitest"
@@ -30,5 +33,10 @@
     "vite": "^6.0.0",
     "vitest": "^4.1.10",
     "vue-tsc": "^2.2.0"
+  },
+  "pnpm": {
+    "patchedDependencies": {
+      "@vue/devtools-api@6.6.4": "patches/@vue__devtools-api@6.6.4.patch"
+    }
   }
 }

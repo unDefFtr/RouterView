@@ -149,6 +149,12 @@ jobs:
           pnpm --dir frontend licenses list --json > pnpm-licenses.json
           node scripts/generate-third-party-notices.mjs \
             cargo-metadata.json pnpm-licenses.json THIRD-PARTY-LICENSES.md
+      - name: Bundle third-party license texts
+        run: |
+          pnpm --dir frontend run licenses:test
+          pnpm --dir frontend run licenses:release
+          test -s release/backend/third-party-licenses/cargo/DEPENDENCIES.md
+          test -s release/frontend/third-party-licenses/pnpm/DEPENDENCIES.md
       - name: Assemble release directories
         run: |
           install -d release/backend release/frontend

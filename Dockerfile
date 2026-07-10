@@ -5,9 +5,35 @@ ARG NODE_VERSION=24.4.0
 ARG CADDY_VERSION=2.10.2
 ARG PNPM_VERSION=10.24.0
 
+FROM node:${NODE_VERSION}-bookworm-slim AS node-base
+
+FROM node-base AS frontend-builder
+WORKDIR /workspace
+
+ARG PNPM_VERSION
+ENV PNPM_HOME=/pnpm
+ENV PATH=${PNPM_HOME}:${PATH}
+
+RUN corepack enable && corepack prepare "pnpm@${PNPM_VERSION}" --activate
+COPY scripts/generate-third-party-licenses.mjs scripts/
+COPY frontend/package.json frontend/pnpm-lock.yaml frontend/
+COPY frontend/patches frontend/patches
+WORKDIR /workspace/frontend
+RUN --mount=type=cache,id=routerview-pnpm-store,target=/pnpm/store,sharing=locked \
+    pnpm config set store-dir /pnpm/store \
+    && pnpm install --frozen-lockfile
+
+COPY frontend/ ./
+RUN pnpm build \
+    && pnpm list --json --depth Infinity --no-optional > /tmp/pnpm-release-dependencies.json \
+    && node /workspace/scripts/generate-third-party-licenses.mjs \
+        pnpm /tmp/pnpm-release-dependencies.json /out/third-party-licenses
+
 FROM rust:${RUST_VERSION}-bookworm AS backend-builder
 WORKDIR /workspace
 
+COPY --from=node-base /usr/local/bin/node /usr/local/bin/node
+COPY scripts/generate-third-party-licenses.mjs scripts/
 COPY Cargo.toml Cargo.lock ./
 COPY backend/Cargo.toml backend/Cargo.toml
 COPY backend/src backend/src
@@ -16,23 +42,13 @@ RUN --mount=type=cache,id=routerview-cargo-registry,target=/usr/local/cargo/regi
     --mount=type=cache,id=routerview-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=routerview-cargo-target,target=/workspace/target,sharing=locked \
     cargo build --locked --release --package routerview-backend \
-    && install -Dm0755 target/release/routerview-backend /out/routerview-backend
-
-FROM node:${NODE_VERSION}-bookworm-slim AS frontend-builder
-WORKDIR /workspace/frontend
-
-ARG PNPM_VERSION
-ENV PNPM_HOME=/pnpm
-ENV PATH=${PNPM_HOME}:${PATH}
-
-RUN corepack enable && corepack prepare "pnpm@${PNPM_VERSION}" --activate
-COPY frontend/package.json frontend/pnpm-lock.yaml ./
-RUN --mount=type=cache,id=routerview-pnpm-store,target=/pnpm/store,sharing=locked \
-    pnpm config set store-dir /pnpm/store \
-    && pnpm install --frozen-lockfile
-
-COPY frontend/ ./
-RUN pnpm build
+    && install -Dm0755 target/release/routerview-backend /out/routerview-backend \
+    && cargo_host="$(rustc -vV | sed -n 's/^host: //p')" \
+    && test -n "${cargo_host}" \
+    && cargo metadata --locked --format-version 1 --filter-platform "${cargo_host}" \
+        > /tmp/cargo-metadata.json \
+    && node scripts/generate-third-party-licenses.mjs \
+        cargo /tmp/cargo-metadata.json /out/third-party-licenses
 
 FROM debian:bookworm-slim AS backend-runtime
 
@@ -50,6 +66,8 @@ RUN apt-get update \
 
 COPY --from=backend-builder /out/routerview-backend /usr/local/bin/routerview-backend
 COPY LICENSE /usr/share/licenses/routerview/LICENSE
+COPY --from=backend-builder /out/third-party-licenses/cargo/ \
+    /usr/share/licenses/routerview/third-party/cargo/
 
 ENV DB_PATH=/var/lib/routerview/routerview.db \
     RUST_LOG=info \
@@ -76,6 +94,8 @@ RUN addgroup -S -g "${APP_GID}" routerview \
 COPY --chown=routerview:routerview deploy/Caddyfile /etc/caddy/Caddyfile
 COPY --chown=routerview:routerview --from=frontend-builder /workspace/frontend/dist/ /srv/
 COPY LICENSE /usr/share/licenses/routerview/LICENSE
+COPY --from=frontend-builder /out/third-party-licenses/pnpm/ \
+    /usr/share/licenses/routerview/third-party/pnpm/
 
 ENV ROUTERVIEW_DOMAIN=routerview.local
 

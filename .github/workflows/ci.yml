@@ -150,6 +150,12 @@ jobs:
       - name: Install frontend dependencies
         working-directory: frontend
         run: pnpm install --frozen-lockfile
+      - name: Verify third-party license texts
+        run: |
+          pnpm --dir frontend run licenses:test
+          pnpm --dir frontend run licenses:bundle
+          test -s third-party-licenses/cargo/DEPENDENCIES.md
+          test -s third-party-licenses/pnpm/DEPENDENCIES.md
       - name: Generate dependency inventory
         run: |
           cargo metadata --locked --format-version 1 > cargo-metadata.json
