@@ -92,13 +92,22 @@ jobs:
           chmod 0444 secrets/routerview_master_key
       - name: Validate Compose model
         run: docker compose --env-file .env.compose.example config --quiet
-      - name: Validate Caddy configuration
+      - name: Build Caddy runtime image
+        run: docker build --target caddy-runtime --tag routerview-caddy:ci .
+      - name: Validate hardened Caddy runtime
         run: >-
           docker run --rm
+          --read-only
+          --cap-drop ALL
+          --security-opt no-new-privileges:true
+          --sysctl net.ipv4.ip_unprivileged_port_start=0
+          --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m,uid=10001,gid=10001,mode=0700
+          --tmpfs /data:rw,nosuid,nodev,uid=10001,gid=10001,mode=0750
+          --tmpfs /config:rw,nosuid,nodev,uid=10001,gid=10001,mode=0750
           -e ROUTERVIEW_DOMAIN=routerview.local
-          -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro"
-          caddy:2.10.2-alpine
-          caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          --entrypoint caddy
+          routerview-caddy:ci
+          validate --config /etc/caddy/Caddyfile --adapter caddyfile
 
   dependency-audit:
     name: Dependency audit
