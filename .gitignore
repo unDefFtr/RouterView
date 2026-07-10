@@ -7,10 +7,16 @@ target/
 node_modules/
 dist/
 .vite/
+.pnpm-store/
+coverage/
+playwright-report/
+test-results/
 
 # Env
 .env
-.env.local
+.env.*
+!.env.compose.example
+!**/.env.example
 
 # IDE
 .idea/
@@ -30,3 +36,14 @@ Thumbs.db
 *.db
 *.db-shm
 *.db-wal
+
+# Production secrets and local operational output
+secrets/
+backups/
+cargo-metadata.json
+pnpm-licenses.json
+THIRD-PARTY-LICENSES.md
+*.spdx.json
+SHA256SUMS
+release/
+routerview-local-ca.crt
