@@ -26,7 +26,6 @@ export default defineConfig({
     rollupOptions: {
       output: {
         manualChunks: {
-          echarts: ['echarts'],
           vue: ['vue', 'pinia', 'vue-router'],
         },
       },

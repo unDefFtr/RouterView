@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushPromises, mount } from '@vue/test-utils';
 import { defineComponent, h, nextTick, ref } from 'vue';
-import type { EChartsOption } from 'echarts';
+import type { EChartsCoreOption } from 'echarts/core';
 import { useECharts } from './useECharts';
 
 const echartsMocks = vi.hoisted(() => ({
@@ -15,9 +15,7 @@ vi.mock('echarts/core', () => ({
 }));
 vi.mock('echarts/charts', () => ({ LineChart: {} }));
 vi.mock('echarts/components', () => ({
-  DataZoomComponent: {},
   GridComponent: {},
-  LegendComponent: {},
   TooltipComponent: {},
 }));
 vi.mock('echarts/renderers', () => ({ CanvasRenderer: {} }));
@@ -46,7 +44,7 @@ describe('useECharts', () => {
       },
     });
     const wrapper = mount(Host);
-    const options: EChartsOption = { xAxis: {}, yAxis: {}, series: [] };
+    const options: EChartsCoreOption = { xAxis: {}, yAxis: {}, series: [] };
 
     chart!.initChart(options);
     const first = echartsMocks.init.mock.results[0].value;

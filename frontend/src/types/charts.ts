@@ -2,7 +2,7 @@
 // ECharts Option Type Helpers
 // ═══════════════════════════════════════════════════════════════════
 
-import type { EChartsOption } from 'echarts';
+import type { EChartsCoreOption } from 'echarts/core';
 
 export interface TrafficChartData {
   timestamp: string;
@@ -126,7 +126,7 @@ export function buildTrafficChartOption(
   darkMode: boolean,
   timeRange: TimeRange,
   opts?: { dataZoom?: boolean },
-): EChartsOption {
+): EChartsCoreOption {
   const textColor = darkMode ? '#8b90a5' : '#5a6080';
   const gridColor = darkMode ? '#1e2235' : '#f1f5f9';
   const tooltipBg = darkMode ? '#1a1e2b' : '#ffffff';
@@ -293,7 +293,6 @@ export function buildTrafficChartOption(
         animation: false,
       },
     ],
-    legend: { show: false },
   };
 }
 
