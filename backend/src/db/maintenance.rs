@@ -496,10 +496,14 @@ pub fn export_legacy(path: &Path, destination: &Path) -> DatabaseResult<BackupAr
 
              INSERT INTO routerview_export_metadata(key, value) VALUES
                  ('format', 'routerview-legacy-v2'),
-                 ('source_user_version', '4'),
                  ('traffic_notice',
                   'Legacy rate rows are estimated unless routerview_traffic_quality says exact.');
              PRAGMA user_version = 0;",
+        )?;
+        tx.execute(
+            "INSERT INTO routerview_export_metadata(key, value)
+                 VALUES ('source_user_version', ?1)",
+            [source_report.user_version.to_string()],
         )?;
         tx.commit()?;
         output.execute_batch("DETACH DATABASE source; PRAGMA optimize;")?;
@@ -522,7 +526,6 @@ pub fn export_legacy(path: &Path, destination: &Path) -> DatabaseResult<BackupAr
     let sha256 = sha256_file(destination)?;
     let manifest_path = write_manifest(destination, &sha256)?;
     let exported = check_database(destination)?;
-    let _ = source_report;
     Ok(BackupArtifact {
         path: destination.to_path_buf(),
         manifest_path,
@@ -1016,7 +1019,7 @@ mod tests {
         conn
     }
 
-    fn create_v4_database(path: &Path, backup_dir: &Path) {
+    fn create_current_database(path: &Path, backup_dir: &Path) {
         let report = migrate_database(path, Some(backup_dir)).unwrap();
         assert_eq!(report.from_version, 0);
         assert_eq!(report.to_version, CURRENT_SCHEMA_VERSION);
@@ -1024,16 +1027,16 @@ mod tests {
     }
 
     #[test]
-    fn migrates_empty_database_to_v4_without_a_backup() {
+    fn migrates_empty_database_to_current_schema_without_a_backup() {
         let directory = TestDirectory::new("empty-migration");
         let database = directory.join("empty.db");
         let report = migrate_database(&database, Some(&directory.0)).unwrap();
         assert_eq!(report.from_version, 0);
-        assert_eq!(report.to_version, 4);
+        assert_eq!(report.to_version, CURRENT_SCHEMA_VERSION);
         assert!(report.backup.is_none());
 
         let checked = check_database(&database).unwrap();
-        assert_eq!(checked.user_version, 4);
+        assert_eq!(checked.user_version, CURRENT_SCHEMA_VERSION);
         assert_eq!(
             database.metadata().unwrap().permissions().mode() & 0o777,
             0o600
@@ -1049,6 +1052,84 @@ mod tests {
         ] {
             assert!(checked.table_counts.contains_key(table), "missing {table}");
         }
+        let conn = Connection::open(&database).unwrap();
+        assert!(conn
+            .prepare(
+                "SELECT 1 FROM sqlite_schema
+                 WHERE type = 'index' AND name = 'idx_traffic_samples_rollup_cutoff'",
+            )
+            .unwrap()
+            .exists([])
+            .unwrap());
+    }
+
+    #[test]
+    fn migrates_v4_rollup_index_with_a_verified_backup() {
+        let directory = TestDirectory::new("v4-rollup-index-migration");
+        let database = directory.join("v4.db");
+        create_current_database(&database, &directory.0);
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "INSERT INTO routers(
+                 id, internal_uuid, fallback_target, first_seen_at_ms, last_seen_at_ms
+             ) VALUES (1, 'migration-router', '192.0.2.1', 0, 10000);
+             INSERT INTO router_interfaces(
+                 id, router_id, interface_key, name, kind, first_seen_at_ms, last_seen_at_ms
+             ) VALUES (1, 1, 'ether1', 'WAN', 'wan', 0, 10000);
+             INSERT INTO traffic_samples(
+                 router_id, interface_id, started_at_ms, ended_at_ms, duration_ms,
+                 download_bytes, upload_bytes, download_bps, upload_bps,
+                 quality, source, created_at_ms
+             ) VALUES
+                 (1, 1, 0, 5000, 5000, 100, 50, 160, 80, 'exact', 'fixture', 5000),
+                 (1, 1, 5000, 10000, 5000, 200, 100, 320, 160, 'exact', 'fixture', 10000);
+             DROP INDEX idx_traffic_samples_rollup_cutoff;
+             DELETE FROM database_migrations WHERE version = 5;
+             PRAGMA user_version = 4;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let report = migrate_database(&database, Some(&directory.join("backups"))).unwrap();
+        assert_eq!(report.from_version, 4);
+        assert_eq!(report.to_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(report.backup.as_ref().unwrap().user_version, 4);
+        let conn = Connection::open(&database).unwrap();
+        let preserved: (i64, i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), SUM(download_bytes), SUM(upload_bytes),
+                        MIN(started_at_ms), MAX(ended_at_ms)
+                 FROM traffic_samples",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(preserved, (2, 300, 150, 0, 10_000));
+        assert!(conn
+            .prepare(
+                "SELECT 1 FROM sqlite_schema
+                 WHERE type = 'index' AND name = 'idx_traffic_samples_rollup_cutoff'",
+            )
+            .unwrap()
+            .exists([])
+            .unwrap());
+        assert_eq!(
+            conn.query_row(
+                "SELECT name, source_version FROM database_migrations WHERE version = 5",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap(),
+            ("traffic_rollup_cutoff_index".to_string(), 4)
+        );
     }
 
     #[test]
@@ -1059,10 +1140,12 @@ mod tests {
         conn.execute_batch(
             "PRAGMA journal_mode=DELETE;
              CREATE TABLE future_data(value TEXT NOT NULL);
-             INSERT INTO future_data VALUES ('preserve-me');
-             PRAGMA user_version=5;",
+             INSERT INTO future_data VALUES ('preserve-me');",
         )
         .unwrap();
+        let future_version = CURRENT_SCHEMA_VERSION + 1;
+        conn.pragma_update(None, "user_version", future_version)
+            .unwrap();
         drop(conn);
         let before = fs::read(&database).unwrap();
 
@@ -1071,13 +1154,13 @@ mod tests {
             Ok(_) => panic!("newer database was unexpectedly accepted"),
         };
 
-        assert!(matches!(
-            error,
-            DatabaseError::UnsupportedVersion {
-                found: 5,
-                supported: CURRENT_SCHEMA_VERSION
+        match error {
+            DatabaseError::UnsupportedVersion { found, supported } => {
+                assert_eq!(found, future_version);
+                assert_eq!(supported, CURRENT_SCHEMA_VERSION);
             }
-        ));
+            error => panic!("unexpected error: {error}"),
+        }
         assert_eq!(fs::read(&database).unwrap(), before);
         let conn = Connection::open(&database).unwrap();
         assert!(!conn
@@ -1110,7 +1193,7 @@ mod tests {
         verify_manifest(&backup.path).unwrap();
 
         let conn = Connection::open(&database).unwrap();
-        assert_eq!(schema::user_version(&conn).unwrap(), 4);
+        assert_eq!(schema::user_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM traffic_points", [], |row| row
                 .get::<_, u64>(0))
@@ -1237,10 +1320,10 @@ mod tests {
     fn migrates_current_security_schema_without_losing_admin_data() {
         let directory = TestDirectory::new("v3-security-migration");
         let database = directory.join("v3.db");
-        create_v4_database(&database, &directory.0);
+        create_current_database(&database, &directory.0);
         let conn = Connection::open(&database).unwrap();
         conn.execute_batch(
-            "DELETE FROM database_migrations WHERE version = 4;
+            "DELETE FROM database_migrations WHERE version >= 4;
              DROP TABLE traffic_gaps;
              DROP TABLE counter_checkpoints;
              DROP TABLE traffic_rollups;
@@ -1266,7 +1349,7 @@ mod tests {
             .unwrap(),
             "existing-admin"
         );
-        assert_eq!(schema::user_version(&conn).unwrap(), 4);
+        assert_eq!(schema::user_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
     }
 
     #[test]
@@ -1348,7 +1431,7 @@ mod tests {
     fn backup_has_private_permissions_checksum_and_exact_counts() {
         let directory = TestDirectory::new("backup");
         let database = directory.join("source.db");
-        create_v4_database(&database, &directory.0);
+        create_current_database(&database, &directory.0);
         let conn = Connection::open(&database).unwrap();
         conn.execute("INSERT INTO config VALUES ('theme', 'dark')", [])
             .unwrap();
@@ -1433,8 +1516,8 @@ mod tests {
         let source = directory.join("source.db");
         let target = directory.join("target.db");
         let backups = directory.join("backups");
-        create_v4_database(&source, &backups);
-        create_v4_database(&target, &backups);
+        create_current_database(&source, &backups);
+        create_current_database(&target, &backups);
         Connection::open(&source)
             .unwrap()
             .execute("INSERT INTO config VALUES ('marker', 'source')", [])
@@ -1469,8 +1552,8 @@ mod tests {
         let directory = TestDirectory::new("restore-tamper");
         let source = directory.join("source.db");
         let target = directory.join("target.db");
-        create_v4_database(&source, &directory.0);
-        create_v4_database(&target, &directory.0);
+        create_current_database(&source, &directory.0);
+        create_current_database(&target, &directory.0);
         Connection::open(&target)
             .unwrap()
             .execute("INSERT INTO config VALUES ('marker', 'untouched')", [])
@@ -1503,7 +1586,7 @@ mod tests {
         let source = directory.join("source.db");
         let target = directory.join("target.db");
         let backups = directory.join("backups");
-        create_v4_database(&source, &backups);
+        create_current_database(&source, &backups);
         Connection::open(&source)
             .unwrap()
             .execute("INSERT INTO config VALUES ('marker', 'source')", [])
@@ -1590,7 +1673,7 @@ mod tests {
     fn legacy_export_filters_sensitive_config_and_writes_verified_manifest() {
         let directory = TestDirectory::new("legacy-export");
         let database = directory.join("source.db");
-        create_v4_database(&database, &directory.0);
+        create_current_database(&database, &directory.0);
         let conn = Connection::open(&database).unwrap();
         conn.execute(
             "INSERT INTO config(key, value) VALUES ('theme', 'dark'), ('api_token', 'secret')",
@@ -1635,5 +1718,33 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn legacy_export_records_the_actual_source_schema_version() {
+        let directory = TestDirectory::new("legacy-export-source-version");
+        let database = directory.join("source.db");
+        create_current_database(&database, &directory.0);
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "DROP INDEX idx_traffic_samples_rollup_cutoff;
+             DELETE FROM database_migrations WHERE version = 5;
+             PRAGMA user_version = 4;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let destination = directory.join("legacy.db");
+        export_legacy(&database, &destination).unwrap();
+        let exported = Connection::open(&destination).unwrap();
+        let source_version: String = exported
+            .query_row(
+                "SELECT value FROM routerview_export_metadata
+                 WHERE key = 'source_user_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_version, "4");
     }
 }

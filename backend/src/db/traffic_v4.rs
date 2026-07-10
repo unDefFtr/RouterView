@@ -12,6 +12,14 @@ use super::types::{DatabaseError, DatabaseResult};
 use super::TrafficDb;
 
 const MAX_TRAFFIC_SOURCE_ROWS: usize = 1_000_000;
+const ROLLUP_SAMPLE_BATCH_SIZE: usize = 10_000;
+const ROLLUP_SAMPLE_BATCH_SQL: &str =
+    "SELECT id, router_id, interface_id, started_at_ms, ended_at_ms,
+            duration_ms, download_bytes, upload_bytes, quality
+     FROM traffic_samples INDEXED BY idx_traffic_samples_rollup_cutoff
+     WHERE started_at_ms < ?1
+     ORDER BY started_at_ms, id
+     LIMIT ?2";
 const TRAFFIC_QUERY_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const TRAFFIC_QUERY_PROGRESS_INTERVAL: i32 = 1_000;
 
@@ -565,14 +573,38 @@ impl TrafficDb {
         Ok(true)
     }
 
+    /// Roll up one bounded batch so a maintenance tick cannot load the full
+    /// raw-retention backlog into memory or monopolize the database indefinitely.
+    /// The return value counts raw rows fully removed; a long row can advance
+    /// through a remainder update while the returned count remains zero.
     pub fn rollup_exact_samples(
         &self,
         before_ms: i64,
         bucket_size_ms: i64,
     ) -> DatabaseResult<usize> {
+        self.rollup_exact_samples_batch(before_ms, bucket_size_ms, ROLLUP_SAMPLE_BATCH_SIZE)
+    }
+
+    fn rollup_exact_samples_batch(
+        &self,
+        before_ms: i64,
+        bucket_size_ms: i64,
+        batch_size: usize,
+    ) -> DatabaseResult<usize> {
         if bucket_size_ms <= 0 {
             return Err(DatabaseError::InvalidCommand(
                 "rollup bucket size must be positive".into(),
+            ));
+        }
+        let segment_budget = batch_size.checked_mul(2).ok_or_else(|| {
+            DatabaseError::InvalidCommand("rollup segment budget exceeds process limits".into())
+        })?;
+        let batch_size = i64::try_from(batch_size).map_err(|_| {
+            DatabaseError::InvalidCommand("rollup batch size exceeds SQLite limits".into())
+        })?;
+        if batch_size <= 0 {
+            return Err(DatabaseError::InvalidCommand(
+                "rollup batch size must be positive".into(),
             ));
         }
         let mut conn = self
@@ -582,14 +614,8 @@ impl TrafficDb {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let rollup_end_ms = before_ms;
         let samples = {
-            let mut statement = tx.prepare(
-                "SELECT id, router_id, interface_id, started_at_ms, ended_at_ms,
-                        duration_ms, download_bytes, upload_bytes, quality
-                 FROM traffic_samples
-                 WHERE started_at_ms < ?1
-                 ORDER BY router_id, interface_id, started_at_ms, ended_at_ms, id",
-            )?;
-            let rows = statement.query_map(params![rollup_end_ms], |row| {
+            let mut statement = tx.prepare(ROLLUP_SAMPLE_BATCH_SQL)?;
+            let rows = statement.query_map(params![rollup_end_ms, batch_size], |row| {
                 Ok(RawTrafficSample {
                     id: row.get(0)?,
                     router_id: row.get(1)?,
@@ -605,24 +631,28 @@ impl TrafficDb {
             rows.collect::<Result<Vec<_>, _>>()?
         };
 
-        let mut buckets: BTreeMap<(i64, i64, i64), (TrafficBucketAccumulator, i64)> =
+        let mut buckets: BTreeMap<(i64, i64, i64), (TrafficBucketAccumulator, i64, i64)> =
             BTreeMap::new();
         let mut fully_consumed = Vec::new();
         let mut remainders = Vec::new();
+        let mut remaining_segments = segment_budget;
         for sample in &samples {
+            if remaining_segments == 0 {
+                break;
+            }
             validate_raw_sample_for_rollup(sample)?;
-            let consumed_end = sample.ended_at_ms.min(rollup_end_ms);
-            if consumed_end <= sample.started_at_ms {
+            let planned_consumed_end = sample.ended_at_ms.min(rollup_end_ms);
+            if planned_consumed_end <= sample.started_at_ms {
                 continue;
             }
             let split_sample = sample.started_at_ms.div_euclid(bucket_size_ms)
-                != (consumed_end - 1).div_euclid(bucket_size_ms)
-                || consumed_end != sample.ended_at_ms;
+                != (planned_consumed_end - 1).div_euclid(bucket_size_ms)
+                || planned_consumed_end != sample.ended_at_ms;
             let mut segment_start = sample.started_at_ms;
-            while segment_start < consumed_end {
+            while segment_start < planned_consumed_end && remaining_segments > 0 {
                 let bucket_start = segment_start.div_euclid(bucket_size_ms) * bucket_size_ms;
                 let bucket_end = bucket_start.saturating_add(bucket_size_ms);
-                let segment_end = consumed_end.min(bucket_end);
+                let segment_end = planned_consumed_end.min(bucket_end);
                 let download_bytes = proportional_slice(
                     i128::from(sample.download_bytes),
                     sample.duration_ms,
@@ -636,10 +666,21 @@ impl TrafficDb {
                     segment_end.saturating_sub(sample.started_at_ms),
                 )?;
                 let segment_duration = segment_end.saturating_sub(segment_start);
-                let (bucket, accumulated_end) = buckets
+                let (bucket, _, accumulated_end) = buckets
                     .entry((sample.router_id, sample.interface_id, bucket_start))
-                    .or_insert_with(|| (TrafficBucketAccumulator::default(), segment_end));
-                *accumulated_end = (*accumulated_end).max(segment_end);
+                    .or_insert_with(|| {
+                        (
+                            TrafficBucketAccumulator::default(),
+                            segment_start,
+                            segment_start,
+                        )
+                    });
+                if segment_start < *accumulated_end {
+                    return Err(DatabaseError::Verification(
+                        "raw traffic samples overlap during rollup".into(),
+                    ));
+                }
+                *accumulated_end = segment_end;
                 if sample.quality == "exact" && !split_sample {
                     bucket.exact_download_bytes += download_bytes;
                     bucket.exact_upload_bytes += upload_bytes;
@@ -654,8 +695,10 @@ impl TrafficDb {
                 }
                 bucket.sample_count = bucket.sample_count.saturating_add(1);
                 segment_start = segment_end;
+                remaining_segments -= 1;
             }
 
+            let consumed_end = segment_start;
             if consumed_end == sample.ended_at_ms {
                 fully_consumed.push(sample.id);
             } else {
@@ -681,7 +724,8 @@ impl TrafficDb {
             }
         }
 
-        for ((router_id, interface_id, bucket_start), (bucket, bucket_end)) in buckets {
+        for ((router_id, interface_id, bucket_start), (bucket, batch_start, bucket_end)) in buckets
+        {
             let exact_download = i64::try_from(bucket.exact_download_bytes).map_err(|_| {
                 DatabaseError::Verification("rollup download byte total overflowed SQLite".into())
             })?;
@@ -707,7 +751,7 @@ impl TrafficDb {
                     "rollup bucket contains invalid or overlapping sample coverage".into(),
                 ));
             }
-            tx.execute(
+            let changed = tx.execute(
                 "INSERT INTO traffic_rollups(
                      router_id, interface_id, bucket_start_ms, bucket_end_ms, bucket_size_ms,
                      exact_download_bytes, exact_upload_bytes,
@@ -740,7 +784,21 @@ impl TrafficDb {
                          MAX(1, traffic_rollups.exact_duration_ms + traffic_rollups.estimated_duration_ms +
                                 excluded.exact_duration_ms + excluded.estimated_duration_ms),
                      bucket_end_ms = MAX(traffic_rollups.bucket_end_ms, excluded.bucket_end_ms),
-                     created_at_ms = excluded.created_at_ms",
+                     created_at_ms = excluded.created_at_ms
+                 WHERE traffic_rollups.exact_duration_ms + traffic_rollups.estimated_duration_ms +
+                       excluded.exact_duration_ms + excluded.estimated_duration_ms
+                       <= excluded.bucket_size_ms
+                   AND ?14 >= traffic_rollups.bucket_end_ms
+                   AND traffic_rollups.exact_download_bytes <=
+                       9223372036854775807 - excluded.exact_download_bytes
+                   AND traffic_rollups.exact_upload_bytes <=
+                       9223372036854775807 - excluded.exact_upload_bytes
+                   AND traffic_rollups.estimated_download_bytes <=
+                       9223372036854775807 - excluded.estimated_download_bytes
+                   AND traffic_rollups.estimated_upload_bytes <=
+                       9223372036854775807 - excluded.estimated_upload_bytes
+                   AND traffic_rollups.sample_count <=
+                       9223372036854775807 - excluded.sample_count",
                 params![
                     router_id,
                     interface_id,
@@ -755,8 +813,14 @@ impl TrafficDb {
                     bucket.estimated_duration_ms,
                     bucket.sample_count,
                     before_ms,
+                    batch_start,
                 ],
             )?;
+            if changed != 1 {
+                return Err(DatabaseError::Verification(
+                    "rollup bucket update violates coverage ordering or integer limits".into(),
+                ));
+            }
         }
 
         for remainder in remainders {
@@ -2066,6 +2130,7 @@ mod tests {
             .unwrap());
 
         assert_eq!(db.rollup_exact_samples(63_000, 60_000).unwrap(), 0);
+        assert_eq!(db.rollup_exact_samples(63_000, 60_000).unwrap(), 0);
         let partially_rolled = db
             .query_traffic_v4(&TrafficQuery {
                 router_id: router.id,
@@ -2093,6 +2158,351 @@ mod tests {
         assert_eq!(fully_rolled.totals.download_bytes, "1001");
         assert_eq!(fully_rolled.totals.upload_bytes, "501");
         assert_eq!(fully_rolled.coverage.covered_duration_ms, 20_000);
+    }
+
+    #[test]
+    fn rollup_batches_bound_work_without_losing_bucket_precision() {
+        let db = database();
+        let router = db.resolve_router(None, "192.0.2.1", 1_000).unwrap();
+        let interface = db
+            .upsert_router_interface(router.id, "ether1", "WAN", "wan", None, 1_000)
+            .unwrap();
+        for index in 0..5 {
+            insert_sample(
+                &db,
+                router.id,
+                interface.id,
+                index * 5_000,
+                TrafficQuality::Exact,
+            );
+        }
+
+        assert_eq!(db.rollup_exact_samples_batch(60_000, 60_000, 2).unwrap(), 2);
+        let remaining: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM traffic_samples", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 3);
+        assert_eq!(db.rollup_exact_samples_batch(60_000, 60_000, 2).unwrap(), 2);
+        assert_eq!(db.rollup_exact_samples_batch(60_000, 60_000, 2).unwrap(), 1);
+        assert_eq!(db.rollup_exact_samples_batch(60_000, 60_000, 2).unwrap(), 0);
+
+        let result = db
+            .query_traffic_v4(&TrafficQuery {
+                router_id: router.id,
+                interface_id: interface.id,
+                from_ms: 0,
+                to_ms: 60_000,
+                max_points: 60,
+            })
+            .unwrap();
+        assert_eq!(result.totals.download_bytes, "5000");
+        assert_eq!(result.totals.upload_bytes, "2500");
+        assert_eq!(result.coverage.exact_duration_ms, 25_000);
+        assert_eq!(result.points.len(), 1);
+        assert_eq!(result.points[0].sample_count, 5);
+    }
+
+    #[test]
+    fn rollup_batches_isolate_interleaved_router_interfaces() {
+        let db = database();
+        let first_router = db.resolve_router(None, "192.0.2.1", 1_000).unwrap();
+        let second_router = db.resolve_router(None, "192.0.2.2", 1_000).unwrap();
+        let streams = [
+            (
+                first_router.id,
+                db.upsert_router_interface(first_router.id, "ether1", "WAN 1", "wan", None, 1_000)
+                    .unwrap()
+                    .id,
+            ),
+            (
+                first_router.id,
+                db.upsert_router_interface(first_router.id, "ether2", "WAN 2", "wan", None, 1_000)
+                    .unwrap()
+                    .id,
+            ),
+            (
+                second_router.id,
+                db.upsert_router_interface(second_router.id, "ether1", "WAN 1", "wan", None, 1_000)
+                    .unwrap()
+                    .id,
+            ),
+            (
+                second_router.id,
+                db.upsert_router_interface(second_router.id, "ether2", "WAN 2", "wan", None, 1_000)
+                    .unwrap()
+                    .id,
+            ),
+        ];
+        for started_at_ms in [0, 5_000] {
+            for (router_id, interface_id) in streams {
+                insert_sample(
+                    &db,
+                    router_id,
+                    interface_id,
+                    started_at_ms,
+                    TrafficQuality::Exact,
+                );
+            }
+        }
+
+        assert_eq!(db.rollup_exact_samples_batch(60_000, 60_000, 3).unwrap(), 3);
+        assert_eq!(db.rollup_exact_samples_batch(60_000, 60_000, 3).unwrap(), 3);
+        assert_eq!(db.rollup_exact_samples_batch(60_000, 60_000, 3).unwrap(), 2);
+        assert_eq!(db.rollup_exact_samples_batch(60_000, 60_000, 3).unwrap(), 0);
+
+        for (router_id, interface_id) in streams {
+            let result = db
+                .query_traffic_v4(&TrafficQuery {
+                    router_id,
+                    interface_id,
+                    from_ms: 0,
+                    to_ms: 60_000,
+                    max_points: 60,
+                })
+                .unwrap();
+            assert_eq!(result.totals.download_bytes, "2000");
+            assert_eq!(result.totals.upload_bytes, "1000");
+            assert_eq!(result.coverage.exact_duration_ms, 10_000);
+            assert_eq!(result.points.len(), 1);
+            assert_eq!(result.points[0].sample_count, 2);
+        }
+    }
+
+    #[test]
+    fn rollup_batch_query_uses_cutoff_index_without_a_temp_sort() {
+        let db = database();
+        let conn = db.conn.lock().unwrap();
+        let plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {ROLLUP_SAMPLE_BATCH_SQL}"))
+            .unwrap()
+            .query_map(params![60_000, 10], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(plan.iter().any(|detail| {
+            detail.contains("SEARCH traffic_samples")
+                && detail.contains("idx_traffic_samples_rollup_cutoff")
+                && detail.contains("started_at_ms<?")
+        }));
+        assert!(!plan
+            .iter()
+            .any(|detail| detail.contains("SCAN traffic_samples")));
+        assert!(!plan.iter().any(|detail| detail.contains("TEMP B-TREE")));
+    }
+
+    #[test]
+    fn rollup_batches_reject_overlaps_even_below_bucket_coverage() {
+        let db = database();
+        let router = db.resolve_router(None, "192.0.2.1", 1_000).unwrap();
+        let interface = db
+            .upsert_router_interface(router.id, "ether1", "WAN", "wan", None, 1_000)
+            .unwrap();
+        for (started_at_ms, ended_at_ms, counter) in
+            [(20_000, 40_000, "4000"), (30_000, 50_000, "8000")]
+        {
+            assert!(db
+                .commit_sample_and_checkpoint(
+                    &TrafficSampleInput {
+                        router_id: router.id,
+                        interface_id: interface.id,
+                        started_at_ms,
+                        ended_at_ms,
+                        duration_ms: 20_000,
+                        download_bytes: 2_000,
+                        upload_bytes: 1_000,
+                        download_bps: 800.0,
+                        upload_bps: 400.0,
+                        quality: TrafficQuality::Exact,
+                        source: "overlap-fixture",
+                    },
+                    &CounterCheckpointInput {
+                        router_id: router.id,
+                        interface_id: interface.id,
+                        rx_counter: counter,
+                        tx_counter: counter,
+                        observed_at_ms: ended_at_ms,
+                        reboot_marker: Some("boot-a"),
+                    },
+                )
+                .unwrap());
+        }
+
+        let same_batch_error = db
+            .rollup_exact_samples_batch(60_000, 60_000, 2)
+            .unwrap_err();
+        assert!(same_batch_error
+            .to_string()
+            .contains("raw traffic samples overlap"));
+        let (raw_samples, rollups): (i64, i64) = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM traffic_samples),
+                        (SELECT COUNT(*) FROM traffic_rollups)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((raw_samples, rollups), (2, 0));
+
+        assert_eq!(db.rollup_exact_samples_batch(60_000, 60_000, 1).unwrap(), 1);
+        let error = db
+            .rollup_exact_samples_batch(60_000, 60_000, 1)
+            .unwrap_err();
+        assert!(error.to_string().contains("coverage ordering"));
+        let (raw_samples, rollups): (i64, i64) = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM traffic_samples),
+                        (SELECT COUNT(*) FROM traffic_rollups)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((raw_samples, rollups), (1, 1));
+    }
+
+    #[test]
+    fn rollup_batches_reject_cumulative_sqlite_integer_overflow() {
+        let db = database();
+        let router = db.resolve_router(None, "192.0.2.1", 1_000).unwrap();
+        let interface = db
+            .upsert_router_interface(router.id, "ether1", "WAN", "wan", None, 1_000)
+            .unwrap();
+        let bytes_per_sample = i64::MAX / 2 + 1;
+        for index in 0..2 {
+            let started_at_ms = index * 5_000;
+            let ended_at_ms = started_at_ms + 5_000;
+            let counter = (index + 1).to_string();
+            assert!(db
+                .commit_sample_and_checkpoint(
+                    &TrafficSampleInput {
+                        router_id: router.id,
+                        interface_id: interface.id,
+                        started_at_ms,
+                        ended_at_ms,
+                        duration_ms: 5_000,
+                        download_bytes: bytes_per_sample,
+                        upload_bytes: 0,
+                        download_bps: bytes_per_sample as f64 * 1.6,
+                        upload_bps: 0.0,
+                        quality: TrafficQuality::Exact,
+                        source: "overflow-fixture",
+                    },
+                    &CounterCheckpointInput {
+                        router_id: router.id,
+                        interface_id: interface.id,
+                        rx_counter: &counter,
+                        tx_counter: &counter,
+                        observed_at_ms: ended_at_ms,
+                        reboot_marker: Some("boot-a"),
+                    },
+                )
+                .unwrap());
+        }
+
+        assert_eq!(db.rollup_exact_samples_batch(60_000, 60_000, 1).unwrap(), 1);
+        let error = db
+            .rollup_exact_samples_batch(60_000, 60_000, 1)
+            .unwrap_err();
+        assert!(error.to_string().contains("integer limits"));
+        let (raw_samples, stored_bytes): (i64, i64) = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM traffic_samples), exact_download_bytes
+                 FROM traffic_rollups",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(raw_samples, 1);
+        assert_eq!(stored_bytes, bytes_per_sample);
+    }
+
+    #[test]
+    fn rollup_segment_budget_splits_long_samples_without_byte_loss() {
+        let db = database();
+        let router = db.resolve_router(None, "192.0.2.1", 1_000).unwrap();
+        let interface = db
+            .upsert_router_interface(router.id, "ether1", "WAN", "wan", None, 1_000)
+            .unwrap();
+        assert!(db
+            .commit_sample_and_checkpoint(
+                &TrafficSampleInput {
+                    router_id: router.id,
+                    interface_id: interface.id,
+                    started_at_ms: 0,
+                    ended_at_ms: 180_000,
+                    duration_ms: 180_000,
+                    download_bytes: 1_801,
+                    upload_bytes: 901,
+                    download_bps: 80.04444444444445,
+                    upload_bps: 40.044444444444444,
+                    quality: TrafficQuality::Exact,
+                    source: "long-fixture",
+                },
+                &CounterCheckpointInput {
+                    router_id: router.id,
+                    interface_id: interface.id,
+                    rx_counter: "1801",
+                    tx_counter: "901",
+                    observed_at_ms: 180_000,
+                    reboot_marker: Some("boot-a"),
+                },
+            )
+            .unwrap());
+
+        assert_eq!(
+            db.rollup_exact_samples_batch(180_000, 60_000, 1).unwrap(),
+            0
+        );
+        let remainder_start: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT started_at_ms FROM traffic_samples", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(remainder_start, 120_000);
+        let partial = db
+            .query_traffic_v4(&TrafficQuery {
+                router_id: router.id,
+                interface_id: interface.id,
+                from_ms: 0,
+                to_ms: 180_000,
+                max_points: 180,
+            })
+            .unwrap();
+        assert_eq!(partial.totals.download_bytes, "1801");
+        assert_eq!(partial.totals.upload_bytes, "901");
+        assert_eq!(partial.coverage.covered_duration_ms, 180_000);
+
+        assert_eq!(
+            db.rollup_exact_samples_batch(180_000, 60_000, 1).unwrap(),
+            1
+        );
+        let completed = db
+            .query_traffic_v4(&TrafficQuery {
+                router_id: router.id,
+                interface_id: interface.id,
+                from_ms: 0,
+                to_ms: 180_000,
+                max_points: 180,
+            })
+            .unwrap();
+        assert_eq!(completed.totals.download_bytes, "1801");
+        assert_eq!(completed.totals.upload_bytes, "901");
+        assert_eq!(completed.coverage.covered_duration_ms, 180_000);
     }
 
     #[test]

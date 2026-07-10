@@ -110,6 +110,17 @@ pub fn apply_migrations(
                 before,
             )?;
         }
+        if original_version < 5 {
+            migrate_v5_rollup_cutoff_index(&tx)?;
+            record_migration(
+                &tx,
+                5,
+                "traffic_rollup_cutoff_index",
+                original_version,
+                backup,
+                before,
+            )?;
+        }
 
         let after = legacy_counts(&tx)?;
         if before != after {
@@ -520,6 +531,14 @@ fn migrate_v4_exact_traffic(conn: &Connection, legacy: LegacyCounts) -> Database
             legacy.traffic_points,
         )));
     }
+    Ok(())
+}
+
+fn migrate_v5_rollup_cutoff_index(conn: &Connection) -> DatabaseResult<()> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_traffic_samples_rollup_cutoff
+             ON traffic_samples(started_at_ms, id);",
+    )?;
     Ok(())
 }
 
