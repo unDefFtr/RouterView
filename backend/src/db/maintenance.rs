@@ -621,8 +621,18 @@ fn create_verified_backup(
     source: &Connection,
     destination: &Path,
 ) -> DatabaseResult<BackupArtifact> {
-    refuse_plaintext_secret_backup(source)?;
-    let source_report = check_connection(source_path, source)?;
+    create_verified_backup_inner(source_path, source, destination, || {})
+}
+
+fn create_verified_backup_inner<F>(
+    source_path: &Path,
+    source: &Connection,
+    destination: &Path,
+    before_snapshot: F,
+) -> DatabaseResult<BackupArtifact>
+where
+    F: FnOnce(),
+{
     if destination.exists() || manifest_path(destination).exists() {
         return Err(DatabaseError::InvalidCommand(format!(
             "backup destination already exists: {}",
@@ -636,16 +646,13 @@ fn create_verified_backup(
     create_private_empty_file(&temporary)?;
 
     let result = (|| -> DatabaseResult<DatabaseReport> {
+        before_snapshot();
         source.backup(MAIN_DB, &temporary, None)?;
         let backup_conn = open_read_only(&temporary)?;
+        // The live source may advance during an online backup. Security and
+        // consistency guarantees therefore come exclusively from the snapshot.
+        refuse_plaintext_secret_backup(&backup_conn)?;
         let backup_report = check_connection(&temporary, &backup_conn)?;
-        if backup_report.user_version != source_report.user_version
-            || backup_report.table_counts != source_report.table_counts
-        {
-            return Err(DatabaseError::Verification(
-                "online backup row counts or schema version differ from source".into(),
-            ));
-        }
         drop(backup_conn);
         sync_file(&temporary)?;
         set_private_permissions(&temporary)?;
@@ -1356,6 +1363,68 @@ mod tests {
             0o600
         );
         assert_eq!(backup.table_counts.get("config"), Some(&1));
+    }
+
+    #[test]
+    fn backup_succeeds_while_traffic_db_holds_lifetime_lock() {
+        let directory = TestDirectory::new("backup-with-runtime-lock");
+        let database = directory.join("source.db");
+        let db = crate::db::TrafficDb::open(&database).unwrap();
+        db.set_config("theme", "dark").unwrap();
+        assert!(matches!(
+            DatabaseLock::acquire(&database),
+            Err(DatabaseError::InUse(_))
+        ));
+
+        let destination = directory.join("verified.db");
+        let backup = backup_database(&database, &destination).unwrap();
+
+        assert_eq!(backup.table_counts.get("config"), Some(&1));
+        verify_manifest(&destination).unwrap();
+        assert!(matches!(
+            DatabaseLock::acquire(&database),
+            Err(DatabaseError::InUse(_))
+        ));
+    }
+
+    #[test]
+    fn backup_report_comes_from_snapshot_during_concurrent_runtime_write() {
+        let directory = TestDirectory::new("backup-with-concurrent-writer");
+        let database = directory.join("source.db");
+        let db = std::sync::Arc::new(crate::db::TrafficDb::open(&database).unwrap());
+        db.set_config("before_backup", "present").unwrap();
+
+        let (start_write_tx, start_write_rx) = std::sync::mpsc::sync_channel(0);
+        let (write_finished_tx, write_finished_rx) = std::sync::mpsc::sync_channel(0);
+        let writer_db = std::sync::Arc::clone(&db);
+        let writer = std::thread::spawn(move || {
+            start_write_rx.recv().unwrap();
+            writer_db.set_config("during_backup", "committed").unwrap();
+            write_finished_tx.send(()).unwrap();
+        });
+
+        let source = open_read_only(&database).unwrap();
+        let destination = directory.join("verified.db");
+        let backup = create_verified_backup_inner(&database, &source, &destination, || {
+            start_write_tx.send(()).unwrap();
+            write_finished_rx.recv().unwrap();
+        })
+        .unwrap();
+        writer.join().unwrap();
+
+        assert_eq!(backup.table_counts.get("config"), Some(&2));
+        let backup_conn = open_read_only(&destination).unwrap();
+        let written_value: String = backup_conn
+            .query_row(
+                "SELECT value FROM config WHERE key = 'during_backup'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(written_value, "committed");
+        let checked = check_connection(&destination, &backup_conn).unwrap();
+        assert_eq!(checked.user_version, backup.user_version);
+        assert_eq!(checked.table_counts, backup.table_counts);
     }
 
     #[test]
