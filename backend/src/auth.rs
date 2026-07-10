@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     fs::OpenOptions,
+    hash::Hash,
     io::Write,
     net::{IpAddr, SocketAddr},
     path::Path as FsPath,
@@ -50,16 +51,17 @@ const SETUP_SECS: i64 = SETUP_TOKEN_TTL_SECS as i64;
 const ARGON2_CONCURRENCY: usize = 2;
 const ARGON2_WAIT_TIMEOUT: Duration = Duration::from_millis(250);
 const HTTP_SESSION_TOUCH_SECS: i64 = 5 * 60;
-const LOGIN_FAILURE_CAPACITY: usize = 1_024;
-const LOGIN_FAILURE_TTL: Duration = Duration::from_secs(15 * 60);
-const LOGIN_BACKOFF_MAX_SECS: u64 = 60;
+const AUTH_FAILURE_CAPACITY: usize = 1_024;
+const AUTH_FAILURE_TTL: Duration = Duration::from_secs(15 * 60);
+const AUTH_BACKOFF_MAX_SECS: u64 = 60;
 const CLIENT_IP_HEADER: &str = "x-real-ip";
 
-/// Process-wide password verification limits and login timing state.
+/// Process-wide authentication work limits and source-aware timing state.
 pub struct AuthSecurity {
     argon2_slots: Arc<Semaphore>,
     dummy_password_hash: String,
-    login_failures: LoginFailureLimiter,
+    login_failures: FailureLimiter<LoginFailureKey>,
+    pairing_attempts: FailureLimiter<PairingFailureKey>,
     trusted_proxy_cidrs: Vec<IpNet>,
 }
 
@@ -68,7 +70,8 @@ impl AuthSecurity {
         Ok(Self {
             argon2_slots: Arc::new(Semaphore::new(ARGON2_CONCURRENCY)),
             dummy_password_hash: hash_password_sync(&random_token())?,
-            login_failures: LoginFailureLimiter::default(),
+            login_failures: FailureLimiter::default(),
+            pairing_attempts: FailureLimiter::default(),
             trusted_proxy_cidrs,
         })
     }
@@ -101,27 +104,49 @@ enum LoginFailureKey {
     Source(IpAddr),
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum PairingFailureKey {
+    Source(IpAddr),
+    Overflow,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PairingAttempt {
+    key: PairingFailureKey,
+    started_at: Instant,
+}
+
 #[derive(Clone, Copy, Debug)]
-struct LoginFailureState {
+struct FailureState {
     failures: u8,
     blocked_until: Instant,
     last_failure: Instant,
     last_seen: Instant,
 }
 
-#[derive(Default)]
-struct LoginFailureLimiter {
-    entries: Mutex<HashMap<LoginFailureKey, LoginFailureState>>,
+struct FailureLimiter<K> {
+    entries: Mutex<HashMap<K, FailureState>>,
 }
 
-impl LoginFailureLimiter {
-    fn retry_after(&self, key: &LoginFailureKey, now: Instant) -> Option<u64> {
+impl<K> Default for FailureLimiter<K> {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl<K> FailureLimiter<K>
+where
+    K: Clone + Eq + Hash,
+{
+    fn retry_after(&self, key: &K, now: Instant) -> Option<u64> {
         let mut entries = self
             .entries
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let state = entries.get_mut(key)?;
-        if now.saturating_duration_since(state.last_seen) >= LOGIN_FAILURE_TTL {
+        if now.saturating_duration_since(state.last_seen) >= AUTH_FAILURE_TTL {
             entries.remove(key);
             return None;
         }
@@ -129,39 +154,16 @@ impl LoginFailureLimiter {
         (state.blocked_until > now).then(|| retry_after_seconds(state.blocked_until, now))
     }
 
-    fn record_failure(&self, key: LoginFailureKey, now: Instant) -> u64 {
+    fn record_failure(&self, key: K, now: Instant) -> u64 {
         let mut entries = self
             .entries
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        entries
-            .retain(|_, state| now.saturating_duration_since(state.last_seen) < LOGIN_FAILURE_TTL);
-
-        if !entries.contains_key(&key) && entries.len() >= LOGIN_FAILURE_CAPACITY {
-            if let Some(oldest) = entries
-                .iter()
-                .min_by_key(|(_, state)| state.last_seen)
-                .map(|(key, _)| key.clone())
-            {
-                entries.remove(&oldest);
-            }
-        }
-
-        let state = entries.entry(key).or_insert(LoginFailureState {
-            failures: 0,
-            blocked_until: now,
-            last_failure: now,
-            last_seen: now,
-        });
-        state.failures = state.failures.saturating_add(1).min(7);
-        let backoff_secs = (1_u64 << (state.failures - 1)).min(LOGIN_BACKOFF_MAX_SECS);
-        state.blocked_until = now + Duration::from_secs(backoff_secs);
-        state.last_failure = now;
-        state.last_seen = now;
-        backoff_secs
+        expire_failure_entries(&mut entries, now);
+        record_failure_locked(&mut entries, key, now)
     }
 
-    fn clear_if_latest(&self, key: &LoginFailureKey, attempt_started_at: Instant) {
+    fn clear_if_latest(&self, key: &K, attempt_started_at: Instant) {
         let mut entries = self
             .entries
             .lock()
@@ -173,6 +175,118 @@ impl LoginFailureLimiter {
             entries.remove(key);
         }
     }
+}
+
+impl FailureLimiter<PairingFailureKey> {
+    fn begin_pairing_attempt(&self, source: IpAddr, now: Instant) -> Result<PairingAttempt, u64> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let source_key = PairingFailureKey::Source(source);
+        let key = if entries.contains_key(&source_key) || entries.len() < AUTH_FAILURE_CAPACITY {
+            source_key
+        } else {
+            // Preserve tracked penalties at capacity; excess addresses share one backoff bucket.
+            let overflow_key = PairingFailureKey::Overflow;
+            if entries.get(&overflow_key).is_some_and(|state| {
+                now.saturating_duration_since(state.last_seen) >= AUTH_FAILURE_TTL
+            }) {
+                entries.remove(&overflow_key);
+            }
+            if let Some(state) = entries.get_mut(&overflow_key) {
+                state.last_seen = now;
+                if state.blocked_until > now {
+                    return Err(retry_after_seconds(state.blocked_until, now));
+                }
+            }
+
+            expire_failure_entries(&mut entries, now);
+            let tracked_sources = entries
+                .keys()
+                .filter(|key| matches!(key, PairingFailureKey::Source(_)))
+                .count();
+            if tracked_sources < AUTH_FAILURE_CAPACITY {
+                entries.remove(&overflow_key);
+                source_key
+            } else {
+                overflow_key
+            }
+        };
+
+        begin_failure_attempt_locked(&mut entries, key, now)?;
+        Ok(PairingAttempt {
+            key,
+            started_at: now,
+        })
+    }
+}
+
+fn expire_failure_entries<K>(entries: &mut HashMap<K, FailureState>, now: Instant) {
+    entries.retain(|_, state| now.saturating_duration_since(state.last_seen) < AUTH_FAILURE_TTL);
+}
+
+fn record_failure_locked<K>(entries: &mut HashMap<K, FailureState>, key: K, now: Instant) -> u64
+where
+    K: Clone + Eq + Hash,
+{
+    if !entries.contains_key(&key) && entries.len() >= AUTH_FAILURE_CAPACITY {
+        if let Some(oldest) = entries
+            .iter()
+            .min_by_key(|(_, state)| state.last_seen)
+            .map(|(key, _)| key.clone())
+        {
+            entries.remove(&oldest);
+        }
+    }
+
+    record_failure_entry_locked(entries, key, now)
+}
+
+fn begin_failure_attempt_locked<K>(
+    entries: &mut HashMap<K, FailureState>,
+    key: K,
+    now: Instant,
+) -> Result<(), u64>
+where
+    K: Eq + Hash,
+{
+    if entries
+        .get(&key)
+        .is_some_and(|state| now.saturating_duration_since(state.last_seen) >= AUTH_FAILURE_TTL)
+    {
+        entries.remove(&key);
+    }
+    if let Some(state) = entries.get_mut(&key) {
+        state.last_seen = now;
+        if state.blocked_until > now {
+            return Err(retry_after_seconds(state.blocked_until, now));
+        }
+    }
+    record_failure_entry_locked(entries, key, now);
+    Ok(())
+}
+
+fn record_failure_entry_locked<K>(
+    entries: &mut HashMap<K, FailureState>,
+    key: K,
+    now: Instant,
+) -> u64
+where
+    K: Eq + Hash,
+{
+    let state = entries.entry(key).or_insert(FailureState {
+        failures: 0,
+        blocked_until: now,
+        last_failure: now,
+        last_seen: now,
+    });
+    state.failures = state.failures.saturating_add(1).min(7);
+    let backoff_secs = (1_u64 << (state.failures - 1)).min(AUTH_BACKOFF_MAX_SECS);
+    state.blocked_until = now + Duration::from_secs(backoff_secs);
+    state.last_failure = now;
+    state.last_seen = now;
+    backoff_secs
 }
 
 fn retry_after_seconds(blocked_until: Instant, now: Instant) -> u64 {
@@ -523,14 +637,23 @@ pub async fn create_pairing(
 
 pub async fn pair(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(connection): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     ApiJson(body): ApiJson<PairRequest>,
 ) -> Result<Response, AppError> {
+    let source = state.auth_security.client_ip(connection.ip(), &headers)?;
+    let attempt = state
+        .auth_security
+        .pairing_attempts
+        .begin_pairing_attempt(source, Instant::now())
+        .map_err(|retry_after_secs| AppError::RateLimited { retry_after_secs })?;
+    let code_hash = validated_token_hash(&body.code)?;
     let token = random_token();
     let csrf = random_token();
     let session = state
         .traffic_db
         .consume_pairing_and_insert_session(
-            &hash_token(body.code.trim()),
+            &code_hash,
             unix_time(),
             &uuid::Uuid::new_v4().to_string(),
             &hash_token(&token),
@@ -539,6 +662,10 @@ pub async fn pair(
             FIXED_ADMIN_SECS,
         )?
         .ok_or(AppError::Unauthorized)?;
+    state
+        .auth_security
+        .pairing_attempts
+        .clear_if_latest(&attempt.key, attempt.started_at);
     session_response(&session, &token, &csrf)
 }
 
@@ -1028,7 +1155,7 @@ fn verify_password_sync(password: &str, encoded: &str) -> Result<bool, AppError>
         .is_ok())
 }
 
-fn validate_setup_token(db: &TrafficDb, token: &str, now: i64) -> Result<Vec<u8>, AppError> {
+fn validated_token_hash(token: &str) -> Result<Vec<u8>, AppError> {
     let token = token.trim();
     if token.len() != 43
         || !token
@@ -1037,7 +1164,11 @@ fn validate_setup_token(db: &TrafficDb, token: &str, now: i64) -> Result<Vec<u8>
     {
         return Err(AppError::Unauthorized);
     }
-    let token_hash = hash_token(token);
+    Ok(hash_token(token))
+}
+
+fn validate_setup_token(db: &TrafficDb, token: &str, now: i64) -> Result<Vec<u8>, AppError> {
+    let token_hash = validated_token_hash(token)?;
     if !db.setup_token_is_valid(&token_hash, now)? {
         return Err(AppError::Unauthorized);
     }
@@ -1143,7 +1274,7 @@ mod tests {
 
     #[test]
     fn login_failures_back_off_and_remain_bounded() {
-        let limiter = LoginFailureLimiter::default();
+        let limiter = FailureLimiter::default();
         let now = Instant::now();
         let key = login_key("admin");
 
@@ -1159,7 +1290,7 @@ mod tests {
             Some(2)
         );
 
-        for index in 0..(LOGIN_FAILURE_CAPACITY + 25) {
+        for index in 0..(AUTH_FAILURE_CAPACITY + 25) {
             limiter.record_failure(login_key(&format!("user-{index}")), now);
         }
         assert_eq!(
@@ -1168,13 +1299,13 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .len(),
-            LOGIN_FAILURE_CAPACITY
+            AUTH_FAILURE_CAPACITY
         );
     }
 
     #[test]
     fn source_backoff_cannot_be_bypassed_by_rotating_usernames() {
-        let limiter = LoginFailureLimiter::default();
+        let limiter = FailureLimiter::default();
         let now = Instant::now();
         let source = LoginFailureKey::Source("192.0.2.10".parse().unwrap());
         limiter.record_failure(source.clone(), now);
@@ -1183,7 +1314,7 @@ mod tests {
 
     #[test]
     fn successful_attempt_does_not_clear_a_newer_failure() {
-        let limiter = LoginFailureLimiter::default();
+        let limiter = FailureLimiter::default();
         let key = login_key("admin");
         let first = Instant::now();
         let newer = first + Duration::from_millis(1);
@@ -1195,6 +1326,148 @@ mod tests {
 
         limiter.clear_if_latest(&key, newer);
         assert!(limiter.retry_after(&key, newer).is_none());
+    }
+
+    #[test]
+    fn pairing_code_validation_accepts_generated_tokens() {
+        let token = random_token();
+        assert_eq!(validated_token_hash(&token).unwrap(), hash_token(&token));
+        assert_eq!(
+            validated_token_hash(&format!(" \t{token}\n")).unwrap(),
+            hash_token(&token)
+        );
+    }
+
+    #[test]
+    fn pairing_code_validation_rejects_invalid_shapes() {
+        let token = random_token();
+        let invalid = [
+            String::new(),
+            token[..42].to_string(),
+            format!("{token}A"),
+            format!("{}+", &token[..42]),
+            format!("{}/", &token[..42]),
+            format!("{}=", &token[..42]),
+            format!("{} {}", &token[..21], &token[22..]),
+            format!("é{}", &token[2..]),
+        ];
+        for code in invalid {
+            assert!(matches!(
+                validated_token_hash(&code),
+                Err(AppError::Unauthorized)
+            ));
+        }
+    }
+
+    #[test]
+    fn pairing_attempts_back_off_per_source() {
+        let limiter = FailureLimiter::default();
+        let now = Instant::now();
+        let first_source: IpAddr = "192.0.2.10".parse().unwrap();
+        let second_source: IpAddr = "192.0.2.11".parse().unwrap();
+
+        let first = limiter.begin_pairing_attempt(first_source, now).unwrap();
+        assert_eq!(first.key, PairingFailureKey::Source(first_source));
+        assert_eq!(first.started_at, now);
+        assert_eq!(limiter.begin_pairing_attempt(first_source, now), Err(1));
+        assert!(limiter.begin_pairing_attempt(second_source, now).is_ok());
+
+        let next = now + Duration::from_secs(1);
+        assert!(limiter.begin_pairing_attempt(first_source, next).is_ok());
+        assert_eq!(limiter.begin_pairing_attempt(first_source, next), Err(2));
+    }
+
+    #[test]
+    fn pairing_attempt_state_expires_and_remains_bounded() {
+        let limiter = FailureLimiter::default();
+        let now = Instant::now();
+        let source: IpAddr = "192.0.2.10".parse().unwrap();
+        limiter.begin_pairing_attempt(source, now).unwrap();
+
+        let after_ttl = now + AUTH_FAILURE_TTL;
+        assert_eq!(
+            limiter
+                .begin_pairing_attempt(source, after_ttl)
+                .unwrap()
+                .started_at,
+            after_ttl
+        );
+        assert_eq!(
+            limiter
+                .entries
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(&PairingFailureKey::Source(source))
+                .map(|state| state.failures),
+            Some(1)
+        );
+
+        for index in 0..(AUTH_FAILURE_CAPACITY - 1) {
+            let source = IpAddr::V6(std::net::Ipv6Addr::from(index as u128 + 1));
+            limiter.begin_pairing_attempt(source, after_ttl).unwrap();
+        }
+        let overflow_source = IpAddr::V6(std::net::Ipv6Addr::from(u128::MAX));
+        let overflow = limiter
+            .begin_pairing_attempt(overflow_source, after_ttl)
+            .unwrap();
+        assert_eq!(overflow.key, PairingFailureKey::Overflow);
+        assert_eq!(
+            limiter.begin_pairing_attempt(
+                IpAddr::V6(std::net::Ipv6Addr::from(u128::MAX - 1)),
+                after_ttl,
+            ),
+            Err(1)
+        );
+        let entries = limiter
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(entries.len(), AUTH_FAILURE_CAPACITY + 1);
+        assert!(entries.contains_key(&PairingFailureKey::Source(source)));
+    }
+
+    #[test]
+    fn pairing_attempt_check_and_record_is_atomic() {
+        let limiter = Arc::new(FailureLimiter::default());
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let source: IpAddr = "192.0.2.10".parse().unwrap();
+        let now = Instant::now();
+        let attempts: Vec<_> = (0..8)
+            .map(|_| {
+                let limiter = limiter.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    limiter.begin_pairing_attempt(source, now)
+                })
+            })
+            .collect();
+
+        assert_eq!(
+            attempts
+                .into_iter()
+                .map(|attempt| attempt.join().unwrap())
+                .filter(Result::is_ok)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn successful_pairing_does_not_clear_a_newer_attempt() {
+        let limiter = FailureLimiter::default();
+        let source: IpAddr = "192.0.2.10".parse().unwrap();
+        let first = limiter
+            .begin_pairing_attempt(source, Instant::now())
+            .unwrap();
+        let newer_at = first.started_at + Duration::from_secs(1);
+        let newer = limiter.begin_pairing_attempt(source, newer_at).unwrap();
+
+        limiter.clear_if_latest(&first.key, first.started_at);
+        assert_eq!(limiter.retry_after(&newer.key, newer_at), Some(2));
+
+        limiter.clear_if_latest(&newer.key, newer.started_at);
+        assert_eq!(limiter.retry_after(&newer.key, newer_at), None);
     }
 
     #[test]
@@ -1257,7 +1530,8 @@ mod tests {
         let security = Arc::new(AuthSecurity {
             argon2_slots: Arc::new(Semaphore::new(ARGON2_CONCURRENCY)),
             dummy_password_hash: String::new(),
-            login_failures: LoginFailureLimiter::default(),
+            login_failures: FailureLimiter::default(),
+            pairing_attempts: FailureLimiter::default(),
             trusted_proxy_cidrs: Vec::new(),
         });
         let first = security.acquire_argon2().await.unwrap();
@@ -1313,7 +1587,8 @@ mod tests {
         let security = Arc::new(AuthSecurity {
             argon2_slots: Arc::new(Semaphore::new(1)),
             dummy_password_hash: String::new(),
-            login_failures: LoginFailureLimiter::default(),
+            login_failures: FailureLimiter::default(),
+            pairing_attempts: FailureLimiter::default(),
             trusted_proxy_cidrs: Vec::new(),
         });
         let permit = security.acquire_argon2().await.unwrap();

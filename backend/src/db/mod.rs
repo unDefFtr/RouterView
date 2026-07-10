@@ -1356,6 +1356,48 @@ mod security_tests {
     }
 
     #[test]
+    fn concurrent_pairing_consumers_create_exactly_one_session() {
+        let db = std::sync::Arc::new(memory_db());
+        db.create_admin("admin", "hash").unwrap();
+        let creator = standard_session("creator", 1, 999_999);
+        db.insert_session(&creator).unwrap();
+        insert_pairing(&db, &pairing("pairing-1", "viewer", 1_000), 9, &creator);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let consumers: Vec<_> = ["fixed-1", "fixed-2"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, session_id)| {
+                let db = db.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    db.consume_pairing_and_insert_session(
+                        &[9; 32],
+                        200,
+                        session_id,
+                        &[10 + index as u8; 32],
+                        &[20 + index as u8; 32],
+                        1_000,
+                        1_000,
+                    )
+                    .unwrap()
+                })
+            })
+            .collect();
+        let sessions: Vec<_> = consumers
+            .into_iter()
+            .map(|consumer| consumer.join().unwrap())
+            .collect();
+
+        assert_eq!(
+            sessions.iter().filter(|session| session.is_some()).count(),
+            1
+        );
+        assert_eq!(db.list_sessions().unwrap().len(), 2);
+    }
+
+    #[test]
     fn security_schema_migrates_existing_admin_credential_version() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
