@@ -203,7 +203,8 @@ pub fn restore_database(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| default_backup_dir(target));
     let (recovery_backup, quarantine) = preserve_target_before_restore(target, &preservation_dir)?;
-    ensure_available_space(target_parent, database_footprint(source)?.saturating_mul(2))?;
+    let source_size = source.metadata()?.len().max(4096);
+    ensure_available_space(target_parent, source_size.saturating_mul(2))?;
 
     let temporary = temporary_path(target, "restore");
     create_private_empty_file(&temporary)?;
@@ -224,10 +225,7 @@ pub fn restore_database(
         sync_directory(target_parent)?;
         Ok(())
     })();
-    if restore_result.is_err() {
-        discard_sqlite_file_family(&temporary);
-    }
-    restore_result?;
+    restore_result.map_err(|error| cleanup_snapshot_error(&temporary, error))?;
 
     Ok(RestoreReport {
         path: target.to_path_buf(),
@@ -517,10 +515,7 @@ pub fn export_legacy(path: &Path, destination: &Path) -> DatabaseResult<BackupAr
         sync_directory(parent)?;
         Ok(())
     })();
-    if result.is_err() {
-        discard_sqlite_file_family(&temporary);
-    }
-    result?;
+    result.map_err(|error| cleanup_snapshot_error(&temporary, error))?;
 
     let sha256 = sha256_file(destination)?;
     let manifest_path = write_manifest(destination, &sha256)?;
@@ -659,10 +654,7 @@ where
         sync_directory(parent)?;
         Ok(backup_report)
     })();
-    if result.is_err() {
-        discard_sqlite_file_family(&temporary);
-    }
-    let backup_report = result?;
+    let backup_report = result.map_err(|error| cleanup_snapshot_error(&temporary, error))?;
     let sha256 = sha256_file(destination)?;
     let manifest_path = write_manifest(destination, &sha256)?;
     Ok(BackupArtifact {
@@ -695,16 +687,12 @@ fn normalize_and_check_snapshot(
         }
         check_connection(path, &conn)
     })();
-    let cleanup = remove_sqlite_sidecars(path);
     match result {
         Ok(report) => {
-            cleanup?;
+            remove_sqlite_sidecars(path)?;
             Ok(report)
         }
-        Err(error) => {
-            let _ = cleanup;
-            Err(error)
-        }
+        Err(error) => Err(error),
     }
 }
 
@@ -916,6 +904,18 @@ fn ensure_available_space(path: &Path, required_bytes: u64) -> DatabaseResult<()
     } else {
         path
     };
+    let available_bytes = available_space(path)?;
+    if available_bytes < required_bytes {
+        return Err(DatabaseError::InsufficientSpace {
+            path: path.to_path_buf(),
+            required_bytes,
+            available_bytes,
+        });
+    }
+    Ok(())
+}
+
+fn available_space(path: &Path) -> DatabaseResult<u64> {
     let c_path = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| DatabaseError::Verification("filesystem path contains NUL".into()))?;
     let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
@@ -928,14 +928,7 @@ fn ensure_available_space(path: &Path, required_bytes: u64) -> DatabaseResult<()
         .saturating_mul(stats.f_frsize as u128)
         .try_into()
         .unwrap_or(u64::MAX);
-    if available_bytes < required_bytes {
-        return Err(DatabaseError::InsufficientSpace {
-            path: path.to_path_buf(),
-            required_bytes,
-            available_bytes,
-        });
-    }
-    Ok(())
+    Ok(available_bytes)
 }
 
 fn create_private_empty_file(path: &Path) -> DatabaseResult<()> {
@@ -963,21 +956,42 @@ fn sync_directory(path: &Path) -> DatabaseResult<()> {
     Ok(())
 }
 
-fn discard_sqlite_file_family(path: &Path) {
-    let _ = fs::remove_file(path);
-    let _ = remove_sqlite_sidecars(path);
+fn cleanup_snapshot_error(path: &Path, error: DatabaseError) -> DatabaseError {
+    match discard_sqlite_file_family(path) {
+        Ok(()) => error,
+        Err(cleanup_error) => DatabaseError::Verification(format!(
+            "{error}; failed to discard temporary SQLite file family {}: {cleanup_error}",
+            path.display()
+        )),
+    }
+}
+
+fn discard_sqlite_file_family(path: &Path) -> DatabaseResult<()> {
+    remove_sqlite_files(path, &["", "-wal", "-shm", "-journal"])
 }
 
 fn remove_sqlite_sidecars(path: &Path) -> DatabaseResult<()> {
-    for suffix in ["-wal", "-shm", "-journal"] {
+    remove_sqlite_files(path, &["-wal", "-shm", "-journal"])
+}
+
+fn remove_sqlite_files(path: &Path, suffixes: &[&str]) -> DatabaseResult<()> {
+    let mut first_error = None;
+    for suffix in suffixes {
         let sidecar = sqlite_related_path(path, suffix);
         match fs::remove_file(sidecar) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(DatabaseError::Io(error)),
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
         }
     }
-    Ok(())
+    match first_error {
+        Some(error) => Err(DatabaseError::Io(error)),
+        None => Ok(()),
+    }
 }
 
 fn sqlite_related_path(database_path: &Path, suffix: &str) -> PathBuf {
@@ -1802,6 +1816,12 @@ mod tests {
                 .len()
                 > 0
         );
+        let untrusted_journal = sqlite_related_path(&source, "-journal");
+        let oversized_sidecar_len = available_space(&directory.0).unwrap().saturating_add(4096);
+        File::create(&untrusted_journal)
+            .unwrap()
+            .set_len(oversized_sidecar_len)
+            .unwrap();
 
         Connection::open(&target)
             .unwrap()
@@ -1821,10 +1841,34 @@ mod tests {
             .unwrap();
         assert_eq!(journal_mode, "delete");
         drop(restored);
+        assert_eq!(
+            untrusted_journal.metadata().unwrap().len(),
+            oversized_sidecar_len
+        );
         drop(writer);
         assert_no_sqlite_sidecars(&target);
         assert_no_partial_sqlite_files(&directory.0);
         assert_no_partial_sqlite_files(&backups);
+    }
+
+    #[test]
+    fn failed_snapshot_cleanup_reports_errors_and_removes_every_sidecar() {
+        let directory = TestDirectory::new("snapshot-cleanup-error");
+        let temporary = directory.join("blocked.partial");
+        fs::create_dir(&temporary).unwrap();
+        for suffix in ["-wal", "-shm", "-journal"] {
+            fs::write(sqlite_related_path(&temporary, suffix), b"temporary data").unwrap();
+        }
+
+        let error = cleanup_snapshot_error(
+            &temporary,
+            DatabaseError::Verification("snapshot validation failed".into()),
+        );
+
+        let message = error.to_string();
+        assert!(message.contains("snapshot validation failed"));
+        assert!(message.contains("failed to discard temporary SQLite file family"));
+        assert_no_sqlite_sidecars(&temporary);
     }
 
     #[test]
