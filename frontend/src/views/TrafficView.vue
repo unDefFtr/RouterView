@@ -4,6 +4,7 @@ import { useThemeStore } from '@/stores/theme';
 import { useDashboardStore } from '@/stores/dashboard';
 import { storeToRefs } from 'pinia';
 import { useECharts } from '@/composables/useECharts';
+import { useEChartsDataZoom } from '@/composables/useEChartsDataZoom';
 import FeatherIcon from '@/components/shared/FeatherIcon.vue';
 import {
   buildTrafficChartOption,
@@ -13,7 +14,12 @@ import {
   type TimeRange,
   type TrafficChartData,
 } from '@/types/charts';
-import { fetchTrafficHistory, type TrafficHistoryResponse } from '@/api/index';
+import {
+  fetchTrafficHistory,
+  type TrafficHistoryResponse,
+  type TrafficHistorySelector,
+  type TrafficInterfaceMetadata,
+} from '@/api/index';
 import {
   formatByteCount,
   isAbortError,
@@ -22,8 +28,9 @@ import {
 
 const themeStore = useThemeStore();
 const dashboardStore = useDashboardStore();
-const { hasMultipleWans, wanNames, selectedWan } = storeToRefs(dashboardStore);
+const { wanNames, selectedWan } = storeToRefs(dashboardStore);
 const isDark = computed(() => themeStore.mode === 'dark');
+useEChartsDataZoom();
 const { chartRef, initChart, updateOption, hasInstance } = useECharts(isDark);
 
 const selectedRange = ref<TimeRange | 'custom'>('6H');
@@ -42,8 +49,36 @@ const estimatedUpload = ref<bigint | null>(null);
 const totalsEstimated = ref(false);
 const totalsComplete = ref(true);
 const coverageRatio = ref<number | null>(null);
+const gapCount = ref<number | null>(null);
+const trafficInterfaces = ref<TrafficInterfaceMetadata[]>([]);
+const selectedInterfaceId = ref<string | null>(null);
+const selectedLegacyWanName = ref<string | null>(selectedWan.value);
 let requestController: AbortController | null = null;
 let requestGeneration = 0;
+
+interface InterfaceOption {
+  value: string;
+  label: string;
+}
+
+const interfaceOptions = computed<InterfaceOption[]>(() => {
+  if (trafficInterfaces.value.length > 0) {
+    const nameCounts = new Map<string, number>();
+    for (const candidate of trafficInterfaces.value) {
+      nameCounts.set(candidate.name, (nameCounts.get(candidate.name) ?? 0) + 1);
+    }
+    return trafficInterfaces.value.map((candidate) => ({
+      value: candidate.id,
+      label: (nameCounts.get(candidate.name) ?? 0) > 1
+        ? `${candidate.name} (${candidate.id})`
+        : candidate.name,
+    }));
+  }
+  return wanNames.value.map((name) => ({ value: `legacy:${name}`, label: name }));
+});
+const hasInterfaceSelector = computed(() => interfaceOptions.value.length > 1);
+const selectedInterfaceValue = computed(() => selectedInterfaceId.value
+  ?? (selectedLegacyWanName.value ? `legacy:${selectedLegacyWanName.value}` : ''));
 
 const intervalLabel = computed(() =>
   intervalSecs.value === null ? '逐点' : `${intervalSecs.value}s`,
@@ -58,6 +93,41 @@ const hasTotalsBreakdown = computed(() =>
 
 function formatOptionalByteCount(value: bigint | null): string {
   return value === null ? '—' : formatByteCount(value);
+}
+
+function trafficSelector(): TrafficHistorySelector | undefined {
+  if (selectedInterfaceId.value) return { interfaceId: selectedInterfaceId.value };
+  if (selectedLegacyWanName.value) return { wanName: selectedLegacyWanName.value };
+  return undefined;
+}
+
+function applyInterfaceMetadata(response: TrafficHistoryResponse): void {
+  if (!response.wan_interfaces || response.wan_interfaces.length === 0) return;
+  trafficInterfaces.value = response.wan_interfaces;
+
+  if (response.interface && !response.interface.aggregate) {
+    selectedInterfaceId.value = response.interface.id;
+    selectedLegacyWanName.value = null;
+    return;
+  }
+  if (
+    selectedInterfaceId.value
+    && !trafficInterfaces.value.some((candidate) => candidate.id === selectedInterfaceId.value)
+  ) {
+    selectedInterfaceId.value = null;
+  }
+}
+
+function selectInterface(event: Event): void {
+  const value = (event.target as HTMLSelectElement).value;
+  if (value.startsWith('legacy:')) {
+    selectedInterfaceId.value = null;
+    selectedLegacyWanName.value = value.slice('legacy:'.length) || null;
+  } else {
+    selectedInterfaceId.value = value || null;
+    selectedLegacyWanName.value = null;
+  }
+  void loadHistory(selectedRange.value);
 }
 
 function rangeLabel(range: TimeRange | 'custom'): string {
@@ -100,17 +170,20 @@ async function loadHistory(range: TimeRange | 'custom') {
     const resp: TrafficHistoryResponse = await fetchTrafficHistory(
       startMs,
       endMs,
-      selectedWan.value ?? undefined,
+      trafficSelector(),
       controller.signal,
     );
     if (generation !== requestGeneration) return;
 
+    applyInterfaceMetadata(resp);
     chartData.value = resp.points.map((p) => ({
       timestamp: new Date(p.timestamp_ms).toISOString(),
       download_bps: p.download_bps,
       upload_bps: p.upload_bps,
     }));
-    intervalSecs.value = resp.interval_secs ?? null;
+    intervalSecs.value = resp.bucket_size_ms === undefined
+      ? resp.interval_secs ?? null
+      : resp.bucket_size_ms / 1_000;
     const totals = resolveTrafficTotals(resp);
     totalDownload.value = totals.downloadBytes;
     totalUpload.value = totals.uploadBytes;
@@ -121,6 +194,7 @@ async function loadHistory(range: TimeRange | 'custom') {
     totalsEstimated.value = totals.estimated;
     totalsComplete.value = totals.complete;
     coverageRatio.value = totals.coverageRatio;
+    gapCount.value = totals.gapCount;
 
     await nextTick();
     renderChart();
@@ -175,11 +249,6 @@ function applyCustom() {
 
 watch([chartData, isDark], () => nextTick(renderChart), { deep: true });
 
-// Re-fetch when WAN selection changes
-watch(selectedWan, () => {
-  loadHistory(selectedRange.value);
-});
-
 onMounted(() => {
   loadHistory(selectedRange.value);
 });
@@ -203,14 +272,16 @@ onUnmounted(() => {
         <div class="range-controls">
           <div class="range-controls-top">
             <select
-              v-if="hasMultipleWans"
+              v-if="hasInterfaceSelector"
               class="wan-select"
               aria-label="选择 WAN 接口"
-              :value="selectedWan ?? ''"
-              @change="dashboardStore.selectWan($event.target ? ($event.target as HTMLSelectElement).value || null : null)"
+              :value="selectedInterfaceValue"
+              @change="selectInterface"
             >
               <option value="">全部 (合计)</option>
-              <option v-for="name in wanNames" :key="name" :value="name">{{ name }}</option>
+              <option v-for="option in interfaceOptions" :key="option.value" :value="option.value">
+                {{ option.label }}
+              </option>
             </select>
 
             <div class="time-range-switcher">
@@ -290,7 +361,9 @@ onUnmounted(() => {
         </div>
         <div v-if="!totalsComplete" class="summary-item coverage" role="status">
           <FeatherIcon name="alert-triangle" :size="13" />
-          <span>数据不完整{{ coverageRatio !== null ? ` (${(coverageRatio * 100).toFixed(0)}%)` : '' }}</span>
+          <span>
+            数据不完整{{ coverageRatio !== null ? ` (${(coverageRatio * 100).toFixed(0)}%)` : '' }}{{ gapCount ? `，${gapCount} 个缺口` : '' }}
+          </span>
         </div>
         <div v-if="hasTotalsBreakdown" class="summary-breakdown" role="status">
           <span v-if="exactDownload !== null || exactUpload !== null">

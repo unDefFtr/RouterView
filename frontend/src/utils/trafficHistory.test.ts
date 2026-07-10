@@ -96,6 +96,39 @@ describe('resolveTrafficTotals', () => {
     expect(totals.estimated).toBe(false);
   });
 
+  it('uses canonical v4 coverage durations instead of display point completeness', () => {
+    const totals = resolveTrafficTotals({
+      schema_version: 4,
+      points: [],
+      totals: {
+        download_bytes: '9',
+        upload_bytes: '5',
+        exact_download_bytes: '8',
+        exact_upload_bytes: '4',
+        estimated_download_bytes: '1',
+        estimated_upload_bytes: '1',
+        estimated: true,
+        complete: false,
+        coverage_ratio: 0.9,
+      },
+      coverage: {
+        requested_duration_ms: 1_000,
+        exact_duration_ms: 800,
+        estimated_duration_ms: 100,
+        covered_duration_ms: 900,
+        completeness: 0.9,
+        gap_count: 1,
+      },
+    });
+
+    expect(totals.complete).toBe(false);
+    expect(totals.estimated).toBe(true);
+    expect(totals.coverageRatio).toBe(0.9);
+    expect(totals.exactDurationMs).toBe(800);
+    expect(totals.estimatedDurationMs).toBe(100);
+    expect(totals.gapCount).toBe(1);
+  });
+
   it('rejects unsafe or fractional JSON numbers as byte counters', () => {
     const totals = resolveTrafficTotals({
       points: [{

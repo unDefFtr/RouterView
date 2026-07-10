@@ -13,6 +13,11 @@ export interface ResolvedTrafficTotals {
   estimated: boolean;
   complete: boolean;
   coverageRatio: number | null;
+  requestedDurationMs: number | null;
+  exactDurationMs: number | null;
+  estimatedDurationMs: number | null;
+  coveredDurationMs: number | null;
+  gapCount: number | null;
 }
 
 const MAX_INFERRED_LEGACY_DURATION_MS = 60_000;
@@ -150,7 +155,13 @@ export function resolveTrafficTotals(
   const upload = resolveDirection(response, 'upload', intervalSecs);
   const pointEstimated = response.points.some((point) => point.estimated === true);
   const pointIncomplete = response.points.some((point) => point.complete === false);
-  const rawCoverage = finiteNumber(totals?.coverage_ratio);
+  const coverage = response.coverage;
+  const rawCoverage = finiteNumber(coverage?.completeness ?? totals?.coverage_ratio);
+  const requestedDurationMs = finiteNumber(coverage?.requested_duration_ms);
+  const coveredDurationMs = finiteNumber(coverage?.covered_duration_ms);
+  const exactDurationMs = finiteNumber(coverage?.exact_duration_ms);
+  const estimatedDurationMs = finiteNumber(coverage?.estimated_duration_ms);
+  const gapCount = finiteNumber(coverage?.gap_count);
 
   return {
     downloadBytes: download.total,
@@ -160,13 +171,23 @@ export function resolveTrafficTotals(
     estimatedDownloadBytes: download.estimated,
     estimatedUploadBytes: upload.estimated,
     estimated: totals?.estimated
-      ?? (pointEstimated
+      ?? ((estimatedDurationMs ?? 0) > 0
+        || pointEstimated
         || download.inferredEstimated
         || upload.inferredEstimated),
-    complete: totals?.complete ?? !pointIncomplete,
+    complete: coverage === undefined
+      ? totals?.complete ?? !pointIncomplete
+      : requestedDurationMs !== null
+        && coveredDurationMs !== null
+        && coveredDurationMs === requestedDurationMs,
     coverageRatio: rawCoverage === null
       ? null
       : Math.max(0, Math.min(1, rawCoverage)),
+    requestedDurationMs,
+    exactDurationMs,
+    estimatedDurationMs,
+    coveredDurationMs,
+    gapCount,
   };
 }
 

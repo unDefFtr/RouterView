@@ -13,7 +13,12 @@ import {
   type TimeRange,
   type TrafficChartData,
 } from '@/types/charts';
-import { fetchTrafficHistory, type TrafficHistoryResponse } from '@/api/index';
+import {
+  fetchTrafficHistory,
+  type TrafficHistoryResponse,
+  type TrafficHistorySelector,
+  type TrafficInterfaceMetadata,
+} from '@/api/index';
 
 const dashboardStore = useDashboardStore();
 const themeStore = useThemeStore();
@@ -31,24 +36,83 @@ const {
 const isDark = computed(() => themeStore.mode === 'dark');
 const { chartRef, initChart, updateOption, hasInstance } = useECharts(isDark);
 
-const downloadRateStr = computed(() => formatBitrate(currentDownloadBps.value));
-const uploadRateStr = computed(() => formatBitrate(currentUploadBps.value));
-
 // Historical backfill from API — survives server restarts
 const historyPoints = ref<TrafficChartData[]>([]);
 const historyLoading = ref(false);
 const historyError = ref<string | null>(null);
+const trafficInterfaces = ref<TrafficInterfaceMetadata[]>([]);
+const selectedInterfaceId = ref<string | null>(null);
 let historyController: AbortController | null = null;
 let historyGeneration = 0;
 let loadedHistoryKey: string | null = null;
+let ignoreNextWanSelection = false;
+
+const interfaceOptions = computed(() => {
+  if (trafficInterfaces.value.length > 0) {
+    const nameCounts = new Map<string, number>();
+    for (const candidate of trafficInterfaces.value) {
+      nameCounts.set(candidate.name, (nameCounts.get(candidate.name) ?? 0) + 1);
+    }
+    return trafficInterfaces.value.map((candidate) => ({
+      value: candidate.id,
+      label: (nameCounts.get(candidate.name) ?? 0) > 1
+        ? `${candidate.name} (${candidate.id})`
+        : candidate.name,
+    }));
+  }
+  return wanNames.value.map((name) => ({ value: `legacy:${name}`, label: name }));
+});
+const hasInterfaceSelector = computed(() => interfaceOptions.value.length > 1 || hasMultipleWans.value);
+const selectedInterfaceValue = computed(() => selectedInterfaceId.value
+  ?? (selectedWan.value ? `legacy:${selectedWan.value}` : ''));
+const selectedInterfaceHasDuplicateName = computed(() => {
+  if (!selectedInterfaceId.value) return false;
+  const selected = trafficInterfaces.value.find(
+    (candidate) => candidate.id === selectedInterfaceId.value,
+  );
+  return selected !== undefined
+    && trafficInterfaces.value.filter((candidate) => candidate.name === selected.name).length > 1;
+});
+const useHistoricalRate = computed(() => selectedInterfaceId.value !== null
+  && (!selectedWan.value || selectedInterfaceHasDuplicateName.value));
+const latestHistoryPoint = computed(() => historyPoints.value.at(-1));
+const downloadRateStr = computed(() => formatBitrate(
+  useHistoricalRate.value
+    ? latestHistoryPoint.value?.download_bps ?? 0
+    : currentDownloadBps.value,
+));
+const uploadRateStr = computed(() => formatBitrate(
+  useHistoricalRate.value
+    ? latestHistoryPoint.value?.upload_bps ?? 0
+    : currentUploadBps.value,
+));
+
+function historySelector(): TrafficHistorySelector | undefined {
+  if (selectedInterfaceId.value) return { interfaceId: selectedInterfaceId.value };
+  if (selectedWan.value) return { wanName: selectedWan.value };
+  return undefined;
+}
+
+function applyInterfaceMetadata(response: TrafficHistoryResponse): void {
+  if (!response.wan_interfaces || response.wan_interfaces.length === 0) return;
+  trafficInterfaces.value = response.wan_interfaces;
+  if (response.interface && !response.interface.aggregate) {
+    selectedInterfaceId.value = response.interface.id;
+  } else if (
+    selectedInterfaceId.value
+    && !trafficInterfaces.value.some((candidate) => candidate.id === selectedInterfaceId.value)
+  ) {
+    selectedInterfaceId.value = null;
+  }
+}
 
 async function loadHistory(range: TimeRange) {
   historyController?.abort();
   const controller = new AbortController();
   historyController = controller;
   const generation = ++historyGeneration;
-  const wanName = selectedWan.value ?? undefined;
-  const historyKey = `${range}\u0000${wanName ?? ''}`;
+  const selector = historySelector();
+  const historyKey = `${range}\u0000${selector?.interfaceId ?? selector?.wanName ?? ''}`;
   historyLoading.value = true;
   historyError.value = null;
   if (loadedHistoryKey !== historyKey) historyPoints.value = [];
@@ -58,10 +122,11 @@ async function loadHistory(range: TimeRange) {
     const resp: TrafficHistoryResponse = await fetchTrafficHistory(
       startMs,
       endMs,
-      wanName,
+      selector,
       controller.signal,
     );
     if (generation !== historyGeneration) return;
+    applyInterfaceMetadata(resp);
     historyPoints.value = resp.points.map((p) => ({
       timestamp: new Date(p.timestamp_ms).toISOString(),
       download_bps: p.download_bps,
@@ -82,9 +147,13 @@ async function loadHistory(range: TimeRange) {
 // Merge WS live data with API history. WS timestamps take priority.
 // When a specific WAN is selected, uses per-WAN traffic; otherwise aggregate.
 const mergedPoints = computed<TrafficChartData[]>(() => {
-  const livePoints = selectedWan.value
-    ? wanTrafficPoints.value
-    : trafficPoints.value;
+  const livePoints = selectedInterfaceId.value
+    ? selectedWan.value && !selectedInterfaceHasDuplicateName.value
+      ? wanTrafficPoints.value
+      : []
+    : selectedWan.value
+      ? wanTrafficPoints.value
+      : trafficPoints.value;
 
   const merged = new Map<number, TrafficChartData>();
   const cutoff = Date.now() - timeRangeToMs(trafficTimeRange.value);
@@ -126,10 +195,57 @@ watch(
   { deep: true },
 );
 
-// Reload history when range or WAN selection changes
-watch([trafficTimeRange, selectedWan], ([range]) => {
+watch(trafficTimeRange, (range) => {
   loadHistory(range);
 });
+
+watch(selectedWan, (wanName) => {
+  if (ignoreNextWanSelection) {
+    ignoreNextWanSelection = false;
+    return;
+  }
+  if (!wanName) {
+    selectedInterfaceId.value = null;
+  } else {
+    const selected = trafficInterfaces.value.find(
+      (candidate) => candidate.id === selectedInterfaceId.value,
+    );
+    if (selected?.name !== wanName) {
+      selectedInterfaceId.value = trafficInterfaces.value.find(
+        (candidate) => candidate.name === wanName,
+      )?.id ?? null;
+    }
+  }
+  loadHistory(trafficTimeRange.value);
+});
+
+function selectInterface(event: Event): void {
+  const value = (event.target as HTMLSelectElement).value;
+  if (!value) {
+    selectedInterfaceId.value = null;
+    updateLiveWanSelection(null);
+    loadHistory(trafficTimeRange.value);
+    return;
+  }
+  if (value.startsWith('legacy:')) {
+    selectedInterfaceId.value = null;
+    updateLiveWanSelection(value.slice('legacy:'.length) || null);
+    loadHistory(trafficTimeRange.value);
+    return;
+  }
+
+  selectedInterfaceId.value = value;
+  const selected = trafficInterfaces.value.find((candidate) => candidate.id === value);
+  updateLiveWanSelection(selected?.name ?? null);
+  loadHistory(trafficTimeRange.value);
+}
+
+function updateLiveWanSelection(wanName: string | null): void {
+  const liveWanName = wanName && wanNames.value.includes(wanName) ? wanName : null;
+  if (selectedWan.value === liveWanName) return;
+  ignoreNextWanSelection = true;
+  dashboardStore.selectWan(liveWanName);
+}
 
 function selectTimeRange(range: TimeRange) {
   dashboardStore.setTrafficTimeRange(range);
@@ -171,14 +287,16 @@ onUnmounted(() => {
       <!-- Right controls: WAN selector + time range -->
       <div class="chart-controls-right">
         <select
-          v-if="hasMultipleWans"
+          v-if="hasInterfaceSelector"
           class="wan-select"
           aria-label="选择 WAN 接口"
-          :value="selectedWan ?? ''"
-          @change="dashboardStore.selectWan($event.target ? ($event.target as HTMLSelectElement).value || null : null)"
+          :value="selectedInterfaceValue"
+          @change="selectInterface"
         >
           <option value="">全部 (合计)</option>
-          <option v-for="name in wanNames" :key="name" :value="name">{{ name }}</option>
+          <option v-for="option in interfaceOptions" :key="option.value" :value="option.value">
+            {{ option.label }}
+          </option>
         </select>
 
         <div class="time-range-switcher">
