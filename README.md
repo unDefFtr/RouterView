@@ -21,7 +21,7 @@ chmod 0444 secrets/routerview_master_key
 # Edit .env, especially ROUTERVIEW_DOMAIN and ROUTER_MANAGEMENT_CIDRS.
 docker compose config --quiet
 docker compose build
-docker compose run --rm --no-deps backend admin setup
+docker compose run --rm --no-deps backend admin setup admin
 docker compose up -d
 ```
 
@@ -48,7 +48,7 @@ openssl rand -out secrets/routerview-dev-master-key 32
 chmod 0600 secrets/routerview-dev-master-key
 export ROUTERVIEW_MASTER_KEY_FILE="$PWD/secrets/routerview-dev-master-key"
 export PUBLIC_ORIGIN=http://localhost:5173
-cargo run --package routerview-backend -- admin setup
+cargo run --package routerview-backend -- admin setup admin
 cargo run --package routerview-backend
 
 # Terminal 2

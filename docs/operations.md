@@ -10,8 +10,8 @@ the public Internet.
 The container starts the service by invoking `routerview-backend` without a
 subcommand. The following maintenance commands are implemented:
 
-- `routerview-backend admin setup [username]`
-- `routerview-backend admin reset-password [username]`
+- `routerview-backend admin setup [USERNAME]`
+- `routerview-backend admin reset-password [USERNAME]`
 - `routerview-backend db check`
 - `routerview-backend db migrate`
 - `routerview-backend db backup FILE`
@@ -24,6 +24,11 @@ subcommand. The following maintenance commands are implemented:
 holds an exclusive lifetime lock for all writers. Run `admin`, `db migrate`,
 `db restore`, and `keys` commands only after stopping the backend. Never use
 `docker compose exec` for those offline commands.
+
+`USERNAME` is optional and defaults to `admin`, but the examples below pass it
+explicitly. `admin setup` creates the initial username. `admin reset-password`
+also sets the username to the supplied value, so pass the current username
+unless intentionally renaming the administrator.
 
 ## Host preparation
 
@@ -82,7 +87,7 @@ Initialize the first administrator before starting the daemon. The one-shot
 container mounts the same database and master-key secret as the service:
 
 ```bash
-docker compose run --rm --no-deps backend admin setup
+docker compose run --rm --no-deps backend admin setup admin
 docker compose up -d
 docker compose ps
 ```
@@ -99,7 +104,7 @@ container. Resetting it revokes all existing sessions and unused pairing codes:
 
 ```bash
 docker compose stop caddy backend
-docker compose run --rm --no-deps backend admin reset-password
+docker compose run --rm --no-deps backend admin reset-password admin
 docker compose up -d
 ```
 
