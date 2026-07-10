@@ -80,6 +80,7 @@ services:
     networks:
       app:
         ipv4_address: 172.31.254.2
+      edge:
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=16m,uid=10001,gid=10001,mode=0700
@@ -108,6 +109,8 @@ networks:
       config:
         - subnet: 172.31.254.0/29
   router_access:
+    driver: bridge
+  edge:
     driver: bridge
 
 volumes:
