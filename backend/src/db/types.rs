@@ -29,6 +29,10 @@ pub enum DatabaseError {
     Verification(String),
     #[error("invalid database command: {0}")]
     InvalidCommand(String),
+    #[error("traffic query exceeds the {max_source_rows} source-row limit")]
+    TrafficQueryTooLarge { max_source_rows: usize },
+    #[error("traffic query was cancelled")]
+    TrafficQueryCancelled,
 }
 
 pub type DatabaseResult<T> = Result<T, DatabaseError>;

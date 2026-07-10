@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
@@ -173,7 +176,11 @@ pub async fn query_traffic(
     let start = params.start;
     let end = params.end;
     let max_points = params.max_points;
-    let response =
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let query_cancellation = cancellation.clone();
+    let mut cancellation_guard = TrafficQueryCancellationGuard::new(cancellation);
+    let shutdown_rx = state.shutdown_tx.subscribe();
+    let query_task =
         spawn_blocking_with_permit(permit, move || -> Result<TrafficResponse, AppError> {
             let router = traffic_db
                 .current_router_for_target(&fallback_target)
@@ -201,20 +208,74 @@ pub async fn query_traffic(
                 .router_wan_interfaces(router.id)
                 .map_err(map_database_error)?;
             let result = traffic_db
-                .query_traffic_v4(&TrafficQuery {
-                    router_id: router.id,
-                    interface_id: interface.id,
-                    from_ms: start,
-                    to_ms: end,
-                    max_points,
-                })
+                .query_traffic_v4_cancellable(
+                    &TrafficQuery {
+                        router_id: router.id,
+                        interface_id: interface.id,
+                        from_ms: start,
+                        to_ms: end,
+                        max_points,
+                    },
+                    query_cancellation,
+                )
                 .map_err(map_database_error)?;
             build_traffic_response(router, interface, wan_interfaces, result)
-        })
-        .await
+        });
+    tokio::pin!(query_task);
+    let query_result = tokio::select! {
+        result = &mut query_task => result,
+        () = wait_for_traffic_query_shutdown(shutdown_rx) => {
+            cancellation_guard.cancel();
+            return Err(traffic_query_unavailable());
+        }
+    };
+    cancellation_guard.disarm();
+    let response = query_result
         .map_err(|error| AppError::Internal(format!("traffic query task failed: {error}")))??;
 
     Ok(Json(response))
+}
+
+struct TrafficQueryCancellationGuard {
+    cancelled: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl TrafficQueryCancellationGuard {
+    fn new(cancelled: Arc<AtomicBool>) -> Self {
+        Self {
+            cancelled,
+            armed: true,
+        }
+    }
+
+    fn cancel(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+        self.armed = false;
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TrafficQueryCancellationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancelled.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+async fn wait_for_traffic_query_shutdown(mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
+    if *shutdown_rx.borrow() {
+        return;
+    }
+    while shutdown_rx.changed().await.is_ok() {
+        if *shutdown_rx.borrow() {
+            return;
+        }
+    }
 }
 
 async fn spawn_blocking_with_permit<F, T>(
@@ -373,10 +434,26 @@ fn traffic_not_found(message: impl Into<String>) -> AppError {
     }
 }
 
+fn traffic_query_unavailable() -> AppError {
+    AppError::InvalidRequest {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: "traffic_query_cancelled",
+        message: "Traffic query was cancelled because the server is shutting down".into(),
+    }
+}
+
 fn map_database_error(error: DatabaseError) -> AppError {
     match error {
         DatabaseError::Sqlite(error) => AppError::Database(error),
         DatabaseError::InvalidCommand(message) => AppError::InvalidData(message),
+        DatabaseError::TrafficQueryTooLarge { max_source_rows } => AppError::InvalidRequest {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "traffic_query_too_large",
+            message: format!(
+                "Traffic query matches more than {max_source_rows} source rows; request a narrower time range or wait for traffic rollup"
+            ),
+        },
+        DatabaseError::TrafficQueryCancelled => traffic_query_unavailable(),
         other => AppError::Internal(other.to_string()),
     }
 }
@@ -415,6 +492,54 @@ mod tests {
         drop(reacquired);
 
         assert!(permit_was_held);
+    }
+
+    #[test]
+    fn cancellation_guard_only_cancels_an_unfinished_query() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        {
+            let _guard = TrafficQueryCancellationGuard::new(cancelled.clone());
+        }
+        assert!(cancelled.load(Ordering::Relaxed));
+
+        let completed = Arc::new(AtomicBool::new(false));
+        {
+            let mut guard = TrafficQueryCancellationGuard::new(completed.clone());
+            guard.disarm();
+        }
+        assert!(!completed.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn traffic_query_shutdown_waiter_observes_an_existing_signal() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        shutdown_tx.send_replace(true);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            wait_for_traffic_query_shutdown(shutdown_rx),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn dense_traffic_query_has_a_stable_client_error() {
+        let error = map_database_error(DatabaseError::TrafficQueryTooLarge {
+            max_source_rows: 1_000_000,
+        });
+        match error {
+            AppError::InvalidRequest {
+                status,
+                code,
+                message,
+            } => {
+                assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+                assert_eq!(code, "traffic_query_too_large");
+                assert!(message.contains("1000000"));
+                assert!(message.contains("narrower"));
+            }
+            other => panic!("unexpected traffic query error: {other}"),
+        }
     }
 
     #[test]
