@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use axum::{Json, extract::{Query, State}};
+use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
 
-use crate::error::AppError;
+use crate::error::{ApiQuery, AppError};
 use crate::state::AppState;
 
 /// Query parameters for GET /api/oui/lookup (batch).
@@ -36,7 +36,7 @@ pub struct OuiLookupResponse {
 /// the vendor name (or null if unknown).
 pub async fn lookup_oui(
     _state: State<Arc<AppState>>,
-    Query(params): Query<OuiLookupParams>,
+    ApiQuery(params): ApiQuery<OuiLookupParams>,
 ) -> Result<Json<OuiLookupResponse>, AppError> {
     let entries: Vec<OuiLookupEntry> = params
         .macs

@@ -1,37 +1,73 @@
 import { createRouter, createWebHistory } from 'vue-router';
-import type { RouteRecordRaw } from 'vue-router';
+import type { RouteLocationNormalized, RouteRecordRaw } from 'vue-router';
 import { fetchFullConfig } from '@/api';
+import type { Capability } from '@/api';
+import { useAuthStore } from '@/stores/auth';
 
 const routes: RouteRecordRaw[] = [
   {
     path: '/',
     name: 'dashboard',
     component: () => import('@/views/DashboardView.vue'),
-    meta: { title: '网络概况', requiresWizard: true },
+    meta: { title: '网络概况', requiresAuth: true, requiresWizard: true },
   },
   {
     path: '/devices',
     name: 'devices',
     component: () => import('@/views/DevicesView.vue'),
-    meta: { title: '终端设备', requiresWizard: true },
+    meta: { title: '终端设备', requiresAuth: true, requiresWizard: true },
   },
   {
     path: '/traffic',
     name: 'traffic',
     component: () => import('@/views/TrafficView.vue'),
-    meta: { title: '流量历史', requiresWizard: true },
+    meta: { title: '流量历史', requiresAuth: true, requiresWizard: true },
   },
   {
     path: '/settings',
     name: 'settings',
     component: () => import('@/views/SettingsView.vue'),
-    meta: { title: '设置', requiresWizard: true },
+    meta: {
+      title: '设置',
+      requiresAuth: true,
+      requiresWizard: true,
+      capability: 'configure',
+    },
   },
   {
     path: '/wizard',
     name: 'wizard',
     component: () => import('@/views/WizardView.vue'),
-    meta: { title: '初始配置', fullScreen: true },
+    meta: { title: '初始配置', fullScreen: true, requiresAuth: true, capability: 'configure' },
+  },
+  {
+    path: '/sessions',
+    name: 'sessions',
+    component: () => import('@/views/SessionsView.vue'),
+    meta: {
+      title: '会话与配对',
+      requiresAuth: true,
+      requiresWizard: true,
+      capability: 'manage_sessions',
+    },
+  },
+  {
+    path: '/login',
+    name: 'login',
+    component: () => import('@/views/LoginView.vue'),
+    meta: { title: '登录', fullScreen: true, guestOnly: true },
+  },
+  {
+    path: '/pair',
+    name: 'pair',
+    component: () => import('@/views/PairView.vue'),
+    meta: { title: '设备配对', fullScreen: true, guestOnly: true },
+  },
+  {
+    path: '/setup-required',
+    name: 'setup-required',
+    component: () => import('@/views/SetupRequiredView.vue'),
+    meta: { title: '需要初始设置', fullScreen: true },
   },
 ];
 
@@ -40,23 +76,37 @@ export const router = createRouter({
   routes,
 });
 
-// Global navigation guard — redirect to wizard if not yet configured.
-router.beforeEach(async (to, _from, next) => {
-  // Always allow navigation to the wizard itself.
-  if (to.name === 'wizard') return next();
-
-  // Only intercept routes that require wizard completion.
-  if (!to.meta.requiresWizard) return next();
-
+export async function authNavigationGuard(to: RouteLocationNormalized) {
+  const auth = useAuthStore();
   try {
-    const cfg = await fetchFullConfig();
-    if (!cfg.wizard_completed) {
-      return next({ name: 'wizard', replace: true });
-    }
+    await auth.initialize();
   } catch {
-    // Backend unreachable — let the route through so the user sees
-    // connection error state rather than being stuck on the wizard.
+    if (to.name !== 'login') return { name: 'login', query: { redirect: to.fullPath } };
   }
 
-  next();
-});
+  if (auth.setupRequired) {
+    return to.name === 'setup-required' ? true : { name: 'setup-required' };
+  }
+  if (to.name === 'setup-required') {
+    return auth.authenticated ? { name: 'dashboard' } : { name: 'login' };
+  }
+  if (to.meta.guestOnly && auth.authenticated) return { name: 'dashboard' };
+  if (to.meta.requiresAuth && !auth.authenticated) {
+    return { name: 'login', query: { redirect: to.fullPath } };
+  }
+
+  const capability = to.meta.capability as Capability | undefined;
+  if (capability && !auth.can(capability)) return { name: 'dashboard' };
+
+  if (to.meta.requiresWizard && auth.authenticated) {
+    try {
+      const config = await fetchFullConfig();
+      if (!config.wizard_completed && auth.can('configure')) return { name: 'wizard' };
+    } catch {
+      // The destination remains useful for showing the backend connection state.
+    }
+  }
+  return true;
+}
+
+router.beforeEach(authNavigationGuard);

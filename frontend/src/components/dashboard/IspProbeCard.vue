@@ -6,7 +6,17 @@ import StatusBadge from '@/components/shared/StatusBadge.vue';
 import FeatherIcon from '@/components/shared/FeatherIcon.vue';
 
 const store = useDashboardStore();
-const { isp, latencyProbes, hasMultipleWans, wansIsp, selectedWan } = storeToRefs(store);
+const {
+  isp,
+  latencyProbes,
+  hasMultipleWans,
+  wansIsp,
+  wans,
+  wanNames,
+  selectedWan,
+  currentDownloadBps,
+  currentUploadBps,
+} = storeToRefs(store);
 
 const rate = {
   formatValue(bps: number): string {
@@ -24,6 +34,7 @@ const currentIspName = computed(() => {
   if (hasMultipleWans.value && selectedWan.value) {
     const match = wansIsp.value.find((w) => w.wan_name === selectedWan.value);
     if (match) return match.name;
+    return selectedWan.value;
   }
   return isp.value.name;
 });
@@ -32,6 +43,7 @@ const currentIspOnline = computed(() => {
   if (hasMultipleWans.value && selectedWan.value) {
     const match = wansIsp.value.find((w) => w.wan_name === selectedWan.value);
     if (match) return match.online;
+    return wans.value.find((wan) => wan.wan_name === selectedWan.value)?.online ?? false;
   }
   // No WAN selected — online iff at least one WAN is up
   if (hasMultipleWans.value) {
@@ -116,11 +128,12 @@ const goodProbes = computed(() => latencyProbes.value.filter(p => p.status === '
     <div v-if="hasMultipleWans" class="wan-select-row">
       <select
         class="wan-select"
+        aria-label="选择 WAN 接口"
         :value="selectedWan ?? ''"
         @change="store.selectWan($event.target ? ($event.target as HTMLSelectElement).value || null : null)"
       >
         <option value="">全部 (合计)</option>
-        <option v-for="w in wansIsp" :key="w.wan_name" :value="w.wan_name">{{ w.wan_name }}</option>
+        <option v-for="name in wanNames" :key="name" :value="name">{{ name }}</option>
       </select>
     </div>
 
@@ -128,13 +141,13 @@ const goodProbes = computed(() => latencyProbes.value.filter(p => p.status === '
     <div class="isp-rates">
       <div class="rate-item download">
         <FeatherIcon name="download" :size="14" :stroke-width="2.5" />
-        <span class="rate-value">{{ rate.formatValue(isp.download_bps) }}</span>
-        <span class="rate-unit">{{ rate.formatUnit(isp.download_bps) }}</span>
+        <span class="rate-value">{{ rate.formatValue(currentDownloadBps) }}</span>
+        <span class="rate-unit">{{ rate.formatUnit(currentDownloadBps) }}</span>
       </div>
       <div class="rate-item upload">
         <FeatherIcon name="upload" :size="14" :stroke-width="2.5" />
-        <span class="rate-value">{{ rate.formatValue(isp.upload_bps) }}</span>
-        <span class="rate-unit">{{ rate.formatUnit(isp.upload_bps) }}</span>
+        <span class="rate-value">{{ rate.formatValue(currentUploadBps) }}</span>
+        <span class="rate-unit">{{ rate.formatUnit(currentUploadBps) }}</span>
       </div>
       <div class="rate-item connections">
         <FeatherIcon name="link" :size="14" :stroke-width="2.5" />
@@ -149,7 +162,7 @@ const goodProbes = computed(() => latencyProbes.value.filter(p => p.status === '
     </div>
 
     <!-- Latency Probes -->
-    <div class="probes-section">
+    <div class="probes-section" role="region" aria-label="延迟探针列表" tabindex="0">
       <div class="probes-header">
         <span>网络延迟探测</span>
         <span class="probes-summary">
@@ -300,7 +313,6 @@ const goodProbes = computed(() => latencyProbes.value.filter(p => p.status === '
 
 .rate-unit {
   font-size: 0.7rem;
-  opacity: 0.7;
 }
 
 .probes-section {

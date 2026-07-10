@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
+import { nextTick, ref, onMounted } from 'vue';
 import {
   fetchProbeTargets,
   updateProbeTargets,
@@ -9,63 +9,52 @@ import {
 import FeatherIcon from '@/components/shared/FeatherIcon.vue';
 
 const CATEGORIES = ['dns', 'cloud', 'cdn', 'repo', 'isp', 'custom'] as const;
+const MAX_TARGETS = 32;
 
 const targets = ref<ProbeTarget[]>([]);
 const loading = ref(true);
 const saving = ref(false);
 const saveStatus = ref<'saved' | 'error' | null>(null);
+const targetKeys = new WeakMap<ProbeTarget, string>();
+let nextTargetKey = 0;
 
-// ── Drag state ─────────────────────────────────────────────────
+// ── Ordering ─────────────────────────────────────────────────
 
-const dragFrom = ref<number | null>(null);
-const dragOver = ref<number | null>(null);
-
-function onDragStart(i: number, e: DragEvent) {
-  dragFrom.value = i;
-  if (e.dataTransfer) {
-    e.dataTransfer.effectAllowed = 'move';
+function targetKey(target: ProbeTarget): string {
+  let key = targetKeys.get(target);
+  if (!key) {
+    key = `probe-${nextTargetKey++}`;
+    targetKeys.set(target, key);
   }
+  return key;
 }
 
-function onDragOver(i: number, e: DragEvent) {
-  // Only allow drop within same category
-  const from = dragFrom.value;
-  if (from === null || targets.value[from]?.category !== targets.value[i]?.category) {
-    return;
+function categoryNeighborIndex(i: number, direction: -1 | 1): number | null {
+  const category = targets.value[i]?.category;
+  if (!category) return null;
+  for (
+    let candidate = i + direction;
+    candidate >= 0 && candidate < targets.value.length;
+    candidate += direction
+  ) {
+    if (targets.value[candidate]?.category === category) return candidate;
   }
-  e.preventDefault();
-  if (e.dataTransfer) {
-    e.dataTransfer.dropEffect = 'move';
-  }
-  dragOver.value = i;
+  return null;
 }
 
-function onDragLeave(_i: number) {
-  dragOver.value = null;
-}
-
-function onDrop(i: number) {
-  const from = dragFrom.value;
-  if (from === null || from === i) {
-    dragFrom.value = null;
-    dragOver.value = null;
-    return;
+async function moveTarget(i: number, direction: -1 | 1, event?: Event) {
+  const destination = categoryNeighborIndex(i, direction);
+  if (destination === null) return;
+  const control = event?.currentTarget;
+  const item = targets.value.splice(i, 1)[0];
+  targets.value.splice(destination, 0, item);
+  await nextTick();
+  if (control instanceof HTMLElement) {
+    const focusTarget = control.matches(':disabled')
+      ? control.parentElement?.querySelector<HTMLElement>('.order-btn:not(:disabled)')
+      : control;
+    focusTarget?.focus();
   }
-  // Only allow same-category swap
-  if (targets.value[from]?.category !== targets.value[i]?.category) {
-    dragFrom.value = null;
-    dragOver.value = null;
-    return;
-  }
-  const item = targets.value.splice(from, 1)[0];
-  targets.value.splice(i, 0, item);
-  dragFrom.value = null;
-  dragOver.value = null;
-}
-
-function onDragEnd() {
-  dragFrom.value = null;
-  dragOver.value = null;
 }
 
 // ── CRUD ───────────────────────────────────────────────────────
@@ -83,6 +72,7 @@ async function load() {
 }
 
 function addTarget() {
+  if (targets.value.length >= MAX_TARGETS) return;
   targets.value.push({
     name: '',
     host: '',
@@ -155,42 +145,50 @@ onMounted(load);
       <table class="probe-table">
         <thead>
           <tr>
-            <th class="col-grip" />
-            <th class="col-name">名称</th>
-            <th class="col-host">目标地址</th>
-            <th class="col-cat">类别</th>
-            <th class="col-del" />
+            <th class="col-grip" scope="col"><span class="visually-hidden">排序</span></th>
+            <th class="col-name" scope="col">名称</th>
+            <th class="col-host" scope="col">目标地址</th>
+            <th class="col-cat" scope="col">类别</th>
+            <th class="col-del" scope="col"><span class="visually-hidden">操作</span></th>
           </tr>
         </thead>
         <tbody>
           <tr
               v-for="(t, i) in targets"
-              :key="i"
+              :key="targetKey(t)"
               class="probe-row"
-              :class="{
-                'drag-from': dragFrom === i,
-                'drag-over': dragOver === i,
-              }"
-              @dragover="onDragOver(i, $event)"
-              @dragleave="onDragLeave(i)"
-              @drop="onDrop(i)"
-              @dragend="onDragEnd"
             >
             <td class="col-grip">
-              <span
-                class="grip-handle"
-                title="拖动排序"
-                draggable="true"
-                @dragstart.stop="onDragStart(i, $event)"
-              >
-                <FeatherIcon name="menu" :size="14" />
-              </span>
+              <div class="order-controls">
+                <button
+                  type="button"
+                  class="order-btn"
+                  :disabled="categoryNeighborIndex(i, -1) === null"
+                  :aria-label="`上移 ${t.name || `站点 ${i + 1}`}`"
+                  title="上移"
+                  @click="moveTarget(i, -1, $event)"
+                >
+                  <FeatherIcon name="chevron-up" :size="13" />
+                </button>
+                <button
+                  type="button"
+                  class="order-btn"
+                  :disabled="categoryNeighborIndex(i, 1) === null"
+                  :aria-label="`下移 ${t.name || `站点 ${i + 1}`}`"
+                  title="下移"
+                  @click="moveTarget(i, 1, $event)"
+                >
+                  <FeatherIcon name="chevron-down" :size="13" />
+                </button>
+              </div>
             </td>
             <td class="col-name">
               <input
                 class="field-input"
                 type="text"
                 v-model="t.name"
+                maxlength="64"
+                :aria-label="`站点 ${i + 1} 名称`"
                 placeholder="名称"
               />
             </td>
@@ -199,11 +197,17 @@ onMounted(load);
                 class="field-input mono"
                 type="text"
                 v-model="t.host"
+                maxlength="253"
+                :aria-label="`${t.name || `站点 ${i + 1}`} 目标地址`"
                 placeholder="IP 或域名"
               />
             </td>
             <td class="col-cat">
-              <select class="field-input" v-model="t.category">
+              <select
+                v-model="t.category"
+                class="field-input"
+                :aria-label="`${t.name || `站点 ${i + 1}`} 类别`"
+              >
                 <option v-for="c in CATEGORIES" :key="c" :value="c">{{ c }}</option>
               </select>
             </td>
@@ -212,6 +216,7 @@ onMounted(load);
                 type="button"
                 class="btn-del"
                 title="删除"
+                :aria-label="`删除 ${t.name || `站点 ${i + 1}`}`"
                 @click="removeTarget(i)"
               >
                 <FeatherIcon name="trash-2" :size="14" />
@@ -228,7 +233,12 @@ onMounted(load);
 
     <!-- Actions -->
     <div class="probe-actions">
-      <button type="button" class="btn-add" @click="addTarget">
+      <button
+        type="button"
+        class="btn-add"
+        :disabled="saving || targets.length >= MAX_TARGETS"
+        @click="addTarget"
+      >
         <FeatherIcon name="plus" :size="14" />
         <span>添加站点</span>
       </button>
@@ -327,48 +337,53 @@ onMounted(load);
   border-bottom: 1px solid var(--color-border-light);
 }
 
-.col-grip { width: 28px; text-align: center; }
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.col-grip { width: 56px; text-align: center; }
 .col-name { width: 28%; }
 .col-host { width: 32%; }
 .col-cat { width: 18%; }
 .col-del { width: 12%; text-align: center; }
 
-/* ── Drag & drop ────────────────────────────────────── */
+/* ── Ordering controls ────────────────────────────────────── */
 
-.grip-handle {
-  cursor: grab;
-  color: var(--color-text-muted);
+.order-controls {
   display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 2px;
-  border-radius: 3px;
-  transition: all var(--transition-fast);
+  gap: 2px;
 }
 
-.grip-handle:hover {
+.order-btn {
+  width: 24px;
+  height: 28px;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid var(--color-border-light);
+  border-radius: 4px;
+  background: transparent;
   color: var(--color-text-secondary);
-  background: var(--color-bg-hover);
+  cursor: pointer;
 }
 
-.grip-handle:active {
-  cursor: grabbing;
-}
-
-.probe-row {
-  transition: background var(--transition-fast), opacity var(--transition-fast);
-}
-
-.probe-row.drag-from {
-  opacity: 0.4;
-}
-
-.probe-row.drag-over {
+.order-btn:hover:not(:disabled) {
+  border-color: var(--color-accent);
+  color: var(--color-accent);
   background: var(--color-accent-subtle);
 }
 
-.probe-row.drag-over td {
-  border-top: 2px solid var(--color-accent);
+.order-btn:disabled {
+  color: var(--color-text-muted);
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 /* ── Field inputs (match SettingsView) ──────────────── */
@@ -475,7 +490,7 @@ onMounted(load);
   border: 1px solid var(--color-accent);
   border-radius: var(--border-radius-sm);
   background: var(--color-accent);
-  color: #fff;
+  color: var(--color-text-inverse);
   cursor: pointer;
   transition: all var(--transition-fast);
 }
@@ -503,5 +518,73 @@ onMounted(load);
 .save-badge.error {
   background: var(--color-danger-subtle);
   color: var(--color-danger);
+}
+
+@media (max-width: 520px) {
+  .settings-section {
+    padding: 16px 12px;
+  }
+
+  .probe-table,
+  .probe-table tbody {
+    display: block;
+    width: 100%;
+  }
+
+  .probe-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .probe-row {
+    display: grid;
+    grid-template-columns: 56px minmax(0, 1fr) 80px 32px;
+    align-items: center;
+    padding: 5px 0;
+    border-bottom: 1px solid var(--color-border-light);
+  }
+
+  .probe-table td {
+    width: auto;
+    padding: 3px;
+    border-bottom: 0;
+  }
+
+  .probe-row .col-grip {
+    grid-column: 1;
+    grid-row: 1 / span 2;
+  }
+
+  .probe-row .col-name {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .probe-row .col-cat {
+    grid-column: 3;
+    grid-row: 1;
+  }
+
+  .probe-row .col-host {
+    grid-column: 2 / span 2;
+    grid-row: 2;
+  }
+
+  .probe-row .col-del {
+    grid-column: 4;
+    grid-row: 1 / span 2;
+  }
+
+  .col-cat .field-input {
+    padding-inline: 5px;
+    font-size: 0.75rem;
+  }
 }
 </style>

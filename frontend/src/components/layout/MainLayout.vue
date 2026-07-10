@@ -16,7 +16,7 @@ const shellClass = computed(() => ({
 <template>
   <div :class="shellClass">
     <!-- Sidebar: landscape / wide screens -->
-    <aside v-if="!isPortrait" class="app-sidebar">
+    <aside v-if="!isPortrait" class="app-sidebar" aria-label="应用导航">
       <LeftSidebar />
     </aside>
 

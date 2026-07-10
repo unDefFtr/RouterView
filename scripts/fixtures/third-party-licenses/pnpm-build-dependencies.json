@@ -1,0 +1,30 @@
+[
+  {
+    "name": "routerview-frontend",
+    "version": "0.2.0",
+    "path": "__FIXTURE_ROOT__/packages/root",
+    "private": true,
+    "dependencies": {
+      "fixture-package": {
+        "version": "1.2.3",
+        "path": "__FIXTURE_ROOT__/packages/fixture-package"
+      }
+    },
+    "devDependencies": {
+      "fixture-build-tool": {
+        "version": "1.0.0",
+        "path": "__FIXTURE_ROOT__/packages/fixture-build-tool",
+        "dependencies": {
+          "fixture-build-runtime": {
+            "version": "1.0.0",
+            "path": "__FIXTURE_ROOT__/packages/fixture-build-runtime"
+          }
+        }
+      },
+      "fixture-test-tool": {
+        "version": "1.0.0",
+        "path": "__FIXTURE_ROOT__/packages/fixture-test-tool"
+      }
+    }
+  }
+]

@@ -1,29 +1,34 @@
 import { ref, onMounted, onUnmounted } from 'vue';
 
-/**
- * Reactive viewport orientation detection.
- * Returns `isPortrait` that updates when the device orientation changes.
- */
+const COMPACT_QUERY = '(max-width: 820px), (max-height: 520px) and (pointer: coarse)';
+
+/** Reactive layout capabilities based on usable size and pointer precision. */
 export function useViewport() {
-  const isPortrait = ref(false);
+  const isCompact = ref(false);
+  const isCoarsePointer = ref(false);
+  // Kept as an alias so existing views do not couple layout to orientation.
+  const isPortrait = isCompact;
 
-  let query: MediaQueryList | null = null;
+  let compactQuery: MediaQueryList | null = null;
+  let coarseQuery: MediaQueryList | null = null;
 
-  function onChange(e: MediaQueryListEvent) {
-    isPortrait.value = e.matches;
+  function update() {
+    isCompact.value = compactQuery?.matches ?? false;
+    isCoarsePointer.value = coarseQuery?.matches ?? false;
   }
 
   onMounted(() => {
-    query = window.matchMedia('(orientation: portrait)');
-    isPortrait.value = query.matches;
-    query.addEventListener('change', onChange);
+    compactQuery = window.matchMedia(COMPACT_QUERY);
+    coarseQuery = window.matchMedia('(pointer: coarse)');
+    update();
+    compactQuery.addEventListener('change', update);
+    coarseQuery.addEventListener('change', update);
   });
 
   onUnmounted(() => {
-    if (query) {
-      query.removeEventListener('change', onChange);
-    }
+    compactQuery?.removeEventListener('change', update);
+    coarseQuery?.removeEventListener('change', update);
   });
 
-  return { isPortrait };
+  return { isCompact, isPortrait, isCoarsePointer };
 }

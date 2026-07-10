@@ -72,7 +72,7 @@ const normalized = computed(() =>
 .segmented-bar__label {
   font-size: 0.65rem;
   font-weight: 600;
-  color: #fff;
+  color: var(--color-text-inverse);
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
   white-space: nowrap;
   overflow: hidden;

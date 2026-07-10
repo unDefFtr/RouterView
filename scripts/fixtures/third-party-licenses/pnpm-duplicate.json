@@ -1,0 +1,22 @@
+[
+  {
+    "name": "fixture-root",
+    "version": "1.0.0",
+    "path": "__FIXTURE_ROOT__/packages/root",
+    "private": true,
+    "dependencies": {
+      "fixture-package": {
+        "version": "1.2.3",
+        "resolved": "https://registry.example/fixture-package-1.2.3.tgz",
+        "path": "__FIXTURE_ROOT__/packages/fixture-package",
+        "dependencies": {
+          "fixture-package": {
+            "version": "1.2.3",
+            "resolved": "https://registry.example/fixture-package-1.2.3.tgz",
+            "path": "__FIXTURE_ROOT__/packages/fixture-package"
+          }
+        }
+      }
+    }
+  }
+]

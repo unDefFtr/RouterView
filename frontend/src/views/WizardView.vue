@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, reactive, computed } from 'vue';
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
 import { useThemeStore, type ThemePreference } from '@/stores/theme';
 import { useViewport } from '@/composables/useViewport';
@@ -7,6 +7,8 @@ import FeatherIcon from '@/components/shared/FeatherIcon.vue';
 import {
   updateConfig,
   testConnection,
+  fetchFullConfig,
+  ApiError,
   type ConnectionTestResult,
 } from '@/api';
 
@@ -22,6 +24,7 @@ const totalSteps = 3;
 const stepTitles = ['RouterOS 连接', '偏好设置', '完成配置'];
 
 function nextStep() {
+  if (currentStep.value === 1 && !canProceedFromStep1.value) return;
   if (currentStep.value < totalSteps) {
     currentStep.value++;
   }
@@ -36,11 +39,11 @@ function prevStep() {
 // ── Form state ──────────────────────────────────────────
 
 const form = reactive({
-  routeros_host: '192.168.88.1',
-  routeros_port: 443,
-  routeros_scheme: 'https' as 'http' | 'https',
-  routeros_username: 'admin',
-  routeros_password: '',
+  router_host: '192.168.88.1',
+  router_port: 443,
+  router_scheme: 'https' as 'http' | 'https',
+  router_username: 'admin',
+  router_password: '',
   accept_invalid_certs: false,
   poll_interval_secs: 3,
   theme: 'system' as ThemePreference,
@@ -50,26 +53,76 @@ const form = reactive({
 
 const testing = ref(false);
 const testResult = ref<ConnectionTestResult | null>(null);
-const connectionVerified = ref(false);
+const verifiedFingerprint = ref<string | null>(null);
+let testGeneration = 0;
+let testController: AbortController | null = null;
+
+function connectionDraft() {
+  return {
+    router_type: 'routeros' as const,
+    router_host: form.router_host.trim(),
+    router_port: form.router_port,
+    router_scheme: form.router_scheme,
+    router_username: form.router_username.trim(),
+    router_password: form.router_password,
+    accept_invalid_certs: form.accept_invalid_certs,
+  };
+}
+
+const connectionFingerprint = computed(() => JSON.stringify(connectionDraft()));
+const connectionFieldsValid = computed(() => {
+  const draft = connectionDraft();
+  return draft.router_host.length > 0
+    && draft.router_username.length > 0
+    && draft.router_password.length > 0
+    && Number.isInteger(draft.router_port)
+    && draft.router_port >= 1
+    && draft.router_port <= 65_535;
+});
+const connectionVerified = computed(() =>
+  verifiedFingerprint.value === connectionFingerprint.value,
+);
+
+watch(connectionFingerprint, () => {
+  testGeneration++;
+  testController?.abort();
+  testController = null;
+  testing.value = false;
+  testResult.value = null;
+  verifiedFingerprint.value = null;
+  saveError.value = null;
+}, { flush: 'sync' });
 
 async function runConnectionTest() {
+  if (!connectionFieldsValid.value) {
+    testResult.value = { success: false, error: '请填写有效的主机、端口和用户名' };
+    return;
+  }
+  testController?.abort();
+  const controller = new AbortController();
+  testController = controller;
+  const generation = ++testGeneration;
+  const draft = connectionDraft();
+  const fingerprint = JSON.stringify(draft);
   testing.value = true;
   testResult.value = null;
-  connectionVerified.value = false;
+  verifiedFingerprint.value = null;
   try {
-    testResult.value = await testConnection({
-      routeros_host: form.routeros_host,
-      routeros_port: form.routeros_port,
-      routeros_scheme: form.routeros_scheme,
-      routeros_username: form.routeros_username,
-      routeros_password: form.routeros_password || '',
-      accept_invalid_certs: form.accept_invalid_certs,
-    });
-    connectionVerified.value = testResult.value.success;
-  } catch (e: any) {
-    testResult.value = { success: false, error: e.message };
+    const result = await testConnection(draft, controller.signal);
+    if (generation !== testGeneration) return;
+    testResult.value = result;
+    verifiedFingerprint.value = result.success ? fingerprint : null;
+  } catch (error: unknown) {
+    if (generation !== testGeneration) return;
+    testResult.value = {
+      success: false,
+      error: error instanceof Error ? error.message : '连接测试失败',
+    };
   } finally {
-    testing.value = false;
+    if (generation === testGeneration) {
+      testing.value = false;
+      if (testController === controller) testController = null;
+    }
   }
 }
 
@@ -95,30 +148,76 @@ function onThemeChange(pref: ThemePreference) {
 const saving = ref(false);
 const saveError = ref<string | null>(null);
 const saveDone = ref(false);
+const pollIntervalValid = computed(() =>
+  Number.isInteger(form.poll_interval_secs)
+  && form.poll_interval_secs >= 1
+  && form.poll_interval_secs <= 30,
+);
+
+async function loadCurrentConfig(): Promise<void> {
+  const current = await fetchFullConfig();
+  form.router_host = current.router_host;
+  form.router_port = current.router_port;
+  form.router_scheme = current.router_scheme;
+  form.router_username = current.router_username;
+  form.router_password = '';
+  form.accept_invalid_certs = current.accept_invalid_certs;
+  form.poll_interval_secs = current.poll_interval_secs;
+  if (['system', 'dark', 'light'].includes(current.theme)) {
+    form.theme = current.theme as ThemePreference;
+    themeStore.setPreference(form.theme);
+  }
+  verifiedFingerprint.value = null;
+  testResult.value = null;
+}
 
 async function finishWizard() {
+  if (!connectionVerified.value) {
+    currentStep.value = 1;
+    saveError.value = '连接参数已更改，请重新测试连接';
+    return;
+  }
+  if (!pollIntervalValid.value) {
+    currentStep.value = 2;
+    saveError.value = '轮询间隔必须是 1 到 30 秒之间的整数';
+    return;
+  }
   saving.value = true;
   saveError.value = null;
   try {
     // Save all config fields + mark wizard as completed
     await updateConfig({
-      routeros_host: form.routeros_host,
-      routeros_port: form.routeros_port,
-      routeros_scheme: form.routeros_scheme,
-      routeros_username: form.routeros_username,
-      routeros_password: form.routeros_password,
-      accept_invalid_certs: form.accept_invalid_certs,
+      ...connectionDraft(),
+      password_mode: 'replace',
       poll_interval_secs: form.poll_interval_secs,
       theme: form.theme,
-      wizard_completed: 'true',
+      wizard_completed: true,
     });
     saveDone.value = true;
     // Auto-navigate to dashboard after a brief pause
     setTimeout(() => {
       router.push('/');
     }, 1500);
-  } catch (e: any) {
-    saveError.value = e.message || '保存配置失败';
+  } catch (error: unknown) {
+    if (error instanceof ApiError && error.status === 409) {
+      testGeneration++;
+      testController?.abort();
+      testController = null;
+      testing.value = false;
+      verifiedFingerprint.value = null;
+      testResult.value = null;
+      currentStep.value = 1;
+      try {
+        await loadCurrentConfig();
+        saveError.value = '配置已被其他会话修改，表单已重新加载。请重新输入密码并测试连接。';
+      } catch (reloadError: unknown) {
+        saveError.value = reloadError instanceof Error
+          ? `配置冲突且重新加载失败：${reloadError.message}`
+          : '配置冲突且重新加载失败';
+      }
+    } else {
+      saveError.value = error instanceof Error ? error.message : '保存配置失败';
+    }
   } finally {
     saving.value = false;
   }
@@ -126,13 +225,29 @@ async function finishWizard() {
 
 // ── Step 1 validation ───────────────────────────────────
 
-const canProceedFromStep1 = computed(() => connectionVerified.value);
+const canProceedFromStep1 = computed(() =>
+  connectionFieldsValid.value && connectionVerified.value,
+);
+
+onMounted(async () => {
+  try {
+    await loadCurrentConfig();
+  } catch (error) {
+    saveError.value = error instanceof Error ? error.message : '无法加载当前配置版本';
+  }
+});
+
+onUnmounted(() => {
+  testGeneration++;
+  testController?.abort();
+  testController = null;
+});
 </script>
 
 <template>
-  <div class="wizard-view" :class="{ portrait: isPortrait }">
+  <main class="wizard-view" :class="{ portrait: isPortrait }">
     <!-- Background decoration -->
-    <div class="wizard-bg" />
+    <div class="wizard-bg" aria-hidden="true" />
 
     <div class="wizard-card">
       <!-- Header -->
@@ -174,6 +289,11 @@ const canProceedFromStep1 = computed(() => connectionVerified.value);
         </div>
       </div>
 
+      <div v-if="saveError" class="save-fail" role="alert">
+        <FeatherIcon name="alert-triangle" :size="16" />
+        <span>{{ saveError }}</span>
+      </div>
+
       <!-- ═══════ Step 1: RouterOS Connection ═══════ -->
       <div v-if="currentStep === 1" class="wizard-body">
         <section class="wizard-section">
@@ -184,9 +304,10 @@ const canProceedFromStep1 = computed(() => connectionVerified.value);
 
           <div class="field-group">
             <div class="field">
-              <label class="field-label">主机地址</label>
+              <label class="field-label" for="wizard-router-host">主机地址</label>
               <input
-                v-model="form.routeros_host"
+                id="wizard-router-host"
+                v-model="form.router_host"
                 class="field-input mono"
                 type="text"
                 placeholder="192.168.88.1"
@@ -195,16 +316,20 @@ const canProceedFromStep1 = computed(() => connectionVerified.value);
 
             <div class="field-row">
               <div class="field" style="flex: 1">
-                <label class="field-label">端口</label>
+                <label class="field-label" for="wizard-router-port">端口</label>
                 <input
-                  v-model.number="form.routeros_port"
+                  id="wizard-router-port"
+                  v-model.number="form.router_port"
                   class="field-input mono short"
                   type="number"
+                  min="1"
+                  max="65535"
+                  step="1"
                 />
               </div>
               <div class="field" style="flex: 2">
-                <label class="field-label">连接方式</label>
-                <select v-model="form.routeros_scheme" class="field-input">
+                <label class="field-label" for="wizard-router-scheme">连接方式</label>
+                <select id="wizard-router-scheme" v-model="form.router_scheme" class="field-input">
                   <option value="https">HTTPS (推荐)</option>
                   <option value="http">HTTP</option>
                 </select>
@@ -212,9 +337,10 @@ const canProceedFromStep1 = computed(() => connectionVerified.value);
             </div>
 
             <div class="field">
-              <label class="field-label">用户名</label>
+              <label class="field-label" for="wizard-router-username">用户名</label>
               <input
-                v-model="form.routeros_username"
+                id="wizard-router-username"
+                v-model="form.router_username"
                 class="field-input"
                 type="text"
                 placeholder="admin"
@@ -222,10 +348,11 @@ const canProceedFromStep1 = computed(() => connectionVerified.value);
             </div>
 
             <div class="field">
-              <label class="field-label">密码</label>
+              <label class="field-label" for="wizard-router-password">密码</label>
               <div class="field-control">
                 <input
-                  v-model="form.routeros_password"
+                  id="wizard-router-password"
+                  v-model="form.router_password"
                   class="field-input mono"
                   :type="showPassword ? 'text' : 'password'"
                   placeholder="输入 RouterOS 密码"
@@ -235,6 +362,7 @@ const canProceedFromStep1 = computed(() => connectionVerified.value);
                   class="toggle-vis-btn"
                   @click="showPassword = !showPassword"
                   :title="showPassword ? '隐藏密码' : '显示密码'"
+                  :aria-label="showPassword ? '隐藏密码' : '显示密码'"
                 >
                   <FeatherIcon :name="showPassword ? 'eye-off' : 'eye'" :size="14" />
                 </button>
@@ -242,10 +370,10 @@ const canProceedFromStep1 = computed(() => connectionVerified.value);
             </div>
 
             <div class="field checkbox-field">
-              <label class="field-label">允许自签证书</label>
+              <label class="field-label" for="wizard-accept-invalid-certs">允许自签证书</label>
               <div class="field-control">
                 <label class="toggle">
-                  <input v-model="form.accept_invalid_certs" type="checkbox" />
+                  <input id="wizard-accept-invalid-certs" v-model="form.accept_invalid_certs" type="checkbox" />
                   <span class="toggle-slider" />
                 </label>
                 <span class="field-hint-inline">仅 HTTPS 时需要，用于自签名证书</span>
@@ -257,7 +385,8 @@ const canProceedFromStep1 = computed(() => connectionVerified.value);
           <div class="test-section">
             <button
               class="btn-test"
-              :disabled="testing"
+              type="button"
+              :disabled="testing || !connectionFieldsValid"
               @click="runConnectionTest"
             >
               <span v-if="testing" class="spinner-sm" />
@@ -269,6 +398,8 @@ const canProceedFromStep1 = computed(() => connectionVerified.value);
               v-if="testResult"
               class="test-result"
               :class="{ success: testResult.success, fail: !testResult.success }"
+              role="status"
+              aria-live="polite"
             >
               <template v-if="testResult.success">
                 <FeatherIcon name="check-circle" :size="14" />
@@ -293,15 +424,20 @@ const canProceedFromStep1 = computed(() => connectionVerified.value);
 
           <div class="field-group">
             <div class="field">
-              <label class="field-label">轮询间隔 (秒)</label>
+              <label class="field-label" for="wizard-poll-interval">轮询间隔 (秒)</label>
               <input
+                id="wizard-poll-interval"
                 v-model.number="form.poll_interval_secs"
                 class="field-input mono short"
                 type="number"
                 min="1"
                 max="30"
+                step="1"
               />
               <span class="field-hint">数据采集频率，1–30 秒。越低越实时但 RouterOS 负载更大。</span>
+              <span v-if="!pollIntervalValid" class="field-error" role="alert">
+                请输入 1 到 30 之间的整数
+              </span>
             </div>
           </div>
         </section>
@@ -350,16 +486,16 @@ const canProceedFromStep1 = computed(() => connectionVerified.value);
             <div class="summary-item">
               <span class="summary-label">RouterOS 地址</span>
               <span class="summary-value mono">
-                {{ form.routeros_scheme }}://{{ form.routeros_host }}:{{ form.routeros_port }}
+                {{ form.router_scheme }}://{{ form.router_host }}:{{ form.router_port }}
               </span>
             </div>
             <div class="summary-item">
               <span class="summary-label">用户名</span>
-              <span class="summary-value">{{ form.routeros_username }}</span>
+              <span class="summary-value">{{ form.router_username }}</span>
             </div>
             <div class="summary-item">
               <span class="summary-label">密码</span>
-              <span class="summary-value">{{ form.routeros_password ? '已设置' : '未设置' }}</span>
+              <span class="summary-value">{{ form.router_password ? '已设置' : '未设置' }}</span>
             </div>
             <div class="summary-item">
               <span class="summary-label">轮询间隔</span>
@@ -378,10 +514,6 @@ const canProceedFromStep1 = computed(() => connectionVerified.value);
             <FeatherIcon name="check-circle" :size="20" />
             <span>配置已保存，正在跳转...</span>
           </div>
-          <div v-else-if="saveError" class="save-fail">
-            <FeatherIcon name="alert-triangle" :size="16" />
-            <span>{{ saveError }}</span>
-          </div>
         </section>
       </div>
 
@@ -390,6 +522,7 @@ const canProceedFromStep1 = computed(() => connectionVerified.value);
         <button
           v-if="currentStep > 1 && !saveDone"
           class="btn-secondary"
+          type="button"
           @click="prevStep"
         >
           上一步
@@ -399,6 +532,7 @@ const canProceedFromStep1 = computed(() => connectionVerified.value);
         <button
           v-if="currentStep === 1"
           class="btn-primary"
+          type="button"
           :disabled="!canProceedFromStep1"
           @click="nextStep"
         >
@@ -408,6 +542,8 @@ const canProceedFromStep1 = computed(() => connectionVerified.value);
         <button
           v-if="currentStep === 2"
           class="btn-primary"
+          type="button"
+          :disabled="!pollIntervalValid"
           @click="nextStep"
         >
           下一步
@@ -416,6 +552,7 @@ const canProceedFromStep1 = computed(() => connectionVerified.value);
         <button
           v-if="currentStep === 3 && !saveDone"
           class="btn-primary"
+          type="button"
           :disabled="saving"
           @click="finishWizard"
         >
@@ -424,25 +561,25 @@ const canProceedFromStep1 = computed(() => connectionVerified.value);
         </button>
       </div>
     </div>
-  </div>
+  </main>
 </template>
 
 <style scoped>
 /* ── Viewport ─────────────────────────────────────────── */
 
 .wizard-view {
-  min-height: 100vh;
+  min-height: 100dvh;
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 24px;
+  padding: max(24px, env(safe-area-inset-top, 0px)) max(24px, env(safe-area-inset-right, 0px)) max(24px, env(safe-area-inset-bottom, 0px)) max(24px, env(safe-area-inset-left, 0px));
   position: relative;
   background: var(--color-bg-app);
 }
 
 .wizard-view.portrait {
   align-items: flex-start;
-  padding: 16px;
+  padding: max(16px, env(safe-area-inset-top, 0px)) max(16px, env(safe-area-inset-right, 0px)) max(16px, env(safe-area-inset-bottom, 0px)) max(16px, env(safe-area-inset-left, 0px));
 }
 
 /* ── Background decoration ────────────────────────────── */
@@ -681,6 +818,11 @@ const canProceedFromStep1 = computed(() => connectionVerified.value);
   color: var(--color-text-muted);
 }
 
+.field-error {
+  font-size: 0.72rem;
+  color: var(--color-danger);
+}
+
 /* ── Checkbox toggle ──────────────────────────────────── */
 
 .checkbox-field .field-control {
@@ -696,7 +838,13 @@ const canProceedFromStep1 = computed(() => connectionVerified.value);
 }
 
 .toggle input {
-  display: none;
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
 }
 
 .toggle-slider {
@@ -726,6 +874,11 @@ const canProceedFromStep1 = computed(() => connectionVerified.value);
 .toggle input:checked + .toggle-slider::after {
   left: 21px;
   background: #fff;
+}
+
+.toggle input:focus-visible + .toggle-slider {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
 }
 
 /* ── Password visibility ──────────────────────────────── */
@@ -815,6 +968,7 @@ const canProceedFromStep1 = computed(() => connectionVerified.value);
 }
 
 .theme-option {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 12px;
@@ -834,7 +988,17 @@ const canProceedFromStep1 = computed(() => connectionVerified.value);
   background: var(--color-accent-subtle);
 }
 
-.theme-option input { display: none; }
+.theme-option input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}
+
+.theme-option:focus-within {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
 
 .theme-option-content {
   display: flex;
@@ -966,7 +1130,7 @@ const canProceedFromStep1 = computed(() => connectionVerified.value);
   border: none;
   border-radius: var(--border-radius-sm);
   background: var(--color-accent);
-  color: #fff;
+  color: var(--color-text-inverse);
   cursor: pointer;
   transition: all var(--transition-fast);
 }

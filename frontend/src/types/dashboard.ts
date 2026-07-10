@@ -105,8 +105,8 @@ export interface Device {
   dhcp_expires: string | null;
   interface: string | null;
   arp_status: string | null;
-  custom_name?: string;
-  custom_type?: string;
+  custom_name?: string | null;
+  custom_type?: string | null;
 }
 
 /** @deprecated Use Device instead */
@@ -171,7 +171,7 @@ export interface DashboardUpdate {
 // ── Connection Status ────────────────────────────────────
 
 export interface ConnectionStatus {
-  routeros: boolean;
+  connected: boolean;
   lastPoll: string | null;
 }
 
@@ -180,7 +180,7 @@ export interface ConnectionStatus {
 export type ServerMessage =
   | { type: 'snapshot'; data: DashboardSnapshot }
   | { type: 'update'; data: DashboardUpdate }
-  | { type: 'connection_status'; routeros: boolean; lastPoll: string | null };
+  | { type: 'connection_status'; connected: boolean; lastPoll: string | null };
 
 // ── Default / Placeholder Values ─────────────────────────
 

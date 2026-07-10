@@ -19,11 +19,12 @@ pub enum ServerMessage {
         #[serde(rename = "data")]
         data: DashboardUpdate,
     },
-    /// RouterOS connectivity status notification.
+    /// Router connectivity status notification.
     #[serde(rename = "connection_status")]
     ConnectionStatus {
-        #[serde(rename = "routeros")]
-        routeros: bool,
+        /// Whether the router is reachable (was `routeros`, now generic)
+        #[serde(rename = "connected")]
+        connected: bool,
         #[serde(rename = "lastPoll")]
         last_poll: Option<String>,
     },
@@ -340,14 +341,4 @@ pub struct StabilitySegment {
     pub value: f64,
     /// Optional label
     pub label: Option<String>,
-}
-
-// ── Connection State (for the initial handshake) ─────────────
-
-/// Sent by the server on initial WS connection to confirm state.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ConnectionState {
-    pub routeros_connected: bool,
-    pub server_version: String,
-    pub poll_interval_secs: u64,
 }

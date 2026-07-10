@@ -1,64 +1,92 @@
-# RouterView — RouterOS Network Dashboard
+# RouterView
 
-Real-time MikroTik RouterOS monitoring dashboard built with **Rust** (backend) and
-**Vue 3 + ECharts** (frontend).
+RouterView is a self-hosted MikroTik RouterOS monitoring dashboard. A Rust/Axum
+service polls the router and stores traffic history in SQLite; a Vue application
+consumes the REST and WebSocket APIs.
 
-## Architecture
+## Production deployment
 
-```
-RouterOS REST API ──▶ Rust Backend (Axum) ──▶ WebSocket ──▶ Vue 3 Frontend
-                         │                                      │
-                    Poll Engine                           Pinia Stores
-                    (1-5s interval)                       ECharts Charts
-```
+The supported production topology is Caddy on ports 80/443 and an unexposed
+backend on a private Docker network. Caddy issues a certificate from its local
+CA, serves the frontend, and proxies `/api/*` and `/ws` to the backend.
 
-## Quick Start
-
-### 1. Backend
+Prerequisites: Docker Engine with Compose v2, a local DNS record for the chosen
+name, and a host that can reach the router management network.
 
 ```bash
-cd backend
-cp .env.example .env
-# Edit .env with your RouterOS credentials
-cargo run
+cp .env.compose.example .env
+install -d -m 0700 secrets
+openssl rand -out secrets/routerview_master_key 32
+chmod 0444 secrets/routerview_master_key
+# Edit .env, especially ROUTERVIEW_DOMAIN and ROUTER_MANAGEMENT_CIDRS.
+docker compose config --quiet
+docker compose build
+docker compose run --rm --no-deps backend admin setup
+docker compose up -d
 ```
 
-Server starts on `http://localhost:3001`.
+The backend has no published port. Do not add one, and do not expose Caddy to
+the public Internet. Trust Caddy's local root certificate on each client before
+entering credentials. Initial administrator setup, CA installation, backup,
+migration, restore, key rotation, and rollback procedures are documented in
+[Operations](docs/operations.md).
 
-### 2. Frontend
+The Compose topology pins Caddy to a private address and trusts only that `/32`
+to supply the client address used by login backoff and WebSocket limits. Direct
+deployments leave `TRUSTED_PROXY_CIDRS` empty. A custom reverse proxy must be
+listed by its exact source network and must overwrite `X-Real-IP` with one
+bare client IP; never trust a LAN range or pass through a client-provided chain.
+
+## Development
+
+Toolchains are pinned in `rust-toolchain.toml` and `.nvmrc`.
 
 ```bash
+# Terminal 1
+mkdir -p secrets
+openssl rand -out secrets/routerview-dev-master-key 32
+chmod 0600 secrets/routerview-dev-master-key
+export ROUTERVIEW_MASTER_KEY_FILE="$PWD/secrets/routerview-dev-master-key"
+export PUBLIC_ORIGIN=http://localhost:5173
+cargo run --package routerview-backend -- admin setup
+cargo run --package routerview-backend
+
+# Terminal 2
 cd frontend
-npm install
-npm run dev
+corepack enable
+corepack prepare pnpm@10.24.0 --activate
+pnpm install --frozen-lockfile
+pnpm dev
 ```
 
-Dev server starts on `http://localhost:5173` with API/WS proxy to backend.
+The backend binds port 3001 on all interfaces; keep that port firewalled from
+untrusted networks. Vite listens on `http://localhost:5173` and proxies API and
+WebSocket requests to the backend. `PUBLIC_ORIGIN` must exactly match the URL
+used in the browser for authenticated mutations and WebSocket connections. The
+administrator CLI is an offline writer: stop the backend before using
+`admin reset-password` against the same database.
 
-## Configuration
+## Verification
 
-| Variable | Default | Description |
-|---|---|---|
-| `ROUTEROS_HOST` | `192.168.88.1` | RouterOS IP/hostname |
-| `ROUTEROS_PORT` | `80` (HTTP) / `443` (HTTPS) | REST API port |
-| `ROUTEROS_SCHEME` | `https` | `http` or `https` |
-| `ROUTEROS_USERNAME` | `admin` | Login username |
-| `ROUTEROS_PASSWORD` | — | Login password (required) |
-| `ROUTEROS_INSECURE_TLS` | `false` | Accept self-signed certs (HTTPS only) |
-| `POLL_INTERVAL_SECS` | `3` | Data poll interval |
-| `PROBE_INTERVAL_SECS` | `60` | Latency probe interval |
-| `SERVER_PORT` | `3001` | Backend listen port |
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-targets --all-features --locked
+pnpm --dir frontend install --frozen-lockfile
+pnpm --dir frontend typecheck
+pnpm --dir frontend test --run
+pnpm --dir frontend build
+pnpm --dir frontend run licenses:test && pnpm --dir frontend run licenses:bundle
+docker compose --env-file .env.compose.example config --quiet
+```
 
-## Dashboard Layout
+Release builds are produced from the root `Dockerfile`; tracked frontend
+archives are not used. Tagged releases publish amd64/arm64 backend and Caddy
+images, a standalone Linux amd64 backend archive, a frontend archive, checksums,
+artifact-specific SPDX SBOMs, a generated dependency inventory, and the
+corresponding third-party license and notice texts. Container images expose the
+texts below `/usr/share/licenses/routerview/third-party/`.
 
-- **Top Navbar**: Brand, quick links, LIVE indicator, theme toggle
-- **Left Sidebar** (60px): Vertical icon navigation with active highlight
-- **Left Column** (30%): System & Gateway Status + ISP Network Probe
-- **Right Column** (70%): Traffic Chart → ISP Stability Bar → AP Loss & WiFi Devices
+## License
 
-## Tech Stack
-
-- **Backend**: Rust, Axum 0.8, Tokio, reqwest
-- **Frontend**: Vue 3, TypeScript, Pinia, ECharts 5, Vite 6
-- **Real-time**: WebSocket (tokio broadcast channel)
-- **Theming**: CSS Variables (dark/light mode)
+RouterView is licensed under the [MIT License](LICENSE).

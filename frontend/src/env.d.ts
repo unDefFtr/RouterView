@@ -1,5 +1,19 @@
 /// <reference types="vite/client" />
 
+import 'vue-router';
+import type { Capability } from '@/api';
+
+declare module 'vue-router' {
+  interface RouteMeta {
+    title?: string;
+    fullScreen?: boolean;
+    requiresAuth?: boolean;
+    requiresWizard?: boolean;
+    guestOnly?: boolean;
+    capability?: Capability;
+  }
+}
+
 declare module '*.vue' {
   import type { DefineComponent } from 'vue';
   const component: DefineComponent<{}, {}, any>;

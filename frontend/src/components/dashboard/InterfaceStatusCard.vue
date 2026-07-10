@@ -176,7 +176,7 @@ const stoppedColor = 'var(--color-danger)';
   padding: 1px 4px;
   border-radius: 3px;
   background: var(--color-accent);
-  color: #fff;
+  color: var(--color-text-inverse);
   font-family: var(--font-sans);
   line-height: 1.4;
 }

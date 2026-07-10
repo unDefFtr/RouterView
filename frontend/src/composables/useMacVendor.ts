@@ -9,6 +9,7 @@
  *   const vendor = await vendorFor('dc:a6:32:ab:cd:ef');  // "Raspberry Pi"
  */
 import { ref } from 'vue';
+import { fetchOuiEntries } from '@/api';
 
 // ── In-memory cache: "AABBCC" → "Apple Inc." ──────────────
 const cache = ref<Map<string, string>>(new Map());
@@ -26,12 +27,8 @@ async function flushBatch() {
   pendingMacs = new Map();
 
   try {
-    const qs = macs.map(encodeURIComponent).join(',');
-    const resp = await fetch(`/api/oui/lookup?macs=${qs}`);
-    if (!resp.ok) throw new Error(`${resp.status}`);
-
-    const data: { entries: { mac: string; vendor: string | null }[] } = await resp.json();
-    for (const entry of data.entries) {
+    const entries = await fetchOuiEntries(macs);
+    for (const entry of entries) {
       const vendor = entry.vendor || '—';
       cache.value.set(normalisePrefix(entry.mac), vendor);
       const r = resolvers.get(entry.mac.toLowerCase());

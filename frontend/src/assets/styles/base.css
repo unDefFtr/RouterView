@@ -23,13 +23,24 @@ body {
   background: var(--color-bg-primary);
   line-height: 1.5;
   overflow: hidden;
-  height: 100vh;
+  height: 100dvh;
   width: 100vw;
 }
 
 #app {
-  height: 100vh;
+  height: 100dvh;
   width: 100vw;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }
 
 /* ── Typography ──────────────────────────────── */

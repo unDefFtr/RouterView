@@ -22,7 +22,7 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{
-  select: [device: Device];
+  select: [mac: string];
 }>();
 
 const store = useDashboardStore();
@@ -54,8 +54,7 @@ const groupedDevices = computed(() => {
         displayName(d).toLowerCase().includes(q) ||
         d.hostname.toLowerCase().includes(q) ||
         d.ip.toLowerCase().includes(q) ||
-        d.mac.toLowerCase().includes(q) ||
-        (d.custom_name && d.custom_name.toLowerCase().includes(q)),
+        d.mac.toLowerCase().includes(q),
     );
   }
 
@@ -77,7 +76,7 @@ const totalFiltered = computed(() =>
 );
 
 function onClick(device: Device) {
-  emit('select', device);
+  emit('select', device.mac);
 }
 </script>
 
@@ -99,6 +98,7 @@ function onClick(device: Device) {
         v-model="searchQuery"
         type="text"
         class="search-input"
+        aria-label="搜索设备"
         placeholder="搜索设备名、IP 或 MAC..."
       />
     </div>
@@ -126,11 +126,15 @@ function onClick(device: Device) {
           {{ typeLabel(type) }}
           <span class="group-count">{{ devs.length }}</span>
         </div>
-        <div
+        <button
           v-for="device in devs"
           :key="device.mac"
+          type="button"
           class="device-row"
           :class="{ selected: device.mac === selectedMac }"
+          :aria-pressed="device.mac === selectedMac"
+          :aria-label="`查看设备 ${displayName(device)} 的详情`"
+          :data-device-mac="device.mac"
           @click="onClick(device)"
         >
           <div class="device-left">
@@ -173,7 +177,7 @@ function onClick(device: Device) {
               {{ dhcpStatusLabel(device.dhcp_status).text }}
             </span>
           </div>
-        </div>
+        </button>
       </div>
     </div>
   </div>
@@ -295,6 +299,8 @@ function onClick(device: Device) {
 }
 
 .device-row {
+  appearance: none;
+  width: 100%;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -305,6 +311,10 @@ function onClick(device: Device) {
   border: 1px solid transparent;
   border-bottom: 1px solid var(--color-border-light);
   flex-wrap: wrap;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
 }
 
 .device-row:hover {

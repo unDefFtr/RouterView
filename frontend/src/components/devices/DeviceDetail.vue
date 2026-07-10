@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue';
+import { ref, computed, nextTick, watch } from 'vue';
 import type { Device } from '@/types/dashboard';
 import FeatherIcon from '@/components/shared/FeatherIcon.vue';
 import {
@@ -14,12 +14,21 @@ import {
   arpStatusLabel,
 } from '@/composables/useDeviceHelpers';
 import { useDeviceOverrides } from '@/composables/useDeviceOverrides';
+import { useAuthStore } from '@/stores/auth';
 
-const { displayName, displayType, hasOverride, saveOverride } = useDeviceOverrides();
+const {
+  displayName,
+  displayType,
+  getOverride,
+  hasOverride,
+  saveOverride,
+} = useDeviceOverrides();
+const auth = useAuthStore();
 
 // ── Device type options for the edit dropdown ────────────────
 
 const DEVICE_TYPE_OPTIONS = [
+  { value: '', label: '自动识别' },
   { value: 'phone', label: '手机' },
   { value: 'tablet', label: '平板' },
   { value: 'laptop', label: '笔记本' },
@@ -40,29 +49,37 @@ const editName = ref('');
 const editType = ref('');
 const isSaving = ref(false);
 const saveError = ref<string | null>(null);
+const editingMac = ref<string | null>(null);
 
 function startEditing() {
   if (!props.device) return;
-  editName.value = props.device.custom_name || props.device.hostname;
-  editType.value = props.device.custom_type || props.device.device_type;
+  const override = getOverride(props.device);
+  editName.value = override.custom_name || '';
+  editType.value = override.custom_type || '';
+  editingMac.value = props.device.mac;
   saveError.value = null;
   isEditing.value = true;
 }
 
 function cancelEditing() {
   isEditing.value = false;
+  editingMac.value = null;
   saveError.value = null;
 }
 
 async function saveEdit() {
-  if (!props.device) return;
+  const mac = editingMac.value;
+  if (!mac || props.device?.mac !== mac) return;
   isSaving.value = true;
   saveError.value = null;
   try {
     const name = editName.value.trim() || null;
-    const type = editType.value;
-    await saveOverride(props.device.mac, name, type);
-    isEditing.value = false;
+    const type = editType.value || null;
+    await saveOverride(mac, name, type);
+    if (props.device?.mac === mac) {
+      isEditing.value = false;
+      editingMac.value = null;
+    }
   } catch (e) {
     console.error('[DeviceDetail] Save override failed:', e);
     saveError.value = '保存失败，请重试';
@@ -79,6 +96,43 @@ const props = defineProps<{
 const emit = defineEmits<{
   close: [];
 }>();
+
+const panelRef = ref<HTMLElement | null>(null);
+
+watch(
+  () => props.device?.mac,
+  () => {
+    isEditing.value = false;
+    editingMac.value = null;
+    saveError.value = null;
+    if (props.isOverlay && props.device) nextTick(() => panelRef.value?.focus());
+  },
+  { immediate: true },
+);
+
+function onPanelKeydown(event: KeyboardEvent) {
+  if (!props.isOverlay) return;
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    emit('close');
+    return;
+  }
+  if (event.key !== 'Tab' || !panelRef.value) return;
+
+  const focusable = Array.from(panelRef.value.querySelectorAll<HTMLElement>(
+    'button:not(:disabled), input:not(:disabled), select:not(:disabled), [tabindex]:not([tabindex="-1"])',
+  )).filter((element) => !element.hasAttribute('hidden'));
+  if (focusable.length === 0) return;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
 
 const copiedLabel = ref<string | null>(null);
 
@@ -110,9 +164,19 @@ function signalWidth(dbm: number | null | undefined): string {
   </div>
 
   <!-- Device detail -->
-  <div v-else class="card detail-panel" :class="{ overlay: isOverlay }">
+  <div
+    v-else
+    ref="panelRef"
+    class="card detail-panel"
+    :class="{ overlay: isOverlay }"
+    :role="isOverlay ? 'dialog' : undefined"
+    :aria-modal="isOverlay ? 'true' : undefined"
+    aria-labelledby="device-detail-title"
+    :tabindex="isOverlay ? -1 : undefined"
+    @keydown="onPanelKeydown"
+  >
     <!-- Back button (overlay mode only) -->
-    <button v-if="isOverlay" class="back-btn" @click="emit('close')">
+    <button v-if="isOverlay" class="back-btn" type="button" @click="emit('close')">
       <FeatherIcon name="arrow-left" :size="20" />
       <span>返回</span>
     </button>
@@ -122,7 +186,7 @@ function signalWidth(dbm: number | null | undefined): string {
       <FeatherIcon :name="deviceIcon(displayType(device))" :size="22" />
       <div class="detail-header-info">
         <div class="detail-hostname-row">
-          <span class="detail-hostname">{{ displayName(device) }}</span>
+          <span id="device-detail-title" class="detail-hostname">{{ displayName(device) }}</span>
           <span v-if="hasOverride(device)" class="override-badge" title="已自定义">
             <FeatherIcon name="edit-2" :size="10" />
           </span>
@@ -135,7 +199,14 @@ function signalWidth(dbm: number | null | undefined): string {
         <span>{{ signalLabel(device.signal) }}</span>
       </div>
       <!-- Edit button -->
-      <button v-if="!isEditing" class="edit-btn" title="编辑备注和类型" @click="startEditing">
+      <button
+        v-if="!isEditing && auth.can('manage_devices')"
+        class="edit-btn"
+        type="button"
+        title="编辑备注和类型"
+        aria-label="编辑备注和类型"
+        @click="startEditing"
+      >
         <FeatherIcon name="edit-2" :size="14" />
       </button>
     </div>
@@ -143,17 +214,18 @@ function signalWidth(dbm: number | null | undefined): string {
     <!-- Edit form -->
     <div v-if="isEditing" class="edit-form">
       <div class="edit-field">
-        <label class="edit-label">备注名称</label>
+        <label class="edit-label" for="device-edit-name">备注名称</label>
         <input
           v-model="editName"
+          id="device-edit-name"
           type="text"
           class="edit-input"
           :placeholder="device.hostname"
         />
       </div>
       <div class="edit-field">
-        <label class="edit-label">设备类型</label>
-        <select v-model="editType" class="edit-select">
+        <label class="edit-label" for="device-edit-type">设备类型</label>
+        <select id="device-edit-type" v-model="editType" class="edit-select">
           <option
             v-for="opt in DEVICE_TYPE_OPTIONS"
             :key="opt.value"
@@ -165,11 +237,11 @@ function signalWidth(dbm: number | null | undefined): string {
       </div>
       <div v-if="saveError" class="edit-error">{{ saveError }}</div>
       <div class="edit-actions">
-        <button class="save-btn" :disabled="isSaving" @click="saveEdit">
+        <button class="save-btn" type="button" :disabled="isSaving" @click="saveEdit">
           <span v-if="isSaving" class="save-spinner" />
           <span>{{ isSaving ? '保存中...' : '保存' }}</span>
         </button>
-        <button class="cancel-btn" @click="cancelEditing">取消</button>
+        <button class="cancel-btn" type="button" @click="cancelEditing">取消</button>
       </div>
     </div>
 
@@ -258,11 +330,11 @@ function signalWidth(dbm: number | null | undefined): string {
 
     <!-- Actions -->
     <div class="detail-actions">
-      <button class="action-btn" @click="copyToClipboard(device.mac, 'MAC')">
+      <button class="action-btn" type="button" @click="copyToClipboard(device.mac, 'MAC')">
         <FeatherIcon name="copy" :size="14" />
         <span>{{ copiedLabel === 'MAC' ? '已复制' : '复制 MAC' }}</span>
       </button>
-      <button class="action-btn" @click="copyToClipboard(device.ip, 'IP')">
+      <button class="action-btn" type="button" @click="copyToClipboard(device.ip, 'IP')">
         <FeatherIcon name="copy" :size="14" />
         <span>{{ copiedLabel === 'IP' ? '已复制' : '复制 IP' }}</span>
       </button>
@@ -613,7 +685,7 @@ function signalWidth(dbm: number | null | undefined): string {
 .save-btn {
   border: 1px solid var(--color-accent);
   background: var(--color-accent);
-  color: #fff;
+  color: var(--color-text-inverse);
 }
 
 .save-btn:hover:not(:disabled) {

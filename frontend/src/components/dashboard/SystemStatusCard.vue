@@ -249,7 +249,6 @@ function formatRate(bps: number): string {
 
 .cpu-label {
   font-size: 0.65rem;
-  opacity: 0.7;
 }
 
 .summary-row {
@@ -384,7 +383,7 @@ function formatRate(bps: number): string {
   padding: 0px 4px;
   border-radius: 3px;
   background: var(--color-accent);
-  color: #fff;
+  color: var(--color-text-inverse);
   font-family: var(--font-sans);
   line-height: 1.4;
 }

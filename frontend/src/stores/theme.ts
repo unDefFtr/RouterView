@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia';
-import { ref, watch } from 'vue';
+import { ref } from 'vue';
 
 export type ThemeMode = 'dark' | 'light';
 export type ThemePreference = 'system' | 'dark' | 'light';
@@ -42,12 +42,12 @@ export const useThemeStore = defineStore('theme', () => {
     }
 
     // Listen for system theme changes
+    systemQuery?.removeEventListener('change', onSystemChange);
     systemQuery = window.matchMedia('(prefers-color-scheme: dark)');
     systemQuery.addEventListener('change', onSystemChange);
 
     // Apply resolved theme
-    mode.value = resolveTheme(preference.value);
-    apply(mode.value);
+    apply(resolveTheme(preference.value));
   }
 
   function toggle() {
@@ -64,6 +64,7 @@ export const useThemeStore = defineStore('theme', () => {
   }
 
   function apply(m: ThemeMode) {
+    mode.value = m;
     document.documentElement.setAttribute('data-theme', m);
   }
 

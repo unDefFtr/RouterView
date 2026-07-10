@@ -15,7 +15,7 @@ export interface WsUpdateMessage {
 
 export interface WsConnectionStatusMessage {
   type: 'connection_status';
-  routeros: boolean;
+  connected: boolean;
   lastPoll: string | null;
 }
 

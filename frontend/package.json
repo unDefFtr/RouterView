@@ -1,13 +1,19 @@
 {
   "name": "routerview-frontend",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
+  "packageManager": "pnpm@10.24.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vue-tsc --noEmit && vite build",
+    "build": "pnpm typecheck && vite build && pnpm bundle:check",
+    "bundle:check": "node scripts/check-bundle-budget.mjs",
+    "licenses:bundle": "node ../scripts/prepare-third-party-licenses.mjs",
+    "licenses:release": "node ../scripts/prepare-third-party-licenses.mjs --cargo-output ../release/backend/third-party-licenses --pnpm-output ../release/frontend/third-party-licenses",
+    "licenses:test": "node --test ../scripts/generate-third-party-licenses.test.mjs",
     "preview": "vite preview",
-    "typecheck": "vue-tsc --noEmit"
+    "typecheck": "vue-tsc --noEmit && tsc -p tsconfig.node.json --noEmit",
+    "test": "vitest"
   },
   "dependencies": {
     "@fontsource/jetbrains-mono": "^5.2.8",
@@ -16,13 +22,21 @@
     "misans": "^4.1.0",
     "pinia": "^2.3.0",
     "vue": "^3.5.13",
-    "vue-i18n": "^10.0.7",
     "vue-router": "^4.5.0"
   },
   "devDependencies": {
+    "@types/node": "^24.0.0",
     "@vitejs/plugin-vue": "^5.2.0",
+    "@vue/test-utils": "^2.4.11",
+    "jsdom": "^29.1.1",
     "typescript": "~5.6.0",
     "vite": "^6.0.0",
+    "vitest": "^4.1.10",
     "vue-tsc": "^2.2.0"
+  },
+  "pnpm": {
+    "patchedDependencies": {
+      "@vue/devtools-api@6.6.4": "patches/@vue__devtools-api@6.6.4.patch"
+    }
   }
 }

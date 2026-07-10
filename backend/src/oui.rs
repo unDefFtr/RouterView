@@ -8,11 +8,10 @@ static OUI_DB: OnceLock<HashMap<String, String>> = OnceLock::new();
 fn load_oui_db() -> &'static HashMap<String, String> {
     OUI_DB.get_or_init(|| {
         let json_bytes = include_bytes!("oui_data.json");
-        serde_json::from_slice::<HashMap<String, String>>(json_bytes)
-            .unwrap_or_else(|e| {
-                tracing::warn!("Failed to load OUI database: {e}");
-                HashMap::new()
-            })
+        serde_json::from_slice::<HashMap<String, String>>(json_bytes).unwrap_or_else(|e| {
+            tracing::warn!("Failed to load OUI database: {e}");
+            HashMap::new()
+        })
     })
 }
 

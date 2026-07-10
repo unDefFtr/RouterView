@@ -10,20 +10,20 @@
     "navbar  navbar"
     "sidebar content";
   grid-template-columns: var(--sidebar-width) 1fr;
-  grid-template-rows: var(--navbar-height) 1fr;
-  height: 100vh;
+  grid-template-rows: calc(var(--navbar-height) + env(safe-area-inset-top, 0px)) minmax(0, 1fr);
+  height: 100dvh;
   width: 100vw;
   overflow: hidden;
 }
 
 .app-navbar {
   grid-area: navbar;
-  height: var(--navbar-height);
+  min-height: calc(var(--navbar-height) + env(safe-area-inset-top, 0px));
   background: var(--color-bg-navbar);
   border-bottom: 1px solid var(--color-border-light);
   display: flex;
   align-items: center;
-  padding: 0 20px;
+  padding: env(safe-area-inset-top, 0px) max(20px, env(safe-area-inset-right, 0px)) 0 max(20px, env(safe-area-inset-left, 0px));
   z-index: 100;
 }
 
@@ -43,13 +43,15 @@
   grid-area: content;
   overflow-y: auto;
   overflow-x: hidden;
+  min-height: 0;
+  overscroll-behavior: contain;
 }
 
 /* ── Bottom navigation bar (portrait only) ─────── */
 
 .app-bottom-bar {
   grid-area: bottom;
-  height: var(--bottom-bar-height);
+  height: calc(var(--bottom-bar-height) + env(safe-area-inset-bottom, 0px));
   position: fixed;
   bottom: 0;
   left: 0;
@@ -65,11 +67,11 @@
     "navbar"
     "content";
   grid-template-columns: 1fr;
-  grid-template-rows: var(--navbar-height) 1fr;
+  grid-template-rows: calc(var(--navbar-height) + env(safe-area-inset-top, 0px)) minmax(0, 1fr);
 }
 
 .app-shell.has-bottom-bar .app-content {
-  padding-bottom: var(--bottom-bar-height);
+  padding-bottom: calc(var(--bottom-bar-height) + env(safe-area-inset-bottom, 0px));
 }
 
 /* ── 2-Column Dashboard Layout ───────────────── */
@@ -79,8 +81,9 @@
   grid-template-columns: 30% 1fr;
   gap: var(--content-gap);
   padding: var(--content-gap);
-  height: calc(100vh - var(--navbar-height));
-  overflow: hidden;
+  height: 100%;
+  min-height: 680px;
+  overflow: visible;
 }
 
 .dashboard-left {
@@ -171,14 +174,14 @@
   padding: 8px;
 }
 
-/* ── Responsive (aspect-ratio driven) ─────────── */
+/* ── Responsive (usable size and pointer driven) ─────────── */
 
 /* Portrait: single-column, let .app-content scroll handle overflow */
-@media (orientation: portrait) {
+@media (max-width: 820px), (max-height: 520px) and (pointer: coarse) {
   .dashboard-grid {
     grid-template-columns: 1fr;
     height: auto;
-    min-height: calc(100vh - var(--navbar-height) - var(--bottom-bar-height));
+    min-height: calc(100dvh - var(--navbar-height) - var(--bottom-bar-height));
     overflow: visible;
   }
 
@@ -200,7 +203,7 @@
   .dashboard-right > *:nth-child(3) {
     flex: none;
     min-height: 200px;
-    max-height: 100vh;
+    max-height: 100dvh;
   }
 
   /* Two-card row also becomes a single column, each card gets half */
@@ -214,7 +217,8 @@
   /* Account for bottom bar in viewport-relative heights */
   .app-shell.has-bottom-bar .traffic-view,
   .app-shell.has-bottom-bar .devices-grid {
-    height: calc(100vh - var(--navbar-height) - var(--bottom-bar-height));
+    height: auto;
+    min-height: calc(100dvh - var(--navbar-height) - var(--bottom-bar-height));
   }
 }
 

@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use axum::{Json, extract::{Path, State}};
+use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
 
 use crate::db;
-use crate::error::AppError;
+use crate::error::{ApiJson, ApiPath, AppError};
 use crate::state::AppState;
 use crate::ws::protocol::{DashboardSnapshot, ServerMessage};
 
@@ -49,15 +49,18 @@ pub async fn list_overrides(
 /// so all connected clients see the change.
 pub async fn update_override(
     State(state): State<Arc<AppState>>,
-    Path(mac): Path<String>,
-    Json(body): Json<UpdateOverrideRequest>,
+    ApiPath(mac): ApiPath<String>,
+    ApiJson(body): ApiJson<UpdateOverrideRequest>,
 ) -> Result<Json<Vec<DeviceOverrideResponse>>, AppError> {
     // Store the override in the database
-    state.traffic_db.upsert_device_override(
-        &mac,
-        body.custom_name.as_deref(),
-        body.custom_type.as_deref(),
-    ).map_err(|e| AppError::Database(e))?;
+    state
+        .traffic_db
+        .upsert_device_override(
+            &mac,
+            body.custom_name.as_deref(),
+            body.custom_type.as_deref(),
+        )
+        .map_err(AppError::Database)?;
 
     // Re-read current snapshot, apply overrides, cache, and broadcast
     let updated_snapshot = {

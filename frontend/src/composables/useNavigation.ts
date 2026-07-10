@@ -4,6 +4,7 @@
  */
 import { computed } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
+import { useAuthStore } from '@/stores/auth';
 
 export interface NavItem {
   id: string;
@@ -29,6 +30,10 @@ const ID_BY_ROUTE_NAME: Record<string, string> = {
 export function useNavigation() {
   const router = useRouter();
   const route = useRoute();
+  const auth = useAuthStore();
+  const items = computed(() => ITEMS.filter((item) => (
+    item.id !== 'settings' || auth.can('configure')
+  )));
 
   const activeId = computed(() => {
     const name = typeof route.name === 'string' ? route.name : '';
@@ -42,7 +47,7 @@ export function useNavigation() {
   }
 
   return {
-    items: ITEMS,
+    items,
     activeId,
     navigate,
   };

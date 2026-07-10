@@ -1,9 +1,8 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue';
+import { ref, computed, nextTick, watch } from 'vue';
 import { useDashboardStore } from '@/stores/dashboard';
 import { storeToRefs } from 'pinia';
 import { useViewport } from '@/composables/useViewport';
-import type { Device } from '@/types/dashboard';
 import DeviceList from '@/components/devices/DeviceList.vue';
 import DeviceDetail from '@/components/devices/DeviceDetail.vue';
 
@@ -12,15 +11,29 @@ const { wifi } = storeToRefs(store);
 const { isPortrait } = useViewport();
 
 const devices = computed(() => wifi.value.devices);
-const selectedDevice = ref<Device | null>(null);
+const selectedMac = ref<string | null>(null);
+const selectedDevice = computed(() =>
+  devices.value.find((device) => device.mac === selectedMac.value) ?? null,
+);
 
-function selectDevice(device: Device) {
-  selectedDevice.value = device;
+function selectDevice(mac: string) {
+  selectedMac.value = mac;
 }
 
-function clearSelection() {
-  selectedDevice.value = null;
+async function clearSelection() {
+  const mac = selectedMac.value;
+  selectedMac.value = null;
+  await nextTick();
+  if (!mac) return;
+  const trigger = Array.from(
+    document.querySelectorAll<HTMLElement>('[data-device-mac]'),
+  ).find((element) => element.dataset.deviceMac === mac);
+  trigger?.focus();
 }
+
+watch(devices, () => {
+  if (selectedMac.value && !selectedDevice.value) selectedMac.value = null;
+});
 </script>
 
 <template>
@@ -28,7 +41,7 @@ function clearSelection() {
     <!-- Device List — left column (landscape) or full width (portrait) -->
     <DeviceList
       :devices="devices"
-      :selected-mac="selectedDevice?.mac ?? null"
+      :selected-mac="selectedMac"
       @select="selectDevice"
     />
 
@@ -58,7 +71,8 @@ function clearSelection() {
   grid-template-columns: 65% 1fr;
   gap: var(--content-gap);
   padding: var(--content-gap);
-  height: calc(100vh - var(--navbar-height));
+  height: 100%;
+  min-height: 600px;
   overflow: hidden;
 }
 
@@ -73,5 +87,7 @@ function clearSelection() {
   background: var(--color-bg-primary);
   display: flex;
   flex-direction: column;
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
 }
 </style>
