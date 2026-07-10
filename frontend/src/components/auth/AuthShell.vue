@@ -93,6 +93,24 @@ p {
   font-size: 0.8rem;
 }
 
+.auth-footer :deep(a) {
+  color: var(--color-accent);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+.auth-footer :deep(a:hover),
+.auth-footer :deep(a:focus-visible) {
+  color: var(--color-text-primary);
+}
+
+.auth-footer :deep(a:focus-visible) {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 3px;
+  border-radius: 2px;
+}
+
 @media (max-width: 480px) {
   .auth-page {
     place-items: start center;
@@ -101,6 +119,46 @@ p {
 
   .auth-panel {
     padding: 22px 18px;
+  }
+}
+
+@media (max-height: 520px) and (min-width: 600px) {
+  .auth-page {
+    place-items: start center;
+    padding-top: max(12px, env(safe-area-inset-top));
+    padding-bottom: max(12px, env(safe-area-inset-bottom));
+  }
+
+  .auth-panel {
+    width: min(100%, 520px);
+    padding: 16px 24px;
+  }
+
+  .auth-header {
+    margin-bottom: 12px;
+  }
+
+  .auth-brand {
+    margin-bottom: 8px;
+  }
+
+  .auth-title-icon {
+    display: none;
+  }
+
+  h1 {
+    font-size: 1.1rem;
+    margin-bottom: 3px;
+  }
+
+  p {
+    font-size: 0.78rem;
+    line-height: 1.35;
+  }
+
+  .auth-footer {
+    padding-top: 8px;
+    margin-top: 10px;
   }
 }
 </style>

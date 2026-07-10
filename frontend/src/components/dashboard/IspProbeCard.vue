@@ -162,7 +162,7 @@ const goodProbes = computed(() => latencyProbes.value.filter(p => p.status === '
     </div>
 
     <!-- Latency Probes -->
-    <div class="probes-section">
+    <div class="probes-section" role="region" aria-label="延迟探针列表" tabindex="0">
       <div class="probes-header">
         <span>网络延迟探测</span>
         <span class="probes-summary">
@@ -313,7 +313,6 @@ const goodProbes = computed(() => latencyProbes.value.filter(p => p.status === '
 
 .rate-unit {
   font-size: 0.7rem;
-  opacity: 0.7;
 }
 
 .probes-section {

@@ -23,7 +23,7 @@ const hasSettings = computed(() => items.value.some(i => i.id === 'settings'));
 </script>
 
 <template>
-  <nav class="sidebar-nav">
+  <nav class="sidebar-nav" aria-label="主导航">
     <RouterLink
       v-for="item in navItems"
       :key="item.id"

@@ -18,7 +18,7 @@ const { items, activeId } = useNavigation();
 </script>
 
 <template>
-  <nav class="bottom-nav">
+  <nav class="bottom-nav" aria-label="主导航">
     <RouterLink
       v-for="item in items"
       :key="item.id"

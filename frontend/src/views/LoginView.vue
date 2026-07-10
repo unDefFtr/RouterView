@@ -98,4 +98,10 @@ input {
 .form-error { color: var(--color-danger); background: var(--color-danger-subtle); padding: 8px 10px; border-radius: var(--border-radius-sm); font-size: 0.78rem; }
 .button-spinner { width: 15px; height: 15px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin 0.7s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
+@media (max-height: 520px) and (min-width: 600px) {
+  .auth-form { gap: 5px; }
+  input { height: 36px; }
+  .password-control button { width: 28px; height: 28px; }
+  .primary-button { height: 36px; margin-top: 4px; }
+}
 </style>

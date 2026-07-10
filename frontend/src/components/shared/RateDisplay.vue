@@ -64,6 +64,5 @@ function formatUnit(bps: number): string {
 
 .rate-unit {
   font-size: 0.7rem;
-  opacity: 0.7;
 }
 </style>

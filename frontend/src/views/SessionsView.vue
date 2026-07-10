@@ -72,7 +72,7 @@ onMounted(load);
 <template>
   <div class="sessions-page">
     <section class="page-section pairing-section">
-      <header><h1>创建固定设备会话</h1><p>配对码一次有效，并在短时间后过期。</p></header>
+      <header><h2>创建固定设备会话</h2><p>配对码一次有效，并在短时间后过期。</p></header>
       <form class="pairing-form" @submit.prevent="generate">
         <div class="field"><label for="pair-label">设备标签</label><input id="pair-label" v-model="label" maxlength="80" placeholder="例如：客厅平板" /></div>
         <fieldset><legend>权限</legend><div class="role-control"><label :class="{ active: role === 'viewer' }"><input v-model="role" type="radio" value="viewer" />只读</label><label :class="{ active: role === 'admin' }"><input v-model="role" type="radio" value="admin" />管理员</label></div></fieldset>

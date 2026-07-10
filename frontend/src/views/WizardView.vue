@@ -245,9 +245,9 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="wizard-view" :class="{ portrait: isPortrait }">
+  <main class="wizard-view" :class="{ portrait: isPortrait }">
     <!-- Background decoration -->
-    <div class="wizard-bg" />
+    <div class="wizard-bg" aria-hidden="true" />
 
     <div class="wizard-card">
       <!-- Header -->
@@ -561,7 +561,7 @@ onUnmounted(() => {
         </button>
       </div>
     </div>
-  </div>
+  </main>
 </template>
 
 <style scoped>
@@ -1130,7 +1130,7 @@ onUnmounted(() => {
   border: none;
   border-radius: var(--border-radius-sm);
   background: var(--color-accent);
-  color: #fff;
+  color: var(--color-text-inverse);
   cursor: pointer;
   transition: all var(--transition-fast);
 }

@@ -97,6 +97,5 @@ const { stability } = storeToRefs(store);
 
 .legend-note {
   margin-left: auto;
-  opacity: 0.6;
 }
 </style>

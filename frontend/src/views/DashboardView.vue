@@ -34,10 +34,10 @@ const connectionLabel = computed(() => {
     </div>
 
     <!-- Left Column: 30% -->
-    <aside class="dashboard-left">
+    <div class="dashboard-left">
       <SystemStatusCard />
       <IspProbeCard />
-    </aside>
+    </div>
 
     <!-- Right Column: 70% — 3 stacked areas -->
     <section class="dashboard-right">
@@ -75,6 +75,5 @@ const connectionLabel = computed(() => {
   margin-left: auto;
   font-family: var(--font-mono);
   font-size: 0.7rem;
-  opacity: 0.7;
 }
 </style>
