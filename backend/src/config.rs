@@ -31,6 +31,8 @@ pub struct Config {
     pub setup_token_file: String,
     /// Exact browser origin accepted for authenticated mutations
     pub public_origin: String,
+    /// Networks containing reverse proxies allowed to assert the client IP
+    pub trusted_proxy_cidrs: Vec<IpNet>,
     /// Path to the 256-bit key used to encrypt RouterOS credentials
     pub master_key_file: String,
     /// Networks in which RouterOS management targets may resolve
@@ -118,6 +120,7 @@ impl Config {
         let public_origin = normalize_public_origin(
             &env::var("PUBLIC_ORIGIN").unwrap_or_else(|_| "https://localhost".to_string()),
         )?;
+        let trusted_proxy_cidrs = parse_optional_cidrs_env("TRUSTED_PROXY_CIDRS")?;
 
         Ok(Config {
             router_type,
@@ -137,6 +140,7 @@ impl Config {
             setup_token_file: env::var("SETUP_TOKEN_FILE")
                 .unwrap_or_else(|_| "/tmp/routerview-setup-token".to_string()),
             public_origin,
+            trusted_proxy_cidrs,
             master_key_file: env::var("ROUTERVIEW_MASTER_KEY_FILE").map_err(|_| {
                 ConfigError::MissingRequired("ROUTERVIEW_MASTER_KEY_FILE".to_string())
             })?,
@@ -224,6 +228,27 @@ fn parse_bool_env(key: &str, default: bool) -> Result<bool, ConfigError> {
     }
 }
 
+fn parse_optional_cidrs_env(key: &str) -> Result<Vec<IpNet>, ConfigError> {
+    match env::var(key) {
+        Ok(value) => parse_cidrs(key, &value),
+        Err(std::env::VarError::NotPresent) => Ok(Vec::new()),
+        Err(error) => Err(ConfigError::EnvError(error)),
+    }
+}
+
+fn parse_cidrs(key: &str, value: &str) -> Result<Vec<IpNet>, ConfigError> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|network| {
+            network.parse::<IpNet>().map_err(|_| {
+                ConfigError::InvalidFormat(format!("{key} contains invalid network '{network}'"))
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("Missing required environment variable: {0}")]
@@ -259,5 +284,18 @@ mod tests {
         assert!(normalize_public_origin("https://example.com/app").is_err());
         assert!(normalize_public_origin("https://user@example.com/").is_err());
         assert!(normalize_public_origin("http://192.168.1.10/").is_err());
+    }
+
+    #[test]
+    fn trusted_proxy_cidrs_are_explicit_and_strictly_parsed() {
+        assert!(parse_cidrs("TRUSTED_PROXY_CIDRS", "").unwrap().is_empty());
+        assert_eq!(
+            parse_cidrs("TRUSTED_PROXY_CIDRS", "172.31.254.2/32, 2001:db8::1/128").unwrap(),
+            vec![
+                "172.31.254.2/32".parse::<IpNet>().unwrap(),
+                "2001:db8::1/128".parse::<IpNet>().unwrap(),
+            ]
+        );
+        assert!(parse_cidrs("TRUSTED_PROXY_CIDRS", "private-network").is_err());
     }
 }

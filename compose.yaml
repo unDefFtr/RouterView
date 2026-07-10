@@ -14,6 +14,7 @@ services:
       SETUP_TOKEN_FILE: /tmp/routerview-setup-token
       RUST_LOG: ${RUST_LOG:-info}
       PUBLIC_ORIGIN: https://${ROUTERVIEW_DOMAIN:-routerview.local}
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-172.31.254.2/32}
       ROUTERVIEW_MASTER_KEY_FILE: /run/secrets/routerview_master_key
       ROUTER_MANAGEMENT_CIDRS: ${ROUTER_MANAGEMENT_CIDRS:-192.168.88.0/24}
       ALLOW_INSECURE_ROUTER_HTTP: ${ALLOW_INSECURE_ROUTER_HTTP:-false}
@@ -34,8 +35,9 @@ services:
       - routerview_data:/var/lib/routerview
       - routerview_backups:/var/backups/routerview
     networks:
-      - app
-      - router_access
+      app:
+        ipv4_address: 172.31.254.3
+      router_access:
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=16m,uid=10001,gid=10001,mode=0700
@@ -74,7 +76,8 @@ services:
       - caddy_data:/data
       - caddy_config:/config
     networks:
-      - app
+      app:
+        ipv4_address: 172.31.254.2
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=16m,uid=10001,gid=10001,mode=0700
@@ -99,6 +102,9 @@ services:
 networks:
   app:
     internal: true
+    ipam:
+      config:
+        - subnet: 172.31.254.0/29
   router_access:
     driver: bridge
 

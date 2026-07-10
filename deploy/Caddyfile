@@ -33,11 +33,15 @@
 		}
 
 		handle /api/* {
-			reverse_proxy backend:3001
+			reverse_proxy backend:3001 {
+				header_up X-Real-IP {http.request.remote.host}
+			}
 		}
 
 		handle /ws {
-			reverse_proxy backend:3001
+			reverse_proxy backend:3001 {
+				header_up X-Real-IP {http.request.remote.host}
+			}
 		}
 
 		handle {

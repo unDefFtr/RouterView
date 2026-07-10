@@ -26,6 +26,7 @@ use axum::{
     Json,
 };
 use base64::Engine;
+use ipnet::IpNet;
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -52,20 +53,23 @@ const HTTP_SESSION_TOUCH_SECS: i64 = 5 * 60;
 const LOGIN_FAILURE_CAPACITY: usize = 1_024;
 const LOGIN_FAILURE_TTL: Duration = Duration::from_secs(15 * 60);
 const LOGIN_BACKOFF_MAX_SECS: u64 = 60;
+const CLIENT_IP_HEADER: &str = "x-real-ip";
 
 /// Process-wide password verification limits and login timing state.
 pub struct AuthSecurity {
     argon2_slots: Arc<Semaphore>,
     dummy_password_hash: String,
     login_failures: LoginFailureLimiter,
+    trusted_proxy_cidrs: Vec<IpNet>,
 }
 
 impl AuthSecurity {
-    pub fn new() -> Result<Self, AppError> {
+    pub fn new(trusted_proxy_cidrs: Vec<IpNet>) -> Result<Self, AppError> {
         Ok(Self {
             argon2_slots: Arc::new(Semaphore::new(ARGON2_CONCURRENCY)),
             dummy_password_hash: hash_password_sync(&random_token())?,
             login_failures: LoginFailureLimiter::default(),
+            trusted_proxy_cidrs,
         })
     }
 
@@ -85,6 +89,10 @@ impl AuthSecurity {
             }),
         }
     }
+
+    pub fn client_ip(&self, peer: IpAddr, headers: &HeaderMap) -> Result<IpAddr, AppError> {
+        resolve_client_ip(peer, headers, &self.trusted_proxy_cidrs)
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -97,6 +105,7 @@ enum LoginFailureKey {
 struct LoginFailureState {
     failures: u8,
     blocked_until: Instant,
+    last_failure: Instant,
     last_seen: Instant,
 }
 
@@ -141,20 +150,28 @@ impl LoginFailureLimiter {
         let state = entries.entry(key).or_insert(LoginFailureState {
             failures: 0,
             blocked_until: now,
+            last_failure: now,
             last_seen: now,
         });
         state.failures = state.failures.saturating_add(1).min(7);
         let backoff_secs = (1_u64 << (state.failures - 1)).min(LOGIN_BACKOFF_MAX_SECS);
         state.blocked_until = now + Duration::from_secs(backoff_secs);
+        state.last_failure = now;
         state.last_seen = now;
         backoff_secs
     }
 
-    fn clear(&self, key: &LoginFailureKey) {
-        self.entries
+    fn clear_if_latest(&self, key: &LoginFailureKey, attempt_started_at: Instant) {
+        let mut entries = self
+            .entries
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(key);
+            .unwrap_or_else(|error| error.into_inner());
+        if entries
+            .get(key)
+            .is_some_and(|state| state.last_failure == attempt_started_at)
+        {
+            entries.remove(key);
+        }
     }
 }
 
@@ -304,12 +321,14 @@ pub async fn status(
 pub async fn login(
     State(state): State<Arc<AppState>>,
     ConnectInfo(connection): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     ApiJson(body): ApiJson<LoginRequest>,
 ) -> Result<Response, AppError> {
     let username = login_key_username(&body.username);
+    let source = state.auth_security.client_ip(connection.ip(), &headers)?;
     let failure_keys = [
         LoginFailureKey::Username(username.clone()),
-        LoginFailureKey::Source(connection.ip()),
+        LoginFailureKey::Source(source),
     ];
     if let Some(retry_after_secs) = failure_keys
         .iter()
@@ -337,15 +356,16 @@ pub async fn login(
     } else {
         "invalid-password-input".to_string()
     };
-    let password_matches = verify_password(password, encoded_hash, permit).await?;
+    let (password_matches, attempt_started_at) = verify_login_password(
+        state.auth_security.clone(),
+        failure_keys.clone(),
+        password,
+        encoded_hash,
+        permit,
+    )
+    .await?;
 
     if !username_matches || !password_matches || !password_is_bounded {
-        for key in failure_keys {
-            state
-                .auth_security
-                .login_failures
-                .record_failure(key, Instant::now());
-        }
         return Err(AppError::Unauthorized);
     }
     let admin = admin.ok_or_else(|| {
@@ -366,7 +386,10 @@ pub async fn login(
         return Err(AppError::Unauthorized);
     }
     for key in &failure_keys {
-        state.auth_security.login_failures.clear(key);
+        state
+            .auth_security
+            .login_failures
+            .clear_if_latest(key, attempt_started_at);
     }
     session_response(&session, &token, &csrf)
 }
@@ -834,6 +857,50 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     difference == 0
 }
 
+fn resolve_client_ip(
+    peer: IpAddr,
+    headers: &HeaderMap,
+    trusted_proxy_cidrs: &[IpNet],
+) -> Result<IpAddr, AppError> {
+    let peer = normalize_ip(peer);
+    if !trusted_proxy_cidrs
+        .iter()
+        .any(|network| network.contains(&peer))
+    {
+        return Ok(peer);
+    }
+
+    let mut forwarded_values = headers.get_all(CLIENT_IP_HEADER).iter();
+    let forwarded = forwarded_values
+        .next()
+        .ok_or_else(invalid_proxy_client_ip)?;
+    if forwarded_values.next().is_some() {
+        return Err(invalid_proxy_client_ip());
+    }
+    let forwarded = forwarded.to_str().map_err(|_| invalid_proxy_client_ip())?;
+    if forwarded.is_empty() || forwarded.trim() != forwarded || forwarded.contains(',') {
+        return Err(invalid_proxy_client_ip());
+    }
+    forwarded
+        .parse::<IpAddr>()
+        .map(normalize_ip)
+        .map_err(|_| invalid_proxy_client_ip())
+}
+
+fn invalid_proxy_client_ip() -> AppError {
+    AppError::Forbidden("trusted proxy supplied an invalid client address".into())
+}
+
+fn normalize_ip(source: IpAddr) -> IpAddr {
+    match source {
+        IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(address)),
+        source => source,
+    }
+}
+
 fn login_key_username(value: &str) -> String {
     let normalized = value.trim().to_ascii_lowercase();
     if normalized.len() <= 64
@@ -908,13 +975,57 @@ async fn verify_password(
     permit: OwnedSemaphorePermit,
 ) -> Result<bool, AppError> {
     run_argon2_task(permit, "password verification task failed", move || {
-        let parsed = PasswordHash::new(&encoded)
-            .map_err(|_| AppError::Internal("stored password hash is invalid".into()))?;
-        Ok(argon2()?
-            .verify_password(password.as_bytes(), &parsed)
-            .is_ok())
+        verify_password_sync(&password, &encoded)
     })
     .await
+}
+
+async fn verify_login_password(
+    security: Arc<AuthSecurity>,
+    failure_keys: [LoginFailureKey; 2],
+    password: String,
+    encoded: String,
+    permit: OwnedSemaphorePermit,
+) -> Result<(bool, Instant), AppError> {
+    run_login_argon2_task(
+        security,
+        failure_keys,
+        permit,
+        "password verification task failed",
+        move || verify_password_sync(&password, &encoded),
+    )
+    .await
+}
+
+async fn run_login_argon2_task<T, F>(
+    security: Arc<AuthSecurity>,
+    failure_keys: [LoginFailureKey; 2],
+    permit: OwnedSemaphorePermit,
+    failure_message: &'static str,
+    task: F,
+) -> Result<(T, Instant), AppError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, AppError> + Send + 'static,
+{
+    // This closure outlives request cancellation, so attempts that consumed
+    // Argon2 work remain counted unless the handler creates a session.
+    run_argon2_task(permit, failure_message, move || {
+        let started_at = Instant::now();
+        for key in failure_keys {
+            security.login_failures.record_failure(key, started_at);
+        }
+        task().map(|result| (result, started_at))
+    })
+    .await
+}
+
+fn verify_password_sync(password: &str, encoded: &str) -> Result<bool, AppError> {
+    let parsed = PasswordHash::new(encoded)
+        .map_err(|_| AppError::Internal("stored password hash is invalid".into()))?;
+    Ok(argon2()?
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok())
 }
 
 fn validate_setup_token(db: &TrafficDb, token: &str, now: i64) -> Result<Vec<u8>, AppError> {
@@ -1071,6 +1182,60 @@ mod tests {
     }
 
     #[test]
+    fn successful_attempt_does_not_clear_a_newer_failure() {
+        let limiter = LoginFailureLimiter::default();
+        let key = login_key("admin");
+        let first = Instant::now();
+        let newer = first + Duration::from_millis(1);
+        limiter.record_failure(key.clone(), first);
+        limiter.record_failure(key.clone(), newer);
+
+        limiter.clear_if_latest(&key, first);
+        assert!(limiter.retry_after(&key, newer).is_some());
+
+        limiter.clear_if_latest(&key, newer);
+        assert!(limiter.retry_after(&key, newer).is_none());
+    }
+
+    #[test]
+    fn direct_clients_cannot_spoof_forwarded_addresses() {
+        let peer = "192.0.2.10".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(CLIENT_IP_HEADER, HeaderValue::from_static("198.51.100.25"));
+
+        assert_eq!(resolve_client_ip(peer, &headers, &[]).unwrap(), peer);
+        assert_eq!(
+            resolve_client_ip(peer, &headers, &["10.0.0.0/8".parse::<IpNet>().unwrap()]).unwrap(),
+            peer
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_requires_one_bare_client_address() {
+        let peer = "::ffff:172.31.254.2".parse().unwrap();
+        let trusted = ["172.31.254.2/32".parse::<IpNet>().unwrap()];
+        let mut headers = HeaderMap::new();
+        headers.insert(CLIENT_IP_HEADER, HeaderValue::from_static("198.51.100.25"));
+        assert_eq!(
+            resolve_client_ip(peer, &headers, &trusted).unwrap(),
+            "198.51.100.25".parse::<IpAddr>().unwrap()
+        );
+
+        let mut missing = HeaderMap::new();
+        assert!(resolve_client_ip(peer, &missing, &trusted).is_err());
+
+        missing.insert(
+            CLIENT_IP_HEADER,
+            HeaderValue::from_static("198.51.100.25, 203.0.113.8"),
+        );
+        assert!(resolve_client_ip(peer, &missing, &trusted).is_err());
+
+        let mut repeated = headers;
+        repeated.append(CLIENT_IP_HEADER, HeaderValue::from_static("203.0.113.8"));
+        assert!(resolve_client_ip(peer, &repeated, &trusted).is_err());
+    }
+
+    #[test]
     fn unknown_username_selects_the_dummy_hash() {
         let admin = AdminRecord {
             username: "admin".into(),
@@ -1093,6 +1258,7 @@ mod tests {
             argon2_slots: Arc::new(Semaphore::new(ARGON2_CONCURRENCY)),
             dummy_password_hash: String::new(),
             login_failures: LoginFailureLimiter::default(),
+            trusted_proxy_cidrs: Vec::new(),
         });
         let first = security.acquire_argon2().await.unwrap();
         let second = security.acquire_argon2().await.unwrap();
@@ -1139,6 +1305,61 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        drop(reacquired);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_login_remains_counted_after_verification_starts() {
+        let security = Arc::new(AuthSecurity {
+            argon2_slots: Arc::new(Semaphore::new(1)),
+            dummy_password_hash: String::new(),
+            login_failures: LoginFailureLimiter::default(),
+            trusted_proxy_cidrs: Vec::new(),
+        });
+        let permit = security.acquire_argon2().await.unwrap();
+        let username = LoginFailureKey::Username("admin".into());
+        let source = LoginFailureKey::Source("192.0.2.10".parse().unwrap());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let verifier = tokio::spawn(run_login_argon2_task(
+            security.clone(),
+            [username.clone(), source.clone()],
+            permit,
+            "test password task failed",
+            move || {
+                let _ = started_tx.send(());
+                release_rx.recv().unwrap();
+                Ok(true)
+            },
+        ));
+        started_rx.await.unwrap();
+
+        {
+            let entries = security
+                .login_failures
+                .entries
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            assert_eq!(entries.get(&username).map(|state| state.failures), Some(1));
+            assert_eq!(entries.get(&source).map(|state| state.failures), Some(1));
+        }
+        verifier.abort();
+        let _ = verifier.await;
+        assert!(security
+            .login_failures
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains_key(&username));
+
+        release_tx.send(()).unwrap();
+        let reacquired = tokio::time::timeout(
+            Duration::from_secs(1),
+            security.argon2_slots.clone().acquire_owned(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         drop(reacquired);
     }
 

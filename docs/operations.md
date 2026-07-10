@@ -68,6 +68,16 @@ router-access network, but it has no published port. Only Caddy publishes
 `no-new-privileges`, and all capabilities dropped. The backend receives only
 `NET_RAW` for ICMP probes.
 
+The application network uses `172.31.254.0/29`; Caddy is pinned to
+`172.31.254.2`, and `TRUSTED_PROXY_CIDRS` trusts only that address. This lets the
+backend apply login and WebSocket source limits to the actual client while
+ignoring forged forwarding headers on direct connections. If that subnet
+conflicts with the host network, change the application subnet, both static
+container addresses, and `TRUSTED_PROXY_CIDRS` together. For a different proxy,
+use only its directly connected source network and configure it to overwrite
+`X-Real-IP` with exactly one IP address. Do not trust an entire LAN or a
+generic private-address range.
+
 Initialize the first administrator before starting the daemon. The one-shot
 container mounts the same database and master-key secret as the service:
 

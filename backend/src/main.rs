@@ -121,7 +121,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         secret_cipher,
         instance_id,
         public_origin: env_config.public_origin.clone(),
-        auth_security: Arc::new(auth::AuthSecurity::new()?),
+        auth_security: Arc::new(auth::AuthSecurity::new(
+            env_config.trusted_proxy_cidrs.clone(),
+        )?),
         setup_token_path: std::path::PathBuf::from(&env_config.setup_token_file),
         poller_control: poller_control.clone(),
         shutdown_tx: shutdown_tx.clone(),

@@ -31,6 +31,12 @@ entering credentials. Initial administrator setup, CA installation, backup,
 migration, restore, key rotation, and rollback procedures are documented in
 [Operations](docs/operations.md).
 
+The Compose topology pins Caddy to a private address and trusts only that `/32`
+to supply the client address used by login backoff and WebSocket limits. Direct
+deployments leave `TRUSTED_PROXY_CIDRS` empty. A custom reverse proxy must be
+listed by its exact source network and must overwrite `X-Real-IP` with one
+bare client IP; never trust a LAN range or pass through a client-provided chain.
+
 ## Development
 
 Toolchains are pinned in `rust-toolchain.toml` and `.nvmrc`.

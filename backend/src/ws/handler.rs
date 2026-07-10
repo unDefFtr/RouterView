@@ -1,5 +1,6 @@
 use axum::{
     extract::{ws::WebSocket, ConnectInfo, State, WebSocketUpgrade},
+    http::HeaderMap,
     response::{IntoResponse, Response},
     Extension,
 };
@@ -22,12 +23,14 @@ pub async fn ws_upgrade(
     State(state): State<Arc<AppState>>,
     Extension(auth_session): Extension<SessionContext>,
     ConnectInfo(connection): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response, AppError> {
     debug!("WebSocket upgrade request received");
+    let source = state.auth_security.client_ip(connection.ip(), &headers)?;
     let permit = state
         .ws_connections
-        .try_acquire(&auth_session.id, connection.ip())
+        .try_acquire(&auth_session.id, source)
         .map_err(|limit| {
             debug!(?limit, "WebSocket connection limit reached");
             AppError::RateLimited {
