@@ -259,6 +259,21 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: Generate release notes
+        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5 # v4.8.0
+        with:
+          version: v2.13.1
+          config: cliff.toml
+          args: --current --strip header --no-exec --output RELEASE_NOTES.md
+      - name: Verify release notes
+        run: |
+          test -s RELEASE_NOTES.md
+          grep -Fq "## ${GITHUB_REF_NAME}" RELEASE_NOTES.md
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: routerview-${{ github.ref_name }}-release
@@ -268,6 +283,6 @@ jobs:
         run: sha256sum --check SHA256SUMS
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
+          body_path: RELEASE_NOTES.md
           fail_on_unmatched_files: true
-          generate_release_notes: true
           files: release-files/*
