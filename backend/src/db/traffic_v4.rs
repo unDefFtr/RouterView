@@ -20,6 +20,31 @@ const ROLLUP_SAMPLE_BATCH_SQL: &str =
      WHERE started_at_ms < ?1
      ORDER BY started_at_ms, id
      LIMIT ?2";
+const RETENTION_DELETE_BATCH_SIZE: usize = 10_000;
+const PRUNE_TRAFFIC_SAMPLES_BATCH_SQL: &str = "DELETE FROM traffic_samples
+     WHERE id IN (
+         SELECT id
+         FROM traffic_samples INDEXED BY idx_traffic_samples_retention
+         WHERE ended_at_ms <= ?1
+         ORDER BY ended_at_ms, id
+         LIMIT ?2
+     )";
+const PRUNE_TRAFFIC_ROLLUPS_BATCH_SQL: &str = "DELETE FROM traffic_rollups
+     WHERE id IN (
+         SELECT id
+         FROM traffic_rollups INDEXED BY idx_traffic_rollups_retention
+         WHERE bucket_end_ms <= ?1
+         ORDER BY bucket_end_ms, id
+         LIMIT ?2
+     )";
+const PRUNE_TRAFFIC_GAPS_BATCH_SQL: &str = "DELETE FROM traffic_gaps
+     WHERE id IN (
+         SELECT id
+         FROM traffic_gaps INDEXED BY idx_traffic_gaps_retention
+         WHERE ended_at_ms <= ?1
+         ORDER BY ended_at_ms, id
+         LIMIT ?2
+     )";
 const TRAFFIC_QUERY_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const TRAFFIC_QUERY_PROGRESS_INTERVAL: i32 = 1_000;
 
@@ -866,26 +891,40 @@ impl TrafficDb {
         Ok(fully_consumed.len())
     }
 
-    /// Delete v4 traffic history that is entirely older than the retention boundary.
-    /// Checkpoints remain intact so the next counter sample can continue atomically.
+    /// Delete one bounded batch of v4 history entirely older than the retention boundary.
+    /// Each source gets an independent quota, and checkpoints remain intact so the
+    /// next counter sample can continue atomically.
     pub fn prune_exact_history(&self, before_ms: i64) -> DatabaseResult<usize> {
+        self.prune_exact_history_batch(before_ms, RETENTION_DELETE_BATCH_SIZE)
+    }
+
+    fn prune_exact_history_batch(
+        &self,
+        before_ms: i64,
+        batch_size: usize,
+    ) -> DatabaseResult<usize> {
+        let batch_size = i64::try_from(batch_size).map_err(|_| {
+            DatabaseError::InvalidCommand("retention batch size exceeds SQLite limits".into())
+        })?;
+        if batch_size <= 0 {
+            return Err(DatabaseError::InvalidCommand(
+                "retention batch size must be positive".into(),
+            ));
+        }
         let mut conn = self
             .conn
             .lock()
             .map_err(|_| rusqlite::Error::InvalidQuery)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let samples = tx.execute(
-            "DELETE FROM traffic_samples WHERE ended_at_ms <= ?1",
-            params![before_ms],
+            PRUNE_TRAFFIC_SAMPLES_BATCH_SQL,
+            params![before_ms, batch_size],
         )?;
         let rollups = tx.execute(
-            "DELETE FROM traffic_rollups WHERE bucket_end_ms <= ?1",
-            params![before_ms],
+            PRUNE_TRAFFIC_ROLLUPS_BATCH_SQL,
+            params![before_ms, batch_size],
         )?;
-        let gaps = tx.execute(
-            "DELETE FROM traffic_gaps WHERE ended_at_ms <= ?1",
-            params![before_ms],
-        )?;
+        let gaps = tx.execute(PRUNE_TRAFFIC_GAPS_BATCH_SQL, params![before_ms, batch_size])?;
         tx.commit()?;
         Ok(samples.saturating_add(rollups).saturating_add(gaps))
     }
@@ -2046,6 +2085,54 @@ mod tests {
             .unwrap());
     }
 
+    fn seed_retention_history(db: &TrafficDb, ended_at_values: &[i64]) -> (i64, i64) {
+        let router = db.resolve_router(None, "192.0.2.1", 1_000).unwrap();
+        let interface = db
+            .upsert_router_interface(router.id, "ether1", "WAN", "wan", None, 1_000)
+            .unwrap();
+        let conn = db.conn.lock().unwrap();
+        for &ended_at_ms in ended_at_values {
+            let started_at_ms = ended_at_ms - 1_000;
+            conn.execute(
+                "INSERT INTO traffic_samples(
+                     router_id, interface_id, started_at_ms, ended_at_ms, duration_ms,
+                     download_bytes, upload_bytes, download_bps, upload_bps,
+                     quality, source, created_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, 1000, 1000, 500, 8000, 4000,
+                           'exact', 'retention-fixture', ?4)",
+                params![router.id, interface.id, started_at_ms, ended_at_ms],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO traffic_rollups(
+                     router_id, interface_id, bucket_start_ms, bucket_end_ms, bucket_size_ms,
+                     exact_download_bytes, exact_upload_bytes, exact_duration_ms, sample_count,
+                     download_avg_bps, upload_avg_bps, source, created_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, 1000, 1000, 500, 1000, 1,
+                           8000, 4000, 'retention-fixture', ?4)",
+                params![router.id, interface.id, started_at_ms, ended_at_ms],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO traffic_gaps(
+                     router_id, interface_id, started_at_ms, ended_at_ms,
+                     reason, details, created_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, 'retention-fixture', NULL, ?4)",
+                params![router.id, interface.id, started_at_ms, ended_at_ms],
+            )
+            .unwrap();
+        }
+        let observed_at_ms = ended_at_values.iter().copied().max().unwrap();
+        conn.execute(
+            "INSERT INTO counter_checkpoints(
+                 router_id, interface_id, rx_counter, tx_counter, observed_at_ms, reboot_marker
+             ) VALUES (?1, ?2, '1000', '500', ?3, 'boot-a')",
+            params![router.id, interface.id, observed_at_ms],
+        )
+        .unwrap();
+        (router.id, interface.id)
+    }
+
     #[test]
     fn router_identity_sample_checkpoint_rollup_and_query_are_consistent() {
         let db = database();
@@ -2503,6 +2590,136 @@ mod tests {
         assert_eq!(completed.totals.download_bytes, "1801");
         assert_eq!(completed.totals.upload_bytes, "901");
         assert_eq!(completed.coverage.covered_duration_ms, 180_000);
+    }
+
+    #[test]
+    fn retention_batches_delete_each_source_oldest_first_and_keep_checkpoints() {
+        let db = database();
+        let (router_id, interface_id) =
+            seed_retention_history(&db, &[5_000, 10_000, 15_000, 30_000]);
+
+        let error = db.prune_exact_history_batch(15_000, 0).unwrap_err();
+        assert!(error.to_string().contains("batch size must be positive"));
+        assert_eq!(db.prune_exact_history_batch(15_000, 2).unwrap(), 6);
+        let remaining: (i64, i64, i64, i64, i64, i64) = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT
+                     (SELECT COUNT(*) FROM traffic_samples WHERE ended_at_ms <= 15000),
+                     (SELECT MIN(ended_at_ms) FROM traffic_samples WHERE ended_at_ms <= 15000),
+                     (SELECT COUNT(*) FROM traffic_rollups WHERE bucket_end_ms <= 15000),
+                     (SELECT MIN(bucket_end_ms) FROM traffic_rollups WHERE bucket_end_ms <= 15000),
+                     (SELECT COUNT(*) FROM traffic_gaps WHERE ended_at_ms <= 15000),
+                     (SELECT MIN(ended_at_ms) FROM traffic_gaps WHERE ended_at_ms <= 15000)",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(remaining, (1, 15_000, 1, 15_000, 1, 15_000));
+
+        assert_eq!(db.prune_exact_history_batch(15_000, 2).unwrap(), 3);
+        assert_eq!(db.prune_exact_history_batch(15_000, 2).unwrap(), 0);
+        let retained: (i64, i64, i64, i64) = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT
+                     (SELECT COUNT(*) FROM traffic_samples),
+                     (SELECT COUNT(*) FROM traffic_rollups),
+                     (SELECT COUNT(*) FROM traffic_gaps),
+                     (SELECT observed_at_ms FROM counter_checkpoints
+                      WHERE router_id = ?1 AND interface_id = ?2)",
+                params![router_id, interface_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(retained, (1, 1, 1, 30_000));
+    }
+
+    #[test]
+    fn retention_batch_rolls_back_all_sources_when_one_delete_fails() {
+        let db = database();
+        seed_retention_history(&db, &[5_000]);
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_rollup_retention
+                 BEFORE DELETE ON traffic_rollups
+                 BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;",
+            )
+            .unwrap();
+
+        assert!(db.prune_exact_history_batch(5_000, 1).is_err());
+        let counts: (i64, i64, i64) = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT
+                     (SELECT COUNT(*) FROM traffic_samples),
+                     (SELECT COUNT(*) FROM traffic_rollups),
+                     (SELECT COUNT(*) FROM traffic_gaps)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (1, 1, 1));
+    }
+
+    #[test]
+    fn retention_batch_queries_use_cutoff_indexes_without_temp_sorts() {
+        let db = database();
+        let conn = db.conn.lock().unwrap();
+        for (sql, table, index, cutoff) in [
+            (
+                PRUNE_TRAFFIC_SAMPLES_BATCH_SQL,
+                "traffic_samples",
+                "idx_traffic_samples_retention",
+                "ended_at_ms<?",
+            ),
+            (
+                PRUNE_TRAFFIC_ROLLUPS_BATCH_SQL,
+                "traffic_rollups",
+                "idx_traffic_rollups_retention",
+                "bucket_end_ms<?",
+            ),
+            (
+                PRUNE_TRAFFIC_GAPS_BATCH_SQL,
+                "traffic_gaps",
+                "idx_traffic_gaps_retention",
+                "ended_at_ms<?",
+            ),
+        ] {
+            let plan = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map(params![15_000, 2], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(plan.iter().any(|detail| {
+                detail.contains(&format!("SEARCH {table}"))
+                    && detail.contains(index)
+                    && detail.contains(cutoff)
+            }));
+            assert!(!plan
+                .iter()
+                .any(|detail| detail.contains(&format!("SCAN {table}"))));
+            assert!(!plan.iter().any(|detail| detail.contains("TEMP B-TREE")));
+        }
     }
 
     #[test]

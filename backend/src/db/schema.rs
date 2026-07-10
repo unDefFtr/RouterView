@@ -121,6 +121,17 @@ pub fn apply_migrations(
                 before,
             )?;
         }
+        if original_version < 6 {
+            migrate_v6_retention_cutoff_indexes(&tx)?;
+            record_migration(
+                &tx,
+                6,
+                "traffic_retention_cutoff_indexes",
+                original_version,
+                backup,
+                before,
+            )?;
+        }
 
         let after = legacy_counts(&tx)?;
         if before != after {
@@ -538,6 +549,18 @@ fn migrate_v5_rollup_cutoff_index(conn: &Connection) -> DatabaseResult<()> {
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_traffic_samples_rollup_cutoff
              ON traffic_samples(started_at_ms, id);",
+    )?;
+    Ok(())
+}
+
+fn migrate_v6_retention_cutoff_indexes(conn: &Connection) -> DatabaseResult<()> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_traffic_samples_retention
+             ON traffic_samples(ended_at_ms, id);
+         CREATE INDEX IF NOT EXISTS idx_traffic_rollups_retention
+             ON traffic_rollups(bucket_end_ms, id);
+         CREATE INDEX IF NOT EXISTS idx_traffic_gaps_retention
+             ON traffic_gaps(ended_at_ms, id);",
     )?;
     Ok(())
 }

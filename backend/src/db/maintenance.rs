@@ -1026,6 +1026,17 @@ mod tests {
         assert!(report.backup.is_none());
     }
 
+    fn assert_index_exists(conn: &Connection, name: &str) {
+        assert!(conn
+            .prepare(
+                "SELECT 1 FROM sqlite_schema
+                 WHERE type = 'index' AND name = ?1",
+            )
+            .unwrap()
+            .exists([name])
+            .unwrap());
+    }
+
     #[test]
     fn migrates_empty_database_to_current_schema_without_a_backup() {
         let directory = TestDirectory::new("empty-migration");
@@ -1053,14 +1064,14 @@ mod tests {
             assert!(checked.table_counts.contains_key(table), "missing {table}");
         }
         let conn = Connection::open(&database).unwrap();
-        assert!(conn
-            .prepare(
-                "SELECT 1 FROM sqlite_schema
-                 WHERE type = 'index' AND name = 'idx_traffic_samples_rollup_cutoff'",
-            )
-            .unwrap()
-            .exists([])
-            .unwrap());
+        for index in [
+            "idx_traffic_samples_rollup_cutoff",
+            "idx_traffic_samples_retention",
+            "idx_traffic_rollups_retention",
+            "idx_traffic_gaps_retention",
+        ] {
+            assert_index_exists(&conn, index);
+        }
     }
 
     #[test]
@@ -1084,7 +1095,10 @@ mod tests {
                  (1, 1, 0, 5000, 5000, 100, 50, 160, 80, 'exact', 'fixture', 5000),
                  (1, 1, 5000, 10000, 5000, 200, 100, 320, 160, 'exact', 'fixture', 10000);
              DROP INDEX idx_traffic_samples_rollup_cutoff;
-             DELETE FROM database_migrations WHERE version = 5;
+             DROP INDEX idx_traffic_samples_retention;
+             DROP INDEX idx_traffic_rollups_retention;
+             DROP INDEX idx_traffic_gaps_retention;
+             DELETE FROM database_migrations WHERE version >= 5;
              PRAGMA user_version = 4;",
         )
         .unwrap();
@@ -1113,14 +1127,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(preserved, (2, 300, 150, 0, 10_000));
-        assert!(conn
-            .prepare(
-                "SELECT 1 FROM sqlite_schema
-                 WHERE type = 'index' AND name = 'idx_traffic_samples_rollup_cutoff'",
-            )
-            .unwrap()
-            .exists([])
-            .unwrap());
+        assert_index_exists(&conn, "idx_traffic_samples_rollup_cutoff");
         assert_eq!(
             conn.query_row(
                 "SELECT name, source_version FROM database_migrations WHERE version = 5",
@@ -1129,6 +1136,83 @@ mod tests {
             )
             .unwrap(),
             ("traffic_rollup_cutoff_index".to_string(), 4)
+        );
+    }
+
+    #[test]
+    fn migrates_v5_retention_indexes_with_a_verified_backup() {
+        let directory = TestDirectory::new("v5-retention-index-migration");
+        let database = directory.join("v5.db");
+        create_current_database(&database, &directory.0);
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "INSERT INTO routers(
+                 id, internal_uuid, fallback_target, first_seen_at_ms, last_seen_at_ms
+             ) VALUES (1, 'retention-migration-router', '192.0.2.1', 0, 10000);
+             INSERT INTO router_interfaces(
+                 id, router_id, interface_key, name, kind, first_seen_at_ms, last_seen_at_ms
+             ) VALUES (1, 1, 'ether1', 'WAN', 'wan', 0, 10000);
+             INSERT INTO traffic_samples(
+                 router_id, interface_id, started_at_ms, ended_at_ms, duration_ms,
+                 download_bytes, upload_bytes, download_bps, upload_bps,
+                 quality, source, created_at_ms
+             ) VALUES
+                 (1, 1, 0, 5000, 5000, 100, 50, 160, 80, 'exact', 'fixture', 5000);
+             INSERT INTO traffic_rollups(
+                 router_id, interface_id, bucket_start_ms, bucket_end_ms, bucket_size_ms,
+                 exact_download_bytes, exact_upload_bytes, exact_duration_ms, sample_count,
+                 download_avg_bps, upload_avg_bps, source, created_at_ms
+             ) VALUES
+                 (1, 1, 0, 5000, 5000, 100, 50, 5000, 1, 160, 80, 'fixture', 5000);
+             INSERT INTO traffic_gaps(
+                 router_id, interface_id, started_at_ms, ended_at_ms,
+                 reason, details, created_at_ms
+             ) VALUES
+                 (1, 1, 5000, 10000, 'fixture-gap', 'preserve-me', 10000);
+             DROP INDEX idx_traffic_samples_retention;
+             DROP INDEX idx_traffic_rollups_retention;
+             DROP INDEX idx_traffic_gaps_retention;
+             DELETE FROM database_migrations WHERE version = 6;
+             PRAGMA user_version = 5;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let report = migrate_database(&database, Some(&directory.join("backups"))).unwrap();
+        assert_eq!(report.from_version, 5);
+        assert_eq!(report.to_version, CURRENT_SCHEMA_VERSION);
+        let backup = report.backup.as_ref().unwrap();
+        assert_eq!(backup.user_version, 5);
+        verify_manifest(&backup.path).unwrap();
+
+        let conn = Connection::open(&database).unwrap();
+        let preserved: (i64, i64, String) = conn
+            .query_row(
+                "SELECT
+                     (SELECT download_bytes FROM traffic_samples),
+                     (SELECT exact_download_bytes FROM traffic_rollups),
+                     (SELECT details FROM traffic_gaps)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(preserved, (100, 100, "preserve-me".to_string()));
+        for index in [
+            "idx_traffic_samples_rollup_cutoff",
+            "idx_traffic_samples_retention",
+            "idx_traffic_rollups_retention",
+            "idx_traffic_gaps_retention",
+        ] {
+            assert_index_exists(&conn, index);
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT name, source_version FROM database_migrations WHERE version = 6",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap(),
+            ("traffic_retention_cutoff_indexes".to_string(), 5)
         );
     }
 
@@ -1728,7 +1812,10 @@ mod tests {
         let conn = Connection::open(&database).unwrap();
         conn.execute_batch(
             "DROP INDEX idx_traffic_samples_rollup_cutoff;
-             DELETE FROM database_migrations WHERE version = 5;
+             DROP INDEX idx_traffic_samples_retention;
+             DROP INDEX idx_traffic_rollups_retention;
+             DROP INDEX idx_traffic_gaps_retention;
+             DELETE FROM database_migrations WHERE version >= 5;
              PRAGMA user_version = 4;",
         )
         .unwrap();
