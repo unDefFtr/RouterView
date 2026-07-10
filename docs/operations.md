@@ -320,6 +320,15 @@ resolved addresses must fall within `ROUTER_MANAGEMENT_CIDRS`, redirects and
 proxy environment variables must not escape that policy, and insecure HTTP is
 allowed only when explicitly enabled for a management subnet.
 
+The Caddy-only `edge` bridge is intentionally not marked `internal`; Docker
+Desktop does not reliably publish host ports for a container attached only to
+internal networks. This also gives Caddy a general outbound route. On hardened
+Linux hosts, use the `DOCKER-USER` chain to reject new outbound connections
+sourced from the `routerview_edge` subnet while allowing `ESTABLISHED,RELATED`
+traffic so published client connections can return normally. Apply an
+equivalent container-egress policy on Docker Desktop or other runtimes. Caddy
+reaches the backend over the separate internal `app` network.
+
 ## Disaster recovery checklist
 
 Keep these items outside the Docker host:
