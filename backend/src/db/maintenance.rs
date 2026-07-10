@@ -184,7 +184,8 @@ pub fn restore_database(
         ));
     }
     verify_manifest(source)?;
-    let source_conn = open_read_only(source)?;
+    // Restore exactly the manifest-covered main file; adjacent sidecars are untrusted.
+    let source_conn = open_immutable_backup(source)?;
     let source_report = check_connection(source, &source_conn)?;
     if source_report.user_version > CURRENT_SCHEMA_VERSION {
         return Err(DatabaseError::UnsupportedVersion {
@@ -208,8 +209,7 @@ pub fn restore_database(
     create_private_empty_file(&temporary)?;
     let restore_result = (|| -> DatabaseResult<()> {
         source_conn.backup(MAIN_DB, &temporary, None)?;
-        let restored = open_read_only(&temporary)?;
-        let restored_report = check_connection(&temporary, &restored)?;
+        let restored_report = normalize_and_check_snapshot(&temporary, false)?;
         if restored_report.table_counts != source_report.table_counts
             || restored_report.user_version != source_report.user_version
         {
@@ -217,7 +217,6 @@ pub fn restore_database(
                 "restored database metadata does not match the source backup".into(),
             ));
         }
-        drop(restored);
         sync_file(&temporary)?;
         set_private_permissions(&temporary)?;
         remove_sqlite_sidecars(target)?;
@@ -226,7 +225,7 @@ pub fn restore_database(
         Ok(())
     })();
     if restore_result.is_err() {
-        let _ = fs::remove_file(&temporary);
+        discard_sqlite_file_family(&temporary);
     }
     restore_result?;
 
@@ -519,7 +518,7 @@ pub fn export_legacy(path: &Path, destination: &Path) -> DatabaseResult<BackupAr
         Ok(())
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&temporary);
+        discard_sqlite_file_family(&temporary);
     }
     result?;
 
@@ -651,12 +650,9 @@ where
     let result = (|| -> DatabaseResult<DatabaseReport> {
         before_snapshot();
         source.backup(MAIN_DB, &temporary, None)?;
-        let backup_conn = open_read_only(&temporary)?;
         // The live source may advance during an online backup. Security and
         // consistency guarantees therefore come exclusively from the snapshot.
-        refuse_plaintext_secret_backup(&backup_conn)?;
-        let backup_report = check_connection(&temporary, &backup_conn)?;
-        drop(backup_conn);
+        let backup_report = normalize_and_check_snapshot(&temporary, true)?;
         sync_file(&temporary)?;
         set_private_permissions(&temporary)?;
         fs::rename(&temporary, destination)?;
@@ -664,7 +660,7 @@ where
         Ok(backup_report)
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&temporary);
+        discard_sqlite_file_family(&temporary);
     }
     let backup_report = result?;
     let sha256 = sha256_file(destination)?;
@@ -676,6 +672,40 @@ where
         user_version: backup_report.user_version,
         table_counts: backup_report.table_counts,
     })
+}
+
+fn normalize_and_check_snapshot(
+    path: &Path,
+    reject_plaintext_secrets: bool,
+) -> DatabaseResult<DatabaseReport> {
+    let result = (|| -> DatabaseResult<DatabaseReport> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let journal_mode: String =
+            conn.query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))?;
+        if !journal_mode.eq_ignore_ascii_case("delete") {
+            return Err(DatabaseError::Verification(format!(
+                "backup snapshot retained unexpected journal mode {journal_mode}"
+            )));
+        }
+        if reject_plaintext_secrets {
+            refuse_plaintext_secret_backup(&conn)?;
+        }
+        check_connection(path, &conn)
+    })();
+    let cleanup = remove_sqlite_sidecars(path);
+    match result {
+        Ok(report) => {
+            cleanup?;
+            Ok(report)
+        }
+        Err(error) => {
+            let _ = cleanup;
+            Err(error)
+        }
+    }
 }
 
 fn check_connection(path: &Path, conn: &Connection) -> DatabaseResult<DatabaseReport> {
@@ -736,6 +766,26 @@ pub(super) fn open_read_only(path: &Path) -> DatabaseResult<Connection> {
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    Ok(conn)
+}
+
+fn open_immutable_backup(path: &Path) -> DatabaseResult<Connection> {
+    let canonical = path.canonicalize()?;
+    let mut uri = url::Url::from_file_path(&canonical).map_err(|_| {
+        DatabaseError::Verification(format!(
+            "backup path cannot be represented as a file URI: {}",
+            path.display()
+        ))
+    })?;
+    uri.query_pairs_mut().append_pair("immutable", "1");
+    let conn = Connection::open_with_flags(
+        uri.as_str(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI,
     )?;
     conn.busy_timeout(Duration::from_secs(5))?;
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
@@ -913,6 +963,11 @@ fn sync_directory(path: &Path) -> DatabaseResult<()> {
     Ok(())
 }
 
+fn discard_sqlite_file_family(path: &Path) {
+    let _ = fs::remove_file(path);
+    let _ = remove_sqlite_sidecars(path);
+}
+
 fn remove_sqlite_sidecars(path: &Path) -> DatabaseResult<()> {
     for suffix in ["-wal", "-shm", "-journal"] {
         let sidecar = sqlite_related_path(path, suffix);
@@ -1038,6 +1093,29 @@ mod tests {
             .unwrap()
             .exists([name])
             .unwrap());
+    }
+
+    fn assert_no_sqlite_sidecars(path: &Path) {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert!(
+                !sqlite_related_path(path, suffix).exists(),
+                "unexpected SQLite sidecar: {}",
+                sqlite_related_path(path, suffix).display()
+            );
+        }
+    }
+
+    fn assert_no_partial_sqlite_files(directory: &Path) {
+        let leftovers: Vec<_> = fs::read_dir(directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .filter(|name| name.to_string_lossy().contains(".partial"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temporary SQLite files: {leftovers:?}"
+        );
     }
 
     #[test]
@@ -1500,18 +1578,20 @@ mod tests {
     fn plaintext_secret_blocks_manual_backup() {
         let directory = TestDirectory::new("plaintext-manual-backup-refusal");
         let database = directory.join("plaintext.db");
-        let conn = create_single_key_legacy_fixture(&database, false);
+        let conn = create_single_key_legacy_fixture(&database, true);
         conn.execute(
             "INSERT INTO config VALUES ('router_password', 'do-not-back-up-me')",
             [],
         )
         .unwrap();
-        drop(conn);
         let destination = directory.join("unsafe-backup.db");
 
         let error = backup_database(&database, &destination).unwrap_err();
+        drop(conn);
         assert!(error.to_string().contains("plaintext router password"));
         assert!(!destination.exists());
+        assert_no_sqlite_sidecars(&destination);
+        assert_no_partial_sqlite_files(&directory.0);
     }
 
     #[test]
@@ -1533,6 +1613,14 @@ mod tests {
             0o600
         );
         assert_eq!(backup.table_counts.get("config"), Some(&1));
+        let backup_conn = open_read_only(&destination).unwrap();
+        let journal_mode: String = backup_conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode, "delete");
+        drop(backup_conn);
+        assert_no_sqlite_sidecars(&destination);
+        assert_no_partial_sqlite_files(&directory.0);
     }
 
     #[test]
@@ -1551,6 +1639,20 @@ mod tests {
 
         assert_eq!(backup.table_counts.get("config"), Some(&1));
         verify_manifest(&destination).unwrap();
+        db.set_config("after_backup", "still_writable").unwrap();
+        let backup_conn = open_read_only(&destination).unwrap();
+        let journal_mode: String = backup_conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode, "delete");
+        assert!(!backup_conn
+            .prepare("SELECT 1 FROM config WHERE key = 'after_backup'")
+            .unwrap()
+            .exists([])
+            .unwrap());
+        drop(backup_conn);
+        assert_no_sqlite_sidecars(&destination);
+        assert_no_partial_sqlite_files(&directory.0);
         assert!(matches!(
             DatabaseLock::acquire(&database),
             Err(DatabaseError::InUse(_))
@@ -1609,10 +1711,17 @@ mod tests {
             .unwrap()
             .execute("INSERT INTO config VALUES ('marker', 'source')", [])
             .unwrap();
-        Connection::open(&target)
-            .unwrap()
+        let target_conn = Connection::open(&target).unwrap();
+        target_conn
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        target_conn
             .execute("INSERT INTO config VALUES ('marker', 'target')", [])
             .unwrap();
+        target_conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        drop(target_conn);
         let source_backup = directory.join("source-backup.db");
         backup_database(&source, &source_backup).unwrap();
 
@@ -1624,14 +1733,98 @@ mod tests {
         drop(lock);
 
         let restored = restore_database(&target, &source_backup, Some(&backups)).unwrap();
-        assert!(restored.recovery_backup.unwrap().path.exists());
-        let marker: String = Connection::open(&target)
-            .unwrap()
+        let recovery = restored.recovery_backup.unwrap();
+        assert!(recovery.path.exists());
+        let recovery_conn = open_read_only(&recovery.path).unwrap();
+        let recovery_mode: String = recovery_conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(recovery_mode, "delete");
+        let recovery_marker: String = recovery_conn
+            .query_row("SELECT value FROM config WHERE key = 'marker'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(recovery_marker, "target");
+        drop(recovery_conn);
+        assert_no_sqlite_sidecars(&recovery.path);
+
+        let target_conn = open_read_only(&target).unwrap();
+        let target_mode: String = target_conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(target_mode, "delete");
+        let marker: String = target_conn
             .query_row("SELECT value FROM config WHERE key = 'marker'", [], |row| {
                 row.get(0)
             })
             .unwrap();
         assert_eq!(marker, "source");
+        drop(target_conn);
+        assert_no_sqlite_sidecars(&target);
+        assert_no_partial_sqlite_files(&directory.0);
+        assert_no_partial_sqlite_files(&backups);
+    }
+
+    #[test]
+    fn restore_ignores_unmanifested_wal_and_supports_legacy_wal_header() {
+        let directory = TestDirectory::new("restore-immutable-source");
+        let source = directory.join("legacy backup #%?.db");
+        let target = directory.join("target.db");
+        let backups = directory.join("backups");
+        create_current_database(&source, &backups);
+        create_current_database(&target, &backups);
+
+        let writer = Connection::open(&source).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        writer
+            .execute("INSERT INTO config VALUES ('marker', 'manifest-main')", [])
+            .unwrap();
+        writer
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+
+        let manifest_sha = sha256_file(&source).unwrap();
+        write_manifest(&source, &manifest_sha).unwrap();
+        writer
+            .execute(
+                "UPDATE config SET value = 'unmanifested-wal' WHERE key = 'marker'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(sha256_file(&source).unwrap(), manifest_sha);
+        assert!(
+            sqlite_related_path(&source, "-wal")
+                .metadata()
+                .unwrap()
+                .len()
+                > 0
+        );
+
+        Connection::open(&target)
+            .unwrap()
+            .execute("INSERT INTO config VALUES ('marker', 'target')", [])
+            .unwrap();
+        restore_database(&target, &source, Some(&backups)).unwrap();
+
+        let restored = open_read_only(&target).unwrap();
+        let marker: String = restored
+            .query_row("SELECT value FROM config WHERE key = 'marker'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(marker, "manifest-main");
+        let journal_mode: String = restored
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode, "delete");
+        drop(restored);
+        drop(writer);
+        assert_no_sqlite_sidecars(&target);
+        assert_no_partial_sqlite_files(&directory.0);
+        assert_no_partial_sqlite_files(&backups);
     }
 
     #[test]
