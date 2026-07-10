@@ -86,7 +86,9 @@ FROM caddy:${CADDY_VERSION}-alpine AS caddy-runtime
 ARG APP_UID=10001
 ARG APP_GID=10001
 
-RUN addgroup -S -g "${APP_GID}" routerview \
+# Compose enables unprivileged low ports and drops all runtime capabilities.
+RUN setcap -r /usr/bin/caddy \
+    && addgroup -S -g "${APP_GID}" routerview \
     && adduser -S -D -H -u "${APP_UID}" -G routerview routerview \
     && mkdir -p /srv /data/caddy /config/caddy \
     && chown -R routerview:routerview /srv /data /config
