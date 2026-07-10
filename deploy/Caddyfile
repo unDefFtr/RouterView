@@ -9,6 +9,13 @@
 	}
 }
 
+http://{$ROUTERVIEW_DOMAIN:routerview.local} {
+	route {
+		header -Server
+		redir https://{$ROUTERVIEW_DOMAIN:routerview.local}{uri} 308
+	}
+}
+
 {$ROUTERVIEW_DOMAIN:routerview.local} {
 	tls internal
 	encode zstd gzip
