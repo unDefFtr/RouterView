@@ -8,15 +8,15 @@ use chacha20poly1305::{
 use hkdf::Hkdf;
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
+use zeroize::{Zeroize, Zeroizing};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncryptedSecret {
     pub ciphertext: Vec<u8>,
     pub nonce: Vec<u8>,
     pub key_id: String,
 }
 
-#[derive(Clone)]
 pub struct SecretCipher {
     master_key: [u8; 32],
     key_id: String,
@@ -33,14 +33,17 @@ impl std::fmt::Debug for SecretCipher {
 impl SecretCipher {
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, SecretError> {
         let path = path.as_ref();
-        let raw = std::fs::read(path).map_err(|source| SecretError::ReadKey {
+        let raw = Zeroizing::new(std::fs::read(path).map_err(|source| SecretError::ReadKey {
             path: path.display().to_string(),
             source,
-        })?;
-        let master_key = decode_master_key(&raw)?;
-        let digest = Sha256::digest(master_key);
+        })?);
+        let master_key = Zeroizing::new(decode_master_key(&raw)?);
+        let digest = Sha256::digest(&master_key[..]);
         let key_id = hex::encode(&digest[..8]);
-        Ok(Self { master_key, key_id })
+        Ok(Self {
+            master_key: *master_key,
+            key_id,
+        })
     }
 
     #[cfg(test)]
@@ -50,6 +53,11 @@ impl SecretCipher {
         Self { master_key, key_id }
     }
 
+    /// Stable, non-secret identifier used to match encrypted rows to a key.
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
     pub fn encrypt(
         &self,
         instance_id: &str,
@@ -57,7 +65,7 @@ impl SecretCipher {
         plaintext: &[u8],
     ) -> Result<EncryptedSecret, SecretError> {
         let key = self.derive_field_key(instance_id, field)?;
-        let cipher = XChaCha20Poly1305::new((&key).into());
+        let cipher = XChaCha20Poly1305::new((&*key).into());
         let mut nonce = [0u8; 24];
         OsRng.fill_bytes(&mut nonce);
         let aad = self.aad(instance_id, field);
@@ -93,7 +101,7 @@ impl SecretCipher {
             return Err(SecretError::InvalidNonce);
         }
         let key = self.derive_field_key(instance_id, field)?;
-        let cipher = XChaCha20Poly1305::new((&key).into());
+        let cipher = XChaCha20Poly1305::new((&*key).into());
         let aad = self.aad(instance_id, field);
         cipher
             .decrypt(
@@ -106,17 +114,27 @@ impl SecretCipher {
             .map_err(|_| SecretError::Decrypt)
     }
 
-    fn derive_field_key(&self, instance_id: &str, field: &str) -> Result<[u8; 32], SecretError> {
+    fn derive_field_key(
+        &self,
+        instance_id: &str,
+        field: &str,
+    ) -> Result<Zeroizing<[u8; 32]>, SecretError> {
         let hkdf = Hkdf::<Sha256>::new(Some(instance_id.as_bytes()), &self.master_key);
-        let mut key = [0u8; 32];
+        let mut key = Zeroizing::new([0u8; 32]);
         let info = format!("routerview/{field}/v1");
-        hkdf.expand(info.as_bytes(), &mut key)
+        hkdf.expand(info.as_bytes(), &mut key[..])
             .map_err(|_| SecretError::Derive)?;
         Ok(key)
     }
 
     fn aad(&self, instance_id: &str, field: &str) -> String {
         format!("routerview:{instance_id}:{field}:{}", self.key_id)
+    }
+}
+
+impl Drop for SecretCipher {
+    fn drop(&mut self) {
+        self.master_key.zeroize();
     }
 }
 
@@ -128,14 +146,19 @@ fn decode_master_key(raw: &[u8]) -> Result<[u8; 32], SecretError> {
     let text = std::str::from_utf8(raw)
         .map_err(|_| SecretError::InvalidKey)?
         .trim();
-    let decoded = if text.len() == 64 && text.bytes().all(|b| b.is_ascii_hexdigit()) {
-        hex::decode(text).map_err(|_| SecretError::InvalidKey)?
-    } else {
-        base64::engine::general_purpose::STANDARD
-            .decode(text)
-            .map_err(|_| SecretError::InvalidKey)?
-    };
-    decoded.try_into().map_err(|_| SecretError::InvalidKey)
+    let decoded = Zeroizing::new(
+        if text.len() == 64 && text.bytes().all(|b| b.is_ascii_hexdigit()) {
+            hex::decode(text).map_err(|_| SecretError::InvalidKey)?
+        } else {
+            base64::engine::general_purpose::STANDARD
+                .decode(text)
+                .map_err(|_| SecretError::InvalidKey)?
+        },
+    );
+    decoded
+        .as_slice()
+        .try_into()
+        .map_err(|_| SecretError::InvalidKey)
 }
 
 #[derive(Debug, thiserror::Error)]

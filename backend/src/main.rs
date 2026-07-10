@@ -2,6 +2,7 @@ mod config;
 mod config_store;
 mod db;
 mod error;
+mod key_cli;
 mod oui;
 mod router;
 mod state;
@@ -32,6 +33,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    if key_cli::run_if_requested()? {
+        return Ok(());
+    }
     if run_admin_cli()? {
         return Ok(());
     }

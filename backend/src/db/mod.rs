@@ -8,11 +8,16 @@ use tracing::{info, warn};
 
 use crate::secrets::EncryptedSecret;
 
+mod key_management;
 mod maintenance;
 mod schema;
 mod traffic_v4;
 mod types;
 
+#[allow(unused_imports)]
+pub use key_management::{
+    rotate_key, verify_key, KeyManagementError, KeyRotationReport, KeyVerificationReport,
+};
 pub use maintenance::{
     backup_database, check_database, export_legacy, migrate_database, restore_database,
 };
