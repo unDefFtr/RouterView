@@ -1,13 +1,15 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::net::IpAddr;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{Datelike, Timelike};
-use futures_util::FutureExt;
+use futures_util::{stream, FutureExt, StreamExt};
 use serde::Serialize;
 use tokio::sync::{broadcast, watch, RwLock};
+use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 use crate::backends::{
@@ -37,6 +39,8 @@ enum ProbeQuality {
 const PING_COUNT: usize = 3;
 const PING_GAP_MS: u64 = 200;
 const PING_TIMEOUT_SECS: u64 = 2;
+pub(crate) const MAX_PROBE_TARGETS: usize = 32;
+const MAX_CONCURRENT_PROBES: usize = 4;
 const MAX_RECONNECT_DELAY_SECS: u64 = 30;
 const AGGREGATE_INTERFACE_KEY: &str = "__aggregate__";
 const EXACT_TRAFFIC_SOURCE: &str = "routeros-counter";
@@ -490,6 +494,7 @@ impl PollEngine {
         // Use sleep-based polling so interval changes hot-reload
         let mut next_poll = tokio::time::Instant::now();
         let mut next_probe = tokio::time::Instant::now();
+        let mut probe_tasks = JoinSet::new();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         if *shutdown_rx.borrow() {
             self.mark_stopped();
@@ -510,14 +515,61 @@ impl PollEngine {
                     };
                     next_poll = tokio::time::Instant::now() + Duration::from_secs(secs);
                 }
-                _ = tokio::time::sleep_until(next_probe) => {
-                    if AssertUnwindSafe(self.probe_tick()).catch_unwind().await.is_err() {
-                        error!("Probe tick panicked; continuing poll supervision");
+                result = probe_tasks.join_next(), if !probe_tasks.is_empty() => {
+                    match result {
+                        Some(Ok(results)) => {
+                            if AssertUnwindSafe(self.record_probe_results(results))
+                                .catch_unwind()
+                                .await
+                                .is_err()
+                            {
+                                error!("Probe result processing panicked; continuing poll supervision");
+                            }
+                        }
+                        Some(Err(error)) if error.is_cancelled() => {
+                            debug!("Probe batch was cancelled");
+                        }
+                        Some(Err(error)) => {
+                            error!("Probe batch task failed: {error}");
+                        }
+                        None => {}
                     }
-                    let secs = {
-                        let cfg = self.config.read().await;
-                        cfg.probe_interval_secs
+                }
+                _ = tokio::time::sleep_until(next_probe) => {
+                    let (targets, configured_targets) = {
+                        let targets = self.probe_targets.read().await;
+                        (
+                            targets.iter().take(MAX_PROBE_TARGETS).cloned().collect(),
+                            targets.len(),
+                        )
                     };
+                    let (good_ms, poor_ms, secs) = {
+                        let cfg = self.config.read().await;
+                        (
+                            cfg.latency_good_ms as f64,
+                            cfg.latency_poor_ms as f64,
+                            cfg.probe_interval_secs,
+                        )
+                    };
+                    self.latency_good_ms = good_ms;
+                    self.latency_poor_ms = poor_ms;
+                    if configured_targets > MAX_PROBE_TARGETS {
+                        warn!(
+                            configured = configured_targets,
+                            limit = MAX_PROBE_TARGETS,
+                            "Probe target limit exceeded; probing only the first targets"
+                        );
+                    }
+                    if start_probe_batch(
+                        &mut probe_tasks,
+                        targets,
+                        self.latency_good_ms,
+                        self.latency_poor_ms,
+                    ) {
+                        debug!("Started latency probe batch");
+                    } else {
+                        debug!("Probe batch still running; skipped overlapping cycle");
+                    }
                     next_probe = tokio::time::Instant::now() + Duration::from_secs(secs);
                 }
                 changed = shutdown_rx.changed() => {
@@ -529,6 +581,7 @@ impl PollEngine {
             }
         }
 
+        shutdown_probe_tasks(&mut probe_tasks).await;
         self.mark_stopped();
     }
 
@@ -678,22 +731,7 @@ impl PollEngine {
         }
     }
 
-    /// Execute one latency probe cycle — send ICMP pings via surge-ping.
-    async fn probe_tick(&mut self) {
-        // Read latest targets and thresholds from shared state
-        let targets = self.probe_targets.read().await.clone();
-
-        // Hot-reload latency thresholds
-        {
-            let cfg = self.config.read().await;
-            self.latency_good_ms = cfg.latency_good_ms as f64;
-            self.latency_poor_ms = cfg.latency_poor_ms as f64;
-        }
-
-        debug!("Probe tick — pinging {} targets", targets.len());
-
-        let results = run_icmp_probes(&targets, self.latency_good_ms, self.latency_poor_ms).await;
-
+    async fn record_probe_results(&mut self, results: Vec<LatencyProbe>) {
         // ── Three-state quality classification ──
         let quality = classify_probe_quality(&results);
         self.stability_history.push(quality);
@@ -1473,53 +1511,76 @@ async fn connect_backend(
 // ICMP Latency Probe — real ping via surge-ping
 // ═══════════════════════════════════════════════════════════════════
 
-/// Run ICMP pings against all probe targets concurrently.
-///
-/// Uses surge-ping for raw ICMP echo requests. Each spawned task creates
-/// its own ICMP socket. All targets are pinged in parallel via `tokio::spawn`.
+fn start_probe_batch(
+    tasks: &mut JoinSet<Vec<LatencyProbe>>,
+    mut targets: Vec<(String, String, String)>,
+    latency_good_ms: f64,
+    latency_poor_ms: f64,
+) -> bool {
+    if !tasks.is_empty() {
+        return false;
+    }
+    targets.truncate(MAX_PROBE_TARGETS);
+    tasks.spawn(async move {
+        debug!("Probe batch pinging {} targets", targets.len());
+        run_icmp_probes(&targets, latency_good_ms, latency_poor_ms).await
+    });
+    true
+}
+
+async fn shutdown_probe_tasks(tasks: &mut JoinSet<Vec<LatencyProbe>>) {
+    tasks.abort_all();
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result {
+            if !error.is_cancelled() {
+                error!("Probe batch failed during shutdown: {error}");
+            }
+        }
+    }
+}
+
+/// Run ICMP pings with a fixed socket/future concurrency limit.
 async fn run_icmp_probes(
     targets: &[(String, String, String)],
     latency_good_ms: f64,
     latency_poor_ms: f64,
 ) -> Vec<LatencyProbe> {
-    // Fire all pings concurrently — each task owns its Client (raw socket)
-    let handles: Vec<_> = targets
-        .iter()
-        .map(|(name, host, cat)| {
-            let name = name.clone();
-            let host = host.clone();
-            let category = cat.clone();
-            let good = latency_good_ms;
-            let poor = latency_poor_ms;
-            let task_name = name.clone();
-            let task_host = host.clone();
-            let task_category = category.clone();
-            (
-                task_name,
-                task_host,
-                task_category,
-                tokio::spawn(async move { probe_one(&name, &host, &category, good, poor).await }),
-            )
-        })
-        .collect();
+    run_probe_futures(
+        targets,
+        latency_good_ms,
+        latency_poor_ms,
+        |name, host, category, good_ms, poor_ms| async move {
+            probe_one(&name, &host, &category, good_ms, poor_ms).await
+        },
+    )
+    .await
+}
 
-    let mut results = Vec::with_capacity(handles.len());
-    for (name, host, category, handle) in handles {
-        match handle.await {
-            Ok(probe) => results.push(probe),
-            Err(e) => {
-                warn!("Probe task for {name} ({host}) failed: {e}");
-                results.push(LatencyProbe {
-                    target: name,
-                    host,
-                    latency_ms: None,
-                    status: "unknown".to_string(),
-                    category,
-                });
+async fn run_probe_futures<F, Fut>(
+    targets: &[(String, String, String)],
+    latency_good_ms: f64,
+    latency_poor_ms: f64,
+    probe: F,
+) -> Vec<LatencyProbe>
+where
+    F: Fn(String, String, String, f64, f64) -> Fut + Clone,
+    Fut: Future<Output = LatencyProbe>,
+{
+    let mut results = stream::iter(targets.iter().take(MAX_PROBE_TARGETS).cloned().enumerate())
+        .map(move |(index, (name, host, category))| {
+            let probe = probe.clone();
+            async move {
+                (
+                    index,
+                    probe(name, host, category, latency_good_ms, latency_poor_ms).await,
+                )
             }
-        }
-    }
-    results
+        })
+        .buffer_unordered(MAX_CONCURRENT_PROBES)
+        .collect::<Vec<_>>()
+        .await;
+    results.sort_unstable_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, result)| result).collect()
 }
 
 /// Send N ICMP pings to a host, collecting individual RTTs.
@@ -1714,6 +1775,89 @@ fn reconnect_delay(failures: u32) -> Duration {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    #[tokio::test]
+    async fn probe_futures_bound_concurrency_and_target_count() {
+        let targets = (0..(MAX_PROBE_TARGETS + 8))
+            .map(|index| {
+                (
+                    format!("target-{index}"),
+                    format!("192.0.2.{index}"),
+                    "test".to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let results = run_probe_futures(&targets, 20.0, 100.0, {
+            let active = active.clone();
+            let peak = peak.clone();
+            let started = started.clone();
+            move |name, host, category, _, _| {
+                let active = active.clone();
+                let peak = peak.clone();
+                let started = started.clone();
+                async move {
+                    started.fetch_add(1, AtomicOrdering::SeqCst);
+                    let current = active.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                    peak.fetch_max(current, AtomicOrdering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    active.fetch_sub(1, AtomicOrdering::SeqCst);
+                    LatencyProbe {
+                        target: name,
+                        host,
+                        latency_ms: Some(1.0),
+                        status: "good".to_string(),
+                        category,
+                    }
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(results.len(), MAX_PROBE_TARGETS);
+        assert_eq!(started.load(AtomicOrdering::SeqCst), MAX_PROBE_TARGETS);
+        assert!(peak.load(AtomicOrdering::SeqCst) <= MAX_CONCURRENT_PROBES);
+        assert!(peak.load(AtomicOrdering::SeqCst) > 1);
+        assert_eq!(results[0].target, "target-0");
+        assert_eq!(
+            results.last().unwrap().target,
+            format!("target-{}", MAX_PROBE_TARGETS - 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_supervisor_refuses_overlap_and_awaits_shutdown_cleanup() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(signal) = self.0.take() {
+                    let _ = signal.send(());
+                }
+            }
+        }
+
+        let mut tasks = JoinSet::new();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        tasks.spawn(async move {
+            let _drop_signal = DropSignal(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<Vec<LatencyProbe>>().await
+        });
+        started_rx.await.unwrap();
+
+        assert!(!start_probe_batch(&mut tasks, Vec::new(), 20.0, 100.0));
+        shutdown_probe_tasks(&mut tasks).await;
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(tasks.is_empty());
+    }
 
     fn exact_traffic_fixture() -> (TrafficDb, i64, i64) {
         let db = TrafficDb::open(&PathBuf::from(":memory:")).unwrap();
