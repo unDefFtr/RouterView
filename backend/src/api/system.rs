@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::{extract::State, http::StatusCode, Json};
 use serde::Deserialize;
@@ -6,13 +7,56 @@ use serde_json::{json, Value};
 
 use crate::backends::{RouterBackend, RouterConnectionConfig, RouterType};
 use crate::error::{ApiJson, AppError};
+use crate::poller::engine::PollReadinessState;
 use crate::state::AppState;
 
-pub async fn health_check() -> Json<Value> {
-    Json(json!({
-        "status": "ok",
-        "version": env!("CARGO_PKG_VERSION"),
-    }))
+pub async fn readiness_check(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
+    let readiness = state.poller_control.readiness();
+    let poll_interval_secs = state.config.read().await.poll_interval_secs;
+    let (status, body) = readiness_response(&readiness, poll_interval_secs, Instant::now());
+    (status, Json(body))
+}
+
+fn readiness_response(
+    readiness: &crate::poller::engine::PollReadiness,
+    poll_interval_secs: u64,
+    now: Instant,
+) -> (StatusCode, Value) {
+    let stale_after_secs = poll_interval_secs.saturating_mul(3).max(15);
+    let fresh = readiness
+        .last_successful_at
+        .map(|last_success| {
+            now.saturating_duration_since(last_success) <= Duration::from_secs(stale_after_secs)
+        })
+        .unwrap_or(false);
+    let ready = readiness.state == PollReadinessState::Ready && fresh;
+    let reason = match readiness.state {
+        PollReadinessState::Starting => "poller_starting",
+        PollReadinessState::Degraded => "poller_degraded",
+        PollReadinessState::Stopped => "poller_stopped",
+        PollReadinessState::Ready if !fresh => "poller_stale",
+        PollReadinessState::Ready => "ready",
+    };
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        json!({
+            "status": if ready { "ready" } else { "not_ready" },
+            "reason": reason,
+            "version": env!("CARGO_PKG_VERSION"),
+            "poller": {
+                "state": readiness.state,
+                "router_connected": readiness.router_connected,
+                "consecutive_failures": readiness.consecutive_failures,
+                "last_successful_poll": readiness.last_successful_poll,
+                "stale_after_secs": stale_after_secs,
+            },
+        }),
+    )
 }
 
 pub async fn config_info(
@@ -24,7 +68,7 @@ pub async fn config_info(
         .get("wizard_completed")
         .is_some_and(|value| value == "true");
     let password_set = cfg.has_connection_config();
-    let password_hint = password_set.then_some("********").unwrap_or("");
+    let password_hint = if password_set { "********" } else { "" };
     Ok((
         StatusCode::OK,
         Json(json!({
@@ -393,6 +437,52 @@ pub async fn test_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn readiness(
+        state: PollReadinessState,
+        last_successful_at: Option<Instant>,
+    ) -> crate::poller::engine::PollReadiness {
+        crate::poller::engine::PollReadiness {
+            state,
+            router_connected: state == PollReadinessState::Ready,
+            consecutive_failures: 0,
+            last_successful_poll: Some("2026-07-10T00:00:00Z".into()),
+            last_successful_at,
+            last_error: Some("private router or database detail".into()),
+        }
+    }
+
+    #[test]
+    fn readiness_uses_monotonic_freshness_and_hides_internal_errors() {
+        let now = Instant::now();
+        let (fresh_status, fresh_body) = readiness_response(
+            &readiness(
+                PollReadinessState::Ready,
+                Some(now - Duration::from_secs(15)),
+            ),
+            5,
+            now,
+        );
+        assert_eq!(fresh_status, StatusCode::OK);
+        assert_eq!(fresh_body["reason"], "ready");
+        assert!(!fresh_body.to_string().contains("private router"));
+
+        let (stale_status, stale_body) = readiness_response(
+            &readiness(
+                PollReadinessState::Ready,
+                Some(now - Duration::from_secs(16)),
+            ),
+            5,
+            now,
+        );
+        assert_eq!(stale_status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(stale_body["reason"], "poller_stale");
+
+        let (degraded_status, degraded_body) =
+            readiness_response(&readiness(PollReadinessState::Degraded, Some(now)), 5, now);
+        assert_eq!(degraded_status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(degraded_body["reason"], "poller_degraded");
+    }
 
     #[test]
     fn legacy_connection_fields_deserialize_into_canonical_draft() {

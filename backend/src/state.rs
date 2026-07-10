@@ -1,10 +1,11 @@
 use crate::auth::AuthSecurity;
 use crate::config_store::MergedConfig;
 use crate::db::TrafficDb;
+use crate::poller::engine::PollEngineControl;
 use crate::secrets::SecretCipher;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, watch, RwLock, Semaphore};
 
 use crate::ws::limits::WsConnectionLimiter;
 use crate::ws::protocol::{DashboardSnapshot, ServerMessage};
@@ -33,4 +34,10 @@ pub struct AppState {
     pub auth_security: Arc<AuthSecurity>,
     /// Location of the one-time setup token delivered through the filesystem.
     pub setup_token_path: PathBuf,
+    /// Poller readiness and shutdown control owned by the process supervisor.
+    pub poller_control: PollEngineControl,
+    /// Process-wide shutdown notification used by upgraded WebSocket sessions.
+    pub shutdown_tx: watch::Sender<bool>,
+    /// Bounds expensive historical traffic queries independently of request count.
+    pub traffic_query_limit: Arc<Semaphore>,
 }

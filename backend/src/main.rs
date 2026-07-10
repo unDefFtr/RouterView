@@ -14,8 +14,13 @@ mod poller;
 mod secrets;
 mod ws;
 
+use std::future::{Future, IntoFuture};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use std::time::Duration;
+
+use futures_util::FutureExt;
+use tokio::sync::{broadcast, watch};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use crate::config::Config;
@@ -88,6 +93,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let snapshot_cache: Arc<tokio::sync::RwLock<Option<Arc<ws::protocol::DashboardSnapshot>>>> =
         Arc::new(tokio::sync::RwLock::new(None));
 
+    // Construct the poller before spawning it so process supervision owns its
+    // control handle and can expose readiness immediately.
+    let poll_engine = poller::engine::PollEngine::new(
+        config.clone(),
+        broadcast_tx.clone(),
+        snapshot_cache.clone(),
+        traffic_db.clone(),
+        probe_targets_arc.clone(),
+    )
+    .await;
+    let poller_control = poll_engine.control();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
     // Build shared application state
     let app_state = Arc::new(AppState {
         config: config.clone(),
@@ -105,67 +123,326 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         public_origin: env_config.public_origin.clone(),
         auth_security: Arc::new(auth::AuthSecurity::new()?),
         setup_token_path: std::path::PathBuf::from(&env_config.setup_token_file),
+        poller_control: poller_control.clone(),
+        shutdown_tx: shutdown_tx.clone(),
+        traffic_query_limit: Arc::new(tokio::sync::Semaphore::new(2)),
     });
-
-    // Start the poll engine in a background task
-    {
-        let state = app_state.clone();
-        tokio::spawn(async move {
-            poller::engine::PollEngine::new(
-                state.config.clone(),
-                state.broadcast_tx.clone(),
-                snapshot_cache,
-                traffic_db,
-                state.probe_targets.clone(),
-            )
-            .await
-            .run()
-            .await;
-        });
-    }
 
     // Build the router
     let app = router::create_router(app_state.clone());
 
-    if auth::issue_setup_token(&app_state.traffic_db, &app_state.setup_token_path)? {
-        let setup_addr = format!("127.0.0.1:{}", env_config.setup_port);
-        let setup_listener = tokio::net::TcpListener::bind(&setup_addr).await?;
-        let setup_app = router::create_setup_router(app_state.clone());
-        tracing::warn!(
-            "Initial setup required. Loopback setup token was written to {} (valid 15 minutes)",
-            app_state.setup_token_path.display()
-        );
-        tracing::info!("Setup listener available at http://{setup_addr}/api/auth/setup");
-        tokio::spawn(async move {
-            if let Err(error) = axum::serve(setup_listener, setup_app).await {
-                tracing::error!("setup listener failed: {error}");
-            }
-        });
-        let setup_token_path = app_state.setup_token_path.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(auth::SETUP_TOKEN_TTL_SECS)).await;
-            if let Err(error) = auth::remove_setup_token_file(&setup_token_path) {
-                tracing::error!("failed to remove expired setup token file: {error}");
-            }
-        });
-    }
-
-    // Bind and serve
     let server_port = {
         let cfg = config.read().await;
         cfg.server_port
     };
-    let addr = format!("0.0.0.0:{}", server_port);
-    tracing::info!("Server listening on http://{}", addr);
-
+    let addr = format!("0.0.0.0:{server_port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(
+
+    let mut setup_server = None;
+    if app_state.traffic_db.admin()?.is_none() {
+        let setup_addr = format!("127.0.0.1:{}", env_config.setup_port);
+        let setup_listener = tokio::net::TcpListener::bind(&setup_addr).await?;
+        if auth::issue_setup_token(&app_state.traffic_db, &app_state.setup_token_path)? {
+            let setup_app = router::create_setup_router(app_state.clone());
+            tracing::warn!(
+                "Initial setup required. Loopback setup token was written to {} (valid 15 minutes)",
+                app_state.setup_token_path.display()
+            );
+            tracing::info!("Setup listener available at http://{setup_addr}/api/auth/setup");
+            setup_server = Some((setup_listener, setup_app));
+        }
+    } else {
+        auth::issue_setup_token(&app_state.traffic_db, &app_state.setup_token_path)?;
+    }
+
+    let poller_supervisor = poller_control.clone();
+    let mut poller_handle = tokio::spawn(async move {
+        match AssertUnwindSafe(poll_engine.run()).catch_unwind().await {
+            Ok(()) if poller_supervisor.shutdown_requested() => Ok(()),
+            Ok(()) => {
+                let message = "poller task exited unexpectedly".to_string();
+                poller_supervisor.report_unexpected_exit(message.clone());
+                Err(message)
+            }
+            Err(_) => {
+                let message = "poller task panicked outside an isolated tick".to_string();
+                poller_supervisor.report_unexpected_exit(message.clone());
+                Err(message)
+            }
+        }
+    });
+
+    let (setup_shutdown_tx, setup_shutdown_rx) = watch::channel(false);
+    let mut setup_handle = setup_server.map(|(listener, setup_app)| {
+        let process_shutdown = shutdown_tx.subscribe();
+        let setup_shutdown = setup_shutdown_rx;
+        let failure_shutdown = shutdown_tx.clone();
+        tokio::spawn(async move {
+            let server = axum::serve(listener, setup_app)
+                .with_graceful_shutdown(wait_for_either_shutdown(process_shutdown, setup_shutdown))
+                .into_future();
+            supervise_setup_server(server, failure_shutdown).await
+        })
+    });
+
+    let mut setup_token_handle = if setup_handle.is_some() {
+        let setup_token_path = app_state.setup_token_path.clone();
+        let process_shutdown = shutdown_tx.subscribe();
+        let setup_shutdown = setup_shutdown_tx.clone();
+        Some(tokio::spawn(async move {
+            let expires_at =
+                tokio::time::Instant::now() + Duration::from_secs(auth::SETUP_TOKEN_TTL_SECS);
+            let mut process_shutdown = process_shutdown;
+            loop {
+                if !setup_token_path.exists() || *process_shutdown.borrow() {
+                    break;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep_until(expires_at) => break,
+                    changed = process_shutdown.changed() => {
+                        if changed.is_err() || *process_shutdown.borrow() {
+                            break;
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                }
+            }
+            if let Err(error) = auth::remove_setup_token_file(&setup_token_path) {
+                tracing::error!("failed to remove setup token file: {error}");
+            }
+            setup_shutdown.send_replace(true);
+        }))
+    } else {
+        None
+    };
+
+    let signal_shutdown = shutdown_tx.clone();
+    let signal_poller = poller_control.clone();
+    let mut signal_handle = tokio::spawn(async move {
+        shutdown_signal().await;
+        tracing::info!("Shutdown signal received");
+        signal_poller.request_shutdown();
+        signal_shutdown.send_replace(true);
+    });
+
+    tracing::info!("Server listening on http://{addr}");
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .await?;
+    .with_graceful_shutdown(wait_for_shutdown(shutdown_rx))
+    .into_future();
+    tokio::pin!(server);
+
+    let mut poller_finished = false;
+    let mut signal_finished = false;
+    let mut supervision_error = None;
+    let server_result = tokio::select! {
+        result = &mut server => result,
+        result = &mut poller_handle => {
+            poller_finished = true;
+            match result {
+                Ok(Ok(())) if poller_control.shutdown_requested() => {}
+                Ok(Ok(())) => supervision_error = Some("poller task stopped unexpectedly".to_string()),
+                Ok(Err(error)) => supervision_error = Some(error),
+                Err(error) => {
+                    poller_control.report_unexpected_exit(format!("poller supervisor failed: {error}"));
+                    supervision_error = Some(format!("poller supervisor failed: {error}"));
+                }
+            }
+            shutdown_tx.send_replace(true);
+            poller_control.request_shutdown();
+            match tokio::time::timeout(Duration::from_secs(30), server.as_mut()).await {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::warn!("HTTP graceful shutdown exceeded 30 seconds");
+                    Ok(())
+                }
+            }
+        },
+        result = &mut signal_handle => {
+            signal_finished = true;
+            if let Err(error) = result {
+                supervision_error = Some(format!("shutdown signal task failed: {error}"));
+            }
+            shutdown_tx.send_replace(true);
+            setup_shutdown_tx.send_replace(true);
+            poller_control.request_shutdown();
+            match tokio::time::timeout(Duration::from_secs(30), async {
+                tokio::join!(server.as_mut(), &mut poller_handle)
+            }).await {
+                Ok((server_result, poller_result)) => {
+                    poller_finished = true;
+                    match poller_result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            supervision_error.get_or_insert(error);
+                        }
+                        Err(error) => {
+                            supervision_error
+                                .get_or_insert_with(|| format!("poller join failed: {error}"));
+                        }
+                    }
+                    server_result
+                }
+                Err(_) => {
+                    supervision_error
+                        .get_or_insert_with(|| "graceful shutdown exceeded 30 seconds".to_string());
+                    let _ = abort_and_wait(&mut poller_handle).await;
+                    poller_finished = true;
+                    Ok(())
+                }
+            }
+        }
+    };
+
+    shutdown_tx.send_replace(true);
+    setup_shutdown_tx.send_replace(true);
+    poller_control.request_shutdown();
+    if !signal_finished {
+        let _ = abort_and_wait(&mut signal_handle).await;
+    }
+
+    if !poller_finished {
+        match tokio::time::timeout(Duration::from_secs(10), &mut poller_handle).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => {
+                supervision_error.get_or_insert(error);
+            }
+            Ok(Err(error)) => {
+                supervision_error.get_or_insert_with(|| format!("poller join failed: {error}"));
+            }
+            Err(_) => {
+                tracing::error!("Poller did not stop within 10 seconds; aborting task");
+                let _ = abort_and_wait(&mut poller_handle).await;
+                supervision_error
+                    .get_or_insert_with(|| "poller shutdown exceeded 10 seconds".to_string());
+            }
+        }
+    }
+
+    if let Some(handle) = setup_handle.as_mut() {
+        match tokio::time::timeout(Duration::from_secs(5), &mut *handle).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => {
+                supervision_error.get_or_insert(error);
+            }
+            Ok(Err(error)) => {
+                supervision_error
+                    .get_or_insert_with(|| format!("setup listener join failed: {error}"));
+            }
+            Err(_) => {
+                let _ = abort_and_wait(handle).await;
+                supervision_error
+                    .get_or_insert_with(|| "setup listener shutdown timed out".to_string());
+            }
+        }
+    }
+    if let Some(handle) = setup_token_handle.as_mut() {
+        match tokio::time::timeout(Duration::from_secs(5), &mut *handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                supervision_error
+                    .get_or_insert_with(|| format!("setup token task failed: {error}"));
+            }
+            Err(_) => {
+                let _ = abort_and_wait(handle).await;
+                supervision_error
+                    .get_or_insert_with(|| "setup token cleanup timed out".to_string());
+            }
+        }
+    }
+
+    server_result?;
+    if let Some(error) = supervision_error {
+        return Err(std::io::Error::other(error).into());
+    }
 
     Ok(())
+}
+
+async fn supervise_setup_server<F, E>(
+    server: F,
+    failure_shutdown: watch::Sender<bool>,
+) -> Result<(), String>
+where
+    F: Future<Output = Result<(), E>>,
+    E: std::fmt::Display,
+{
+    match AssertUnwindSafe(server).catch_unwind().await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            let message = format!("setup listener failed: {error}");
+            failure_shutdown.send_replace(true);
+            Err(message)
+        }
+        Err(_) => {
+            let message = "setup listener panicked".to_string();
+            failure_shutdown.send_replace(true);
+            Err(message)
+        }
+    }
+}
+
+async fn abort_and_wait<T>(
+    handle: &mut tokio::task::JoinHandle<T>,
+) -> Result<T, tokio::task::JoinError> {
+    handle.abort();
+    handle.await
+}
+
+async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
+    if *shutdown.borrow() {
+        return;
+    }
+    while shutdown.changed().await.is_ok() {
+        if *shutdown.borrow() {
+            return;
+        }
+    }
+}
+
+async fn wait_for_either_shutdown(
+    process_shutdown: watch::Receiver<bool>,
+    setup_shutdown: watch::Receiver<bool>,
+) {
+    tokio::select! {
+        _ = wait_for_shutdown(process_shutdown) => {}
+        _ = wait_for_shutdown(setup_shutdown) => {}
+    }
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {}
+            Err(error) => {
+                tracing::error!("failed to install Ctrl+C handler: {error}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => {
+                tracing::error!("failed to install SIGTERM handler: {error}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }
 
 fn run_admin_cli() -> Result<bool, Box<dyn std::error::Error>> {
@@ -355,4 +632,83 @@ fn print_backup(backup: &db::BackupArtifact) {
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn setup_server_failure_and_panic_request_process_shutdown() {
+        let (failure_tx, failure_rx) = watch::channel(false);
+        let error = supervise_setup_server(
+            async { Err(std::io::Error::other("listener error")) },
+            failure_tx,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("listener error"));
+        assert!(*failure_rx.borrow());
+
+        let (panic_tx, panic_rx) = watch::channel(false);
+        let error = supervise_setup_server(
+            async {
+                panic!("listener panic");
+                #[allow(unreachable_code)]
+                Ok::<(), std::io::Error>(())
+            },
+            panic_tx,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "setup listener panicked");
+        assert!(*panic_rx.borrow());
+    }
+
+    #[tokio::test]
+    async fn process_and_setup_shutdown_watchers_return_promptly() {
+        let (already_tx, already_rx) = watch::channel(false);
+        already_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), wait_for_shutdown(already_rx))
+            .await
+            .unwrap();
+
+        let (_process_tx, process_rx) = watch::channel(false);
+        let (setup_tx, setup_rx) = watch::channel(false);
+        let waiter = tokio::spawn(wait_for_either_shutdown(process_rx, setup_rx));
+        setup_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn forced_abort_waits_for_task_cleanup() {
+        struct CleanupSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for CleanupSignal {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel();
+        let mut handle = tokio::spawn(async move {
+            let _cleanup = CleanupSignal(Some(cleanup_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+
+        let error = abort_and_wait(&mut handle).await.unwrap_err();
+        assert!(error.is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), cleanup_rx)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 }

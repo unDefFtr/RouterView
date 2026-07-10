@@ -10,6 +10,13 @@ use crate::{auth, auth::SessionContext};
 
 const SESSION_REVALIDATE_SECS: u64 = 30;
 
+fn shutdown_close_frame() -> CloseFrame {
+    CloseFrame {
+        code: 1001,
+        reason: "server shutting down".into(),
+    }
+}
+
 /// Run a single WebSocket client session.
 ///
 /// Subscribes to the broadcast channel and streams messages to the client.
@@ -29,6 +36,7 @@ pub async fn run_session(socket: WebSocket, state: Arc<AppState>, auth_session: 
 
     // Subscribe to the broadcast channel
     let mut broadcast_rx = state.broadcast_tx.subscribe();
+    let mut shutdown_rx = state.shutdown_tx.subscribe();
     let mut session_check =
         tokio::time::interval(std::time::Duration::from_secs(SESSION_REVALIDATE_SECS));
     session_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -56,6 +64,15 @@ pub async fn run_session(socket: WebSocket, state: Arc<AppState>, auth_session: 
 
     loop {
         tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    let _ = sender
+                        .send(Message::Close(Some(shutdown_close_frame())))
+                        .await;
+                    break;
+                }
+            }
+
             _ = session_check.tick() => {
                 if !auth::revalidate_session(&state.traffic_db, &auth_session).unwrap_or(false) {
                     let _ = sender
@@ -152,5 +169,12 @@ mod tests {
         )));
         assert!(!is_client_data_message(&Message::Ping(vec![].into())));
         assert!(!is_client_data_message(&Message::Pong(vec![].into())));
+    }
+
+    #[test]
+    fn process_shutdown_uses_going_away_close_frame() {
+        let frame = shutdown_close_frame();
+        assert_eq!(frame.code, 1001);
+        assert_eq!(frame.reason, "server shutting down");
     }
 }

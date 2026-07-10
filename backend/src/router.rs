@@ -43,6 +43,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 
     Router::new()
         .route("/api/health", get(auth::health))
+        .route("/api/ready", get(api::system::readiness_check))
         .route("/api/auth/status", get(auth::status))
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/pair", post(auth::pair))

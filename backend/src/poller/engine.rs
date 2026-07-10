@@ -100,6 +100,8 @@ pub struct PollReadiness {
     pub router_connected: bool,
     pub consecutive_failures: u32,
     pub last_successful_poll: Option<String>,
+    #[serde(skip)]
+    pub last_successful_at: Option<Instant>,
     pub last_error: Option<String>,
 }
 
@@ -135,6 +137,7 @@ impl PollEngineControl {
             router_connected: false,
             consecutive_failures: previous.consecutive_failures.saturating_add(1),
             last_successful_poll: previous.last_successful_poll,
+            last_successful_at: previous.last_successful_at,
             last_error: Some(message.into()),
         });
     }
@@ -246,6 +249,7 @@ impl PollEngine {
             router_connected: false,
             consecutive_failures: 0,
             last_successful_poll: None,
+            last_successful_at: None,
             last_error: None,
         };
         let (readiness_tx, _) = watch::channel(initial_readiness);
@@ -328,6 +332,7 @@ impl PollEngine {
             router_connected: true,
             consecutive_failures: 0,
             last_successful_poll: Some(chrono::Utc::now().to_rfc3339()),
+            last_successful_at: Some(Instant::now()),
             last_error: None,
         });
     }
@@ -344,6 +349,7 @@ impl PollEngine {
             router_connected: false,
             consecutive_failures: self.consecutive_poll_failures,
             last_successful_poll: previous.last_successful_poll,
+            last_successful_at: previous.last_successful_at,
             last_error: Some(message),
         });
     }
@@ -356,6 +362,7 @@ impl PollEngine {
             router_connected: true,
             consecutive_failures: self.consecutive_poll_failures,
             last_successful_poll: previous.last_successful_poll,
+            last_successful_at: previous.last_successful_at,
             last_error: Some(message),
         });
     }
@@ -368,6 +375,7 @@ impl PollEngine {
             router_connected: false,
             consecutive_failures: self.consecutive_poll_failures,
             last_successful_poll: previous.last_successful_poll,
+            last_successful_at: previous.last_successful_at,
             last_error: Some(message),
         });
     }
@@ -379,6 +387,7 @@ impl PollEngine {
             router_connected: false,
             consecutive_failures: previous.consecutive_failures,
             last_successful_poll: previous.last_successful_poll,
+            last_successful_at: previous.last_successful_at,
             last_error: previous.last_error,
         });
     }
@@ -1854,6 +1863,7 @@ mod tests {
             router_connected: false,
             consecutive_failures: 0,
             last_successful_poll: None,
+            last_successful_at: None,
             last_error: None,
         };
         let (readiness_tx, _) = watch::channel(readiness.clone());

@@ -555,7 +555,13 @@ pub fn issue_setup_token(db: &TrafficDb, path: &FsPath) -> Result<bool, AppError
     }
     let token = random_token();
     db.store_setup_token(&hash_token(&token), unix_time() + SETUP_SECS)?;
-    write_setup_token_file(path, &token)?;
+    if let Err(error) = write_setup_token_file(path, &token) {
+        if let Err(cleanup_error) = db.store_setup_token(&[], 0) {
+            tracing::error!(%cleanup_error, "failed to invalidate setup token after file write failure");
+        }
+        let _ = remove_setup_token_file(path);
+        return Err(error);
+    }
     Ok(true)
 }
 
@@ -905,7 +911,7 @@ fn normalize_username(value: &str) -> Result<String, AppError> {
 }
 
 fn validate_password(value: &str) -> Result<(), AppError> {
-    if !(12..=128).contains(&value.as_bytes().len()) {
+    if !(12..=128).contains(&value.len()) {
         return Err(AppError::InvalidData(
             "password must be 12 to 128 UTF-8 bytes".into(),
         ));
@@ -1089,6 +1095,35 @@ mod tests {
         remove_setup_token_file(&path).unwrap();
         assert!(!path.exists());
         remove_setup_token_file(&path).unwrap();
+    }
+
+    #[test]
+    fn setup_token_publication_failure_invalidates_database_token() {
+        let directory = std::env::temp_dir().join(format!(
+            "routerview-setup-token-rollback-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let database_path = directory.join("routerview.db");
+        let database = TrafficDb::open(&database_path).unwrap();
+        let unavailable_path = directory.join("missing-parent/setup-token");
+
+        assert!(issue_setup_token(&database, &unavailable_path).is_err());
+
+        let verification = rusqlite::Connection::open(&database_path).unwrap();
+        let stored: (i64, i64) = verification
+            .query_row(
+                "SELECT length(token_hash), expires_at FROM setup_tokens WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (0, 0));
+        assert!(!unavailable_path.exists());
+
+        drop(verification);
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
