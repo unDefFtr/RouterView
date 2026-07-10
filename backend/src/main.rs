@@ -27,6 +27,8 @@ use crate::config::Config;
 use crate::config_store::ConfigStore;
 use crate::state::AppState;
 
+const WS_SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing
@@ -115,6 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ws::limits::MAX_CONNECTIONS_PER_SESSION,
             ws::limits::MAX_CONNECTIONS_PER_SOURCE,
         )),
+        ws_sessions: Arc::new(ws::tracker::WsSessionTracker::new()),
         last_snapshot: snapshot_cache.clone(),
         traffic_db: traffic_db.clone(),
         probe_targets: probe_targets_arc.clone(),
@@ -301,6 +304,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     shutdown_tx.send_replace(true);
     setup_shutdown_tx.send_replace(true);
     poller_control.request_shutdown();
+    if let Err(active) =
+        shutdown_websocket_sessions(&app_state.ws_sessions, WS_SESSION_SHUTDOWN_TIMEOUT).await
+    {
+        let timeout_secs = WS_SESSION_SHUTDOWN_TIMEOUT.as_secs();
+        tracing::error!(active, "WebSocket sessions did not stop before timeout");
+        supervision_error.get_or_insert_with(|| {
+            format!(
+                "websocket shutdown exceeded {timeout_secs} seconds \
+                 ({active} sessions still active)"
+            )
+        });
+    }
     if !signal_finished {
         let _ = abort_and_wait(&mut signal_handle).await;
     }
@@ -391,6 +406,16 @@ async fn abort_and_wait<T>(
 ) -> Result<T, tokio::task::JoinError> {
     handle.abort();
     handle.await
+}
+
+async fn shutdown_websocket_sessions(
+    tracker: &ws::tracker::WsSessionTracker,
+    timeout: Duration,
+) -> Result<(), usize> {
+    tracker.stop_accepting();
+    tokio::time::timeout(timeout, tracker.wait_for_empty())
+        .await
+        .map_err(|_| tracker.active())
 }
 
 async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
@@ -712,5 +737,21 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn supervisor_waits_for_upgraded_websocket_tasks() {
+        let tracker = Arc::new(ws::tracker::WsSessionTracker::new());
+        let session = tracker.try_register().unwrap();
+        tracker.stop_accepting();
+        let waiter = tokio::spawn({
+            let tracker = tracker.clone();
+            async move { shutdown_websocket_sessions(&tracker, Duration::from_secs(1)).await }
+        });
+
+        assert!(!waiter.is_finished());
+        assert!(tracker.try_register().is_none());
+        drop(session);
+        assert_eq!(waiter.await.unwrap(), Ok(()));
     }
 }

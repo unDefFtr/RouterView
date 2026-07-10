@@ -12,6 +12,7 @@ use crate::error::AppError;
 use crate::state::AppState;
 use crate::ws::limits::WsConnectionPermit;
 use crate::ws::session;
+use crate::ws::tracker::WsSessionGuard;
 
 const MAX_CLIENT_FRAME_BYTES: usize = 4 * 1024;
 const MAX_CLIENT_MESSAGE_BYTES: usize = 4 * 1024;
@@ -37,10 +38,21 @@ pub async fn ws_upgrade(
                 retry_after_secs: 1,
             }
         })?;
+    let session_guard =
+        state
+            .ws_sessions
+            .try_register()
+            .ok_or_else(|| AppError::InvalidRequest {
+                status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                code: "server_shutting_down",
+                message: "Server is shutting down".to_string(),
+            })?;
     Ok(ws
         .max_frame_size(MAX_CLIENT_FRAME_BYTES)
         .max_message_size(MAX_CLIENT_MESSAGE_BYTES)
-        .on_upgrade(move |socket| handle_ws_connection(socket, state, auth_session, permit))
+        .on_upgrade(move |socket| {
+            handle_ws_connection(socket, state, auth_session, permit, session_guard)
+        })
         .into_response())
 }
 
@@ -50,6 +62,7 @@ async fn handle_ws_connection(
     state: Arc<AppState>,
     auth_session: SessionContext,
     permit: WsConnectionPermit,
+    _session_guard: WsSessionGuard,
 ) {
     let conn_count = state.ws_connections.total();
     info!("WebSocket client connected (total: {conn_count})");

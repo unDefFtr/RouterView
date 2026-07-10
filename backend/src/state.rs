@@ -9,6 +9,7 @@ use tokio::sync::{broadcast, watch, RwLock, Semaphore};
 
 use crate::ws::limits::WsConnectionLimiter;
 use crate::ws::protocol::{DashboardSnapshot, ServerMessage};
+use crate::ws::tracker::WsSessionTracker;
 
 /// Shared application state accessible by all handlers.
 pub struct AppState {
@@ -18,6 +19,8 @@ pub struct AppState {
     pub broadcast_tx: broadcast::Sender<Arc<ServerMessage>>,
     /// Global, per-session and per-source WebSocket connection accounting.
     pub ws_connections: Arc<WsConnectionLimiter>,
+    /// Tracks upgraded WebSocket tasks so process shutdown can await them.
+    pub ws_sessions: Arc<WsSessionTracker>,
     /// Latest dashboard snapshot, updated on every successful poll.
     pub last_snapshot: Arc<RwLock<Option<Arc<DashboardSnapshot>>>>,
     /// SQLite traffic history database.
