@@ -21,15 +21,18 @@ describe('ProbeTargetEditor keyboard ordering', () => {
     apiMocks.fetchProbeTargets.mockResolvedValue({
       targets: [
         { name: 'DNS A', host: '1.1.1.1', category: 'dns', sort_order: 0 },
-        { name: 'DNS B', host: '8.8.8.8', category: 'dns', sort_order: 1 },
-        { name: 'Cloud', host: 'cloud.example', category: 'cloud', sort_order: 2 },
+        { name: 'Cloud', host: 'cloud.example', category: 'cloud', sort_order: 1 },
+        { name: 'DNS B', host: '8.8.8.8', category: 'dns', sort_order: 2 },
+        { name: 'Repo', host: 'repo.example', category: 'repo', sort_order: 3 },
+        { name: 'DNS C', host: '9.9.9.9', category: 'dns', sort_order: 4 },
       ],
     });
   });
 
-  it('moves adjacent targets with arrow keys without crossing categories', async () => {
+  it('moves non-adjacent category peers while preserving the focused target', async () => {
     const wrapper = mount(ProbeTargetEditor, {
       global: { stubs: { FeatherIcon: true } },
+      attachTo: document.body,
     });
     await flushPromises();
 
@@ -37,10 +40,21 @@ describe('ProbeTargetEditor keyboard ordering', () => {
       .findAll<HTMLInputElement>('input[aria-label$="名称"]')
       .map((input) => input.element.value);
 
-    await wrapper.findAll('.grip-handle')[0].trigger('keydown', { key: 'ArrowDown' });
-    expect(names()).toEqual(['DNS B', 'DNS A', 'Cloud']);
+    const moveDown = wrapper.get<HTMLButtonElement>('button[aria-label="下移 DNS A"]');
+    moveDown.element.focus();
+    await moveDown.trigger('click');
+    await flushPromises();
+    expect(names()).toEqual(['Cloud', 'DNS B', 'DNS A', 'Repo', 'DNS C']);
+    expect(document.activeElement).toBe(moveDown.element);
 
-    await wrapper.findAll('.grip-handle')[1].trigger('keydown', { key: 'ArrowDown' });
-    expect(names()).toEqual(['DNS B', 'DNS A', 'Cloud']);
+    await moveDown.trigger('click');
+    await flushPromises();
+    expect(names()).toEqual(['Cloud', 'DNS B', 'Repo', 'DNS C', 'DNS A']);
+    expect(moveDown.attributes('disabled')).toBeDefined();
+    expect(document.activeElement).toBe(
+      wrapper.get<HTMLButtonElement>('button[aria-label="上移 DNS A"]').element,
+    );
+
+    wrapper.unmount();
   });
 });

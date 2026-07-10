@@ -377,7 +377,7 @@ onUnmounted(() => {
       </div>
 
       <!-- Chart -->
-      <div class="chart-body">
+      <div class="chart-body" :aria-busy="loading">
         <div v-if="staleError" class="stale-warning" role="alert">
           <FeatherIcon name="alert-triangle" :size="14" />
           <span>更新失败，当前显示上次成功加载的数据：{{ error }}</span>
@@ -390,7 +390,7 @@ onUnmounted(() => {
         </div>
 
         <!-- Error -->
-        <div v-else-if="error && chartData.length === 0" class="chart-state error">
+        <div v-else-if="error && chartData.length === 0" class="chart-state error" role="alert">
           <FeatherIcon name="alert-triangle" :size="24" />
           <span>{{ error }}</span>
           <button class="retry-btn" @click="loadHistory(selectedRange)">重试</button>

@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushPromises, mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 import TrafficView from './TrafficView.vue';
-import type { TrafficHistoryResponse } from '@/api/index';
+import { ApiError, type TrafficHistoryResponse } from '@/api/index';
 
 const apiMocks = vi.hoisted(() => ({
   fetchTrafficHistory: vi.fn(),
@@ -120,5 +120,26 @@ describe('TrafficView interface selection', () => {
       { interfaceId: '*2' },
       expect.any(AbortSignal),
     );
+  });
+
+  it('announces a localized empty-history error', async () => {
+    apiMocks.fetchTrafficHistory.mockRejectedValue(new ApiError(404, {
+      code: 'traffic_history_not_found',
+      message: 'traffic history has not been initialized',
+      fields: {},
+      request_id: 'request-1',
+    }));
+    const wrapper = mount(TrafficView, {
+      global: {
+        plugins: [createPinia()],
+        stubs: { FeatherIcon: true },
+      },
+    });
+    await flushPromises();
+
+    expect(wrapper.get('[role="alert"]').text()).toContain(
+      '所选范围或接口尚无流量历史数据',
+    );
+    expect(wrapper.get('.chart-body').attributes('aria-busy')).toBe('false');
   });
 });

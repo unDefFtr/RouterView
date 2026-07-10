@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
+import { nextTick, ref, onMounted } from 'vue';
 import {
   fetchProbeTargets,
   updateProbeTargets,
@@ -14,80 +14,46 @@ const targets = ref<ProbeTarget[]>([]);
 const loading = ref(true);
 const saving = ref(false);
 const saveStatus = ref<'saved' | 'error' | null>(null);
+const targetKeys = new WeakMap<ProbeTarget, string>();
+let nextTargetKey = 0;
 
-// ── Drag state ─────────────────────────────────────────────────
+// ── Ordering ─────────────────────────────────────────────────
 
-const dragFrom = ref<number | null>(null);
-const dragOver = ref<number | null>(null);
-
-function onDragStart(i: number, e: DragEvent) {
-  dragFrom.value = i;
-  if (e.dataTransfer) {
-    e.dataTransfer.effectAllowed = 'move';
+function targetKey(target: ProbeTarget): string {
+  let key = targetKeys.get(target);
+  if (!key) {
+    key = `probe-${nextTargetKey++}`;
+    targetKeys.set(target, key);
   }
+  return key;
 }
 
-function onDragOver(i: number, e: DragEvent) {
-  // Only allow drop within same category
-  const from = dragFrom.value;
-  if (from === null || targets.value[from]?.category !== targets.value[i]?.category) {
-    return;
+function categoryNeighborIndex(i: number, direction: -1 | 1): number | null {
+  const category = targets.value[i]?.category;
+  if (!category) return null;
+  for (
+    let candidate = i + direction;
+    candidate >= 0 && candidate < targets.value.length;
+    candidate += direction
+  ) {
+    if (targets.value[candidate]?.category === category) return candidate;
   }
-  e.preventDefault();
-  if (e.dataTransfer) {
-    e.dataTransfer.dropEffect = 'move';
-  }
-  dragOver.value = i;
+  return null;
 }
 
-function onDragLeave(_i: number) {
-  dragOver.value = null;
-}
-
-function onDrop(i: number) {
-  const from = dragFrom.value;
-  if (from === null || from === i) {
-    dragFrom.value = null;
-    dragOver.value = null;
-    return;
-  }
-  // Only allow same-category swap
-  if (targets.value[from]?.category !== targets.value[i]?.category) {
-    dragFrom.value = null;
-    dragOver.value = null;
-    return;
-  }
-  const item = targets.value.splice(from, 1)[0];
-  targets.value.splice(i, 0, item);
-  dragFrom.value = null;
-  dragOver.value = null;
-}
-
-function onDragEnd() {
-  dragFrom.value = null;
-  dragOver.value = null;
-}
-
-function moveTarget(i: number, direction: -1 | 1) {
-  const destination = i + direction;
-  if (
-    destination < 0
-    || destination >= targets.value.length
-    || targets.value[i]?.category !== targets.value[destination]?.category
-  ) return;
-
+async function moveTarget(i: number, direction: -1 | 1, event?: Event) {
+  const destination = categoryNeighborIndex(i, direction);
+  if (destination === null) return;
+  const control = event?.currentTarget;
   const item = targets.value.splice(i, 1)[0];
   targets.value.splice(destination, 0, item);
-}
-
-function categoryOrder(i: number): { position: number; total: number } {
-  const target = targets.value[i];
-  if (!target) return { position: 1, total: 1 };
-  const siblings = targets.value.filter((candidate) => candidate.category === target.category);
-  return {
-    position: siblings.indexOf(target) + 1,
-    total: siblings.length,
-  };
+  await nextTick();
+  if (control instanceof HTMLElement) {
+    const focusTarget = control.matches(':disabled')
+      ? control.parentElement?.querySelector<HTMLElement>('.order-btn:not(:disabled)')
+      : control;
+    focusTarget?.focus();
+  }
 }
 
 // ── CRUD ───────────────────────────────────────────────────────
@@ -187,36 +153,32 @@ onMounted(load);
         <tbody>
           <tr
               v-for="(t, i) in targets"
-              :key="i"
+              :key="targetKey(t)"
               class="probe-row"
-              :class="{
-                'drag-from': dragFrom === i,
-                'drag-over': dragOver === i,
-              }"
-              @dragover="onDragOver(i, $event)"
-              @dragleave="onDragLeave(i)"
-              @drop="onDrop(i)"
-              @dragend="onDragEnd"
             >
             <td class="col-grip">
-              <span
-                class="grip-handle"
-                role="slider"
-                tabindex="0"
-                aria-orientation="vertical"
-                :aria-label="`调整 ${t.name || `站点 ${i + 1}`} 顺序`"
-                :aria-valuemin="1"
-                :aria-valuemax="categoryOrder(i).total"
-                :aria-valuenow="categoryOrder(i).position"
-                :aria-valuetext="`第 ${categoryOrder(i).position} 项，共 ${categoryOrder(i).total} 项`"
-                title="拖动排序，或使用上下方向键"
-                draggable="true"
-                @dragstart.stop="onDragStart(i, $event)"
-                @keydown.up.prevent="moveTarget(i, -1)"
-                @keydown.down.prevent="moveTarget(i, 1)"
-              >
-                <FeatherIcon name="menu" :size="14" />
-              </span>
+              <div class="order-controls">
+                <button
+                  type="button"
+                  class="order-btn"
+                  :disabled="categoryNeighborIndex(i, -1) === null"
+                  :aria-label="`上移 ${t.name || `站点 ${i + 1}`}`"
+                  title="上移"
+                  @click="moveTarget(i, -1, $event)"
+                >
+                  <FeatherIcon name="chevron-up" :size="13" />
+                </button>
+                <button
+                  type="button"
+                  class="order-btn"
+                  :disabled="categoryNeighborIndex(i, 1) === null"
+                  :aria-label="`下移 ${t.name || `站点 ${i + 1}`}`"
+                  title="下移"
+                  @click="moveTarget(i, 1, $event)"
+                >
+                  <FeatherIcon name="chevron-down" :size="13" />
+                </button>
+              </div>
             </td>
             <td class="col-name">
               <input
@@ -378,53 +340,41 @@ onMounted(load);
   border: 0;
 }
 
-.col-grip { width: 28px; text-align: center; }
+.col-grip { width: 56px; text-align: center; }
 .col-name { width: 28%; }
 .col-host { width: 32%; }
 .col-cat { width: 18%; }
 .col-del { width: 12%; text-align: center; }
 
-/* ── Drag & drop ────────────────────────────────────── */
+/* ── Ordering controls ────────────────────────────────────── */
 
-.grip-handle {
-  cursor: grab;
-  color: var(--color-text-muted);
+.order-controls {
   display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 2px;
-  border-radius: 3px;
-  transition: all var(--transition-fast);
+  gap: 2px;
 }
 
-.grip-handle:hover {
+.order-btn {
+  width: 24px;
+  height: 28px;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid var(--color-border-light);
+  border-radius: 4px;
+  background: transparent;
   color: var(--color-text-secondary);
-  background: var(--color-bg-hover);
+  cursor: pointer;
 }
 
-.grip-handle:active {
-  cursor: grabbing;
-}
-
-.grip-handle:focus-visible {
-  outline: 2px solid var(--color-accent);
-  outline-offset: 2px;
-}
-
-.probe-row {
-  transition: background var(--transition-fast), opacity var(--transition-fast);
-}
-
-.probe-row.drag-from {
-  opacity: 0.4;
-}
-
-.probe-row.drag-over {
+.order-btn:hover:not(:disabled) {
+  border-color: var(--color-accent);
+  color: var(--color-accent);
   background: var(--color-accent-subtle);
 }
 
-.probe-row.drag-over td {
-  border-top: 2px solid var(--color-accent);
+.order-btn:disabled {
+  color: var(--color-text-muted);
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 /* ── Field inputs (match SettingsView) ──────────────── */
@@ -586,7 +536,7 @@ onMounted(load);
 
   .probe-row {
     display: grid;
-    grid-template-columns: 28px minmax(0, 1fr) 80px 32px;
+    grid-template-columns: 56px minmax(0, 1fr) 80px 32px;
     align-items: center;
     padding: 5px 0;
     border-bottom: 1px solid var(--color-border-light);

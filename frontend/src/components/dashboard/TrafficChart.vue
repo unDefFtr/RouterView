@@ -315,10 +315,12 @@ onUnmounted(() => {
     </div>
 
     <!-- Chart Area -->
-      <div class="chart-container">
-      <div v-if="historyError" class="history-warning" role="status">
+    <div class="chart-container" :aria-busy="historyLoading">
+      <div v-if="historyError" class="history-warning" role="alert">
         <FeatherIcon name="alert-triangle" :size="13" />
-        <span>历史数据更新失败，正在显示可用的实时或缓存数据</span>
+        <span>
+          {{ historyError }}{{ mergedPoints.length > 0 ? '，正在显示已有数据' : '' }}
+        </span>
         <button type="button" @click="loadHistory(trafficTimeRange)">重试</button>
       </div>
       <div
