@@ -3,7 +3,9 @@ import {
   formatByteCount,
   isAbortError,
   resolveTrafficTotals,
+  trafficHistoryErrorMessage,
 } from './trafficHistory';
+import { ApiError } from '@/api';
 
 describe('resolveTrafficTotals', () => {
   it('integrates legacy bit rates as estimated bytes using each point duration', () => {
@@ -163,5 +165,21 @@ describe('traffic history helpers', () => {
     expect(isAbortError(new DOMException('aborted', 'AbortError'))).toBe(true);
     expect(isAbortError({ name: 'AbortError' })).toBe(true);
     expect(isAbortError(new Error('network failed'))).toBe(false);
+  });
+
+  it('localizes traffic history API failures without exposing backend messages', () => {
+    const detail = {
+      code: 'traffic_history_not_found',
+      message: 'traffic history has not been initialized',
+      fields: {},
+      request_id: 'request-1',
+    };
+
+    expect(trafficHistoryErrorMessage(new ApiError(404, detail))).toBe(
+      '所选范围或接口尚无流量历史数据',
+    );
+    expect(trafficHistoryErrorMessage(new Error('Failed to fetch'))).toBe(
+      '历史数据加载失败，请稍后重试',
+    );
   });
 });

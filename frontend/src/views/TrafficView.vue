@@ -24,6 +24,7 @@ import {
   formatByteCount,
   isAbortError,
   resolveTrafficTotals,
+  trafficHistoryErrorMessage,
 } from '@/utils/trafficHistory';
 
 const themeStore = useThemeStore();
@@ -202,7 +203,7 @@ async function loadHistory(range: TimeRange | 'custom') {
     if (controller.signal.aborted || generation !== requestGeneration || isAbortError(caught)) {
       return;
     }
-    error.value = caught instanceof Error ? caught.message : '加载失败';
+    error.value = trafficHistoryErrorMessage(caught);
   } finally {
     if (generation === requestGeneration) loading.value = false;
   }
@@ -534,7 +535,7 @@ onUnmounted(() => {
 
 .apply-btn:hover:not(:disabled) {
   background: var(--color-accent);
-  color: #fff;
+  color: var(--color-text-inverse);
 }
 
 .apply-btn:disabled {
@@ -551,7 +552,6 @@ onUnmounted(() => {
   color: var(--color-text-secondary);
   cursor: pointer;
   font-family: var(--font-sans);
-  transition: all var(--transition-fast);
   white-space: nowrap;
 }
 
@@ -562,7 +562,7 @@ onUnmounted(() => {
 
 .time-btn.active {
   background: var(--color-accent);
-  color: #fff;
+  color: var(--color-text-inverse);
   font-weight: 600;
 }
 

@@ -152,6 +152,37 @@ export function buildTrafficChartOption(
   else if (timeRange === '7D') xInterval = Math.floor(xData.length / 14);
   else xInterval = Math.floor(xData.length / 15); // 30D
 
+  const dataZoom = opts?.dataZoom
+    ? [
+        {
+          type: 'inside',
+          xAxisIndex: 0,
+          filterMode: 'none',
+          zoomOnMouseWheel: true,
+          moveOnMouseMove: true,
+          minSpan: 10,
+        },
+        {
+          type: 'slider',
+          xAxisIndex: 0,
+          filterMode: 'none',
+          minSpan: 10,
+          height: 20,
+          bottom: 4,
+          borderColor: gridColor,
+          backgroundColor: darkMode ? '#1a1e2b' : '#ffffff',
+          fillerColor: darkMode ? 'rgba(79,140,255,0.15)' : 'rgba(37,99,235,0.1)',
+          handleStyle: {
+            color: darkMode ? '#4f8cff' : '#2563eb',
+          },
+          dataBackground: {
+            lineStyle: { color: gridColor },
+            areaStyle: { color: 'transparent' },
+          },
+        },
+      ]
+    : null;
+
   return {
     backgroundColor: 'transparent',
     grid: {
@@ -161,36 +192,7 @@ export function buildTrafficChartOption(
       bottom: opts?.dataZoom ? 36 : 0,
       containLabel: true,
     },
-    dataZoom: opts?.dataZoom
-      ? [
-          {
-            type: 'inside',
-            xAxisIndex: 0,
-            filterMode: 'none',
-            zoomOnMouseWheel: true,
-            moveOnMouseMove: true,
-            minSpan: 10,
-          },
-          {
-            type: 'slider',
-            xAxisIndex: 0,
-            filterMode: 'none',
-            minSpan: 10,
-            height: 20,
-            bottom: 4,
-            borderColor: gridColor,
-            backgroundColor: darkMode ? '#1a1e2b' : '#ffffff',
-            fillerColor: darkMode ? 'rgba(79,140,255,0.15)' : 'rgba(37,99,235,0.1)',
-            handleStyle: {
-              color: darkMode ? '#4f8cff' : '#2563eb',
-            },
-            dataBackground: {
-              lineStyle: { color: gridColor },
-              areaStyle: { color: 'transparent' },
-            },
-          },
-        ]
-      : undefined,
+    ...(dataZoom ? { dataZoom } : {}),
     xAxis: {
       type: 'category',
       data: xData,

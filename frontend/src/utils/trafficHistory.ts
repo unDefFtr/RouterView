@@ -1,6 +1,7 @@
-import type {
-  TrafficHistoryPoint,
-  TrafficHistoryResponse,
+import {
+  ApiError,
+  type TrafficHistoryPoint,
+  type TrafficHistoryResponse,
 } from '@/api';
 
 export interface ResolvedTrafficTotals {
@@ -224,4 +225,16 @@ export function isAbortError(error: unknown): boolean {
       && error !== null
       && 'name' in error
       && error.name === 'AbortError');
+}
+
+export function trafficHistoryErrorMessage(error: unknown): string {
+  if (error instanceof ApiError) {
+    if (error.detail.code === 'traffic_history_not_found') {
+      return '所选范围或接口尚无流量历史数据';
+    }
+    if (error.status === 429 || error.detail.code === 'rate_limited') {
+      return '历史数据查询繁忙，请稍后重试';
+    }
+  }
+  return '历史数据加载失败，请稍后重试';
 }

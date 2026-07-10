@@ -19,6 +19,7 @@ import {
   type TrafficHistorySelector,
   type TrafficInterfaceMetadata,
 } from '@/api/index';
+import { trafficHistoryErrorMessage } from '@/utils/trafficHistory';
 
 const dashboardStore = useDashboardStore();
 const themeStore = useThemeStore();
@@ -136,9 +137,7 @@ async function loadHistory(range: TimeRange) {
     loadedHistoryKey = historyKey;
   } catch (error: unknown) {
     if (controller.signal.aborted || generation !== historyGeneration) return;
-    historyError.value = error instanceof Error
-      ? error.message
-      : '历史数据加载失败';
+    historyError.value = trafficHistoryErrorMessage(error);
   } finally {
     if (generation === historyGeneration) historyLoading.value = false;
   }
@@ -390,10 +389,6 @@ onUnmounted(() => {
   color: var(--color-accent);
 }
 
-.rate-label {
-  opacity: 0.7;
-}
-
 .rate-value {
   font-weight: 600;
 }
@@ -440,7 +435,6 @@ onUnmounted(() => {
   color: var(--color-text-secondary);
   cursor: pointer;
   font-family: var(--font-sans);
-  transition: all var(--transition-fast);
 }
 
 .time-btn:hover {
@@ -450,7 +444,7 @@ onUnmounted(() => {
 
 .time-btn.active {
   background: var(--color-accent);
-  color: #fff;
+  color: var(--color-text-inverse);
   font-weight: 600;
 }
 
