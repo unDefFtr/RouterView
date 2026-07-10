@@ -127,6 +127,34 @@ jobs:
             | jq --slurp --exit-status \
               'length == 2 and all(.[]; .Health == "healthy")' >/dev/null
 
+          backend_id="$(docker compose --env-file .env.compose.example ps -q backend)"
+          caddy_id="$(docker compose --env-file .env.compose.example ps -q caddy)"
+          docker inspect "$backend_id" | jq --exit-status '
+            .[0] |
+            .Config.User == "10001:10001" and
+            .HostConfig.ReadonlyRootfs == true and
+            .HostConfig.CapDrop == ["ALL"] and
+            .HostConfig.CapAdd == ["CAP_NET_RAW"] and
+            .HostConfig.SecurityOpt == ["no-new-privileges:true"] and
+            .HostConfig.PortBindings == {} and
+            (.NetworkSettings.Networks | keys | sort) ==
+              ["routerview_app", "routerview_router_access"]
+          ' >/dev/null
+          docker inspect "$caddy_id" | jq --exit-status '
+            .[0] |
+            .Config.User == "10001:10001" and
+            .HostConfig.ReadonlyRootfs == true and
+            .HostConfig.CapDrop == ["ALL"] and
+            .HostConfig.CapAdd == null and
+            .HostConfig.SecurityOpt == ["no-new-privileges:true"] and
+            .HostConfig.PortBindings == {
+              "80/tcp": [{"HostIp": "127.0.0.1", "HostPort": "80"}],
+              "443/tcp": [{"HostIp": "127.0.0.1", "HostPort": "443"}]
+            } and
+            (.NetworkSettings.Networks | keys | sort) ==
+              ["routerview_app", "routerview_edge"]
+          ' >/dev/null
+
           docker compose --env-file .env.compose.example cp \
             caddy:/data/caddy/pki/authorities/local/root.crt \
             /tmp/routerview-local-ca.crt
@@ -149,6 +177,9 @@ jobs:
             http://127.0.0.1/)"
           test "$redirect_code" = 308
           ! grep --ignore-case '^Server:' /tmp/routerview-redirect.headers
+          redirect_location="$(sed -n 's/^Location: //Ip' \
+            /tmp/routerview-redirect.headers | tr -d '\r')"
+          test "$redirect_location" = 'https://routerview.local/'
       - name: Stop Compose deployment
         if: always()
         run: >-
