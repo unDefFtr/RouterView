@@ -68,6 +68,28 @@ function onDragEnd() {
   dragOver.value = null;
 }
 
+function moveTarget(i: number, direction: -1 | 1) {
+  const destination = i + direction;
+  if (
+    destination < 0
+    || destination >= targets.value.length
+    || targets.value[i]?.category !== targets.value[destination]?.category
+  ) return;
+
+  const item = targets.value.splice(i, 1)[0];
+  targets.value.splice(destination, 0, item);
+}
+
+function categoryOrder(i: number): { position: number; total: number } {
+  const target = targets.value[i];
+  if (!target) return { position: 1, total: 1 };
+  const siblings = targets.value.filter((candidate) => candidate.category === target.category);
+  return {
+    position: siblings.indexOf(target) + 1,
+    total: siblings.length,
+  };
+}
+
 // ── CRUD ───────────────────────────────────────────────────────
 
 async function load() {
@@ -155,11 +177,11 @@ onMounted(load);
       <table class="probe-table">
         <thead>
           <tr>
-            <th class="col-grip" />
-            <th class="col-name">名称</th>
-            <th class="col-host">目标地址</th>
-            <th class="col-cat">类别</th>
-            <th class="col-del" />
+            <th class="col-grip" scope="col"><span class="visually-hidden">排序</span></th>
+            <th class="col-name" scope="col">名称</th>
+            <th class="col-host" scope="col">目标地址</th>
+            <th class="col-cat" scope="col">类别</th>
+            <th class="col-del" scope="col"><span class="visually-hidden">操作</span></th>
           </tr>
         </thead>
         <tbody>
@@ -179,9 +201,19 @@ onMounted(load);
             <td class="col-grip">
               <span
                 class="grip-handle"
-                title="拖动排序"
+                role="slider"
+                tabindex="0"
+                aria-orientation="vertical"
+                :aria-label="`调整 ${t.name || `站点 ${i + 1}`} 顺序`"
+                :aria-valuemin="1"
+                :aria-valuemax="categoryOrder(i).total"
+                :aria-valuenow="categoryOrder(i).position"
+                :aria-valuetext="`第 ${categoryOrder(i).position} 项，共 ${categoryOrder(i).total} 项`"
+                title="拖动排序，或使用上下方向键"
                 draggable="true"
                 @dragstart.stop="onDragStart(i, $event)"
+                @keydown.up.prevent="moveTarget(i, -1)"
+                @keydown.down.prevent="moveTarget(i, 1)"
               >
                 <FeatherIcon name="menu" :size="14" />
               </span>
@@ -191,6 +223,7 @@ onMounted(load);
                 class="field-input"
                 type="text"
                 v-model="t.name"
+                :aria-label="`站点 ${i + 1} 名称`"
                 placeholder="名称"
               />
             </td>
@@ -199,11 +232,16 @@ onMounted(load);
                 class="field-input mono"
                 type="text"
                 v-model="t.host"
+                :aria-label="`${t.name || `站点 ${i + 1}`} 目标地址`"
                 placeholder="IP 或域名"
               />
             </td>
             <td class="col-cat">
-              <select class="field-input" v-model="t.category">
+              <select
+                v-model="t.category"
+                class="field-input"
+                :aria-label="`${t.name || `站点 ${i + 1}`} 类别`"
+              >
                 <option v-for="c in CATEGORIES" :key="c" :value="c">{{ c }}</option>
               </select>
             </td>
@@ -212,6 +250,7 @@ onMounted(load);
                 type="button"
                 class="btn-del"
                 title="删除"
+                :aria-label="`删除 ${t.name || `站点 ${i + 1}`}`"
                 @click="removeTarget(i)"
               >
                 <FeatherIcon name="trash-2" :size="14" />
@@ -327,6 +366,18 @@ onMounted(load);
   border-bottom: 1px solid var(--color-border-light);
 }
 
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .col-grip { width: 28px; text-align: center; }
 .col-name { width: 28%; }
 .col-host { width: 32%; }
@@ -353,6 +404,11 @@ onMounted(load);
 
 .grip-handle:active {
   cursor: grabbing;
+}
+
+.grip-handle:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
 }
 
 .probe-row {
@@ -475,7 +531,7 @@ onMounted(load);
   border: 1px solid var(--color-accent);
   border-radius: var(--border-radius-sm);
   background: var(--color-accent);
-  color: #fff;
+  color: var(--color-text-inverse);
   cursor: pointer;
   transition: all var(--transition-fast);
 }
@@ -503,5 +559,73 @@ onMounted(load);
 .save-badge.error {
   background: var(--color-danger-subtle);
   color: var(--color-danger);
+}
+
+@media (max-width: 520px) {
+  .settings-section {
+    padding: 16px 12px;
+  }
+
+  .probe-table,
+  .probe-table tbody {
+    display: block;
+    width: 100%;
+  }
+
+  .probe-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .probe-row {
+    display: grid;
+    grid-template-columns: 28px minmax(0, 1fr) 80px 32px;
+    align-items: center;
+    padding: 5px 0;
+    border-bottom: 1px solid var(--color-border-light);
+  }
+
+  .probe-table td {
+    width: auto;
+    padding: 3px;
+    border-bottom: 0;
+  }
+
+  .probe-row .col-grip {
+    grid-column: 1;
+    grid-row: 1 / span 2;
+  }
+
+  .probe-row .col-name {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .probe-row .col-cat {
+    grid-column: 3;
+    grid-row: 1;
+  }
+
+  .probe-row .col-host {
+    grid-column: 2 / span 2;
+    grid-row: 2;
+  }
+
+  .probe-row .col-del {
+    grid-column: 4;
+    grid-row: 1 / span 2;
+  }
+
+  .col-cat .field-input {
+    padding-inline: 5px;
+    font-size: 0.75rem;
+  }
 }
 </style>
