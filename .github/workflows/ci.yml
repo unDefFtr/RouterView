@@ -108,6 +108,47 @@ jobs:
           --entrypoint caddy
           routerview-caddy:ci
           validate --config /etc/caddy/Caddyfile --adapter caddyfile
+      - name: Start Compose deployment
+        env:
+          ROUTERVIEW_HTTP_BIND: 127.0.0.1
+          ROUTERVIEW_HTTPS_BIND: 127.0.0.1
+        run: >-
+          docker compose --env-file .env.compose.example
+          up --detach --build --wait --wait-timeout 180
+      - name: Verify Compose deployment
+        run: |
+          set -euo pipefail
+          docker compose --env-file .env.compose.example ps --format json \
+            | jq --slurp --exit-status \
+              'length == 2 and all(.[]; .Health == "healthy")' >/dev/null
+
+          docker compose --env-file .env.compose.example cp \
+            caddy:/data/caddy/pki/authorities/local/root.crt \
+            /tmp/routerview-local-ca.crt
+          health_code="$(curl --silent --show-error \
+            --resolve routerview.local:443:127.0.0.1 \
+            --cacert /tmp/routerview-local-ca.crt \
+            --output /tmp/routerview-health.json \
+            --write-out '%{http_code}' \
+            https://routerview.local/api/health)"
+          test "$health_code" = 200
+          jq --exit-status \
+            '.status == "ok" and .version == "0.2.0"' \
+            /tmp/routerview-health.json >/dev/null
+
+          redirect_code="$(curl --silent --show-error \
+            --header 'Host: routerview.local' \
+            --dump-header /tmp/routerview-redirect.headers \
+            --output /dev/null \
+            --write-out '%{http_code}' \
+            http://127.0.0.1/)"
+          test "$redirect_code" = 308
+          ! grep --ignore-case '^Server:' /tmp/routerview-redirect.headers
+      - name: Stop Compose deployment
+        if: always()
+        run: >-
+          docker compose --env-file .env.compose.example
+          down --volumes --remove-orphans
 
   dependency-audit:
     name: Dependency audit
