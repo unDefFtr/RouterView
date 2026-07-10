@@ -2,6 +2,7 @@ import { defineStore } from 'pinia';
 import { ref } from 'vue';
 import type { ConnectionState } from '@/types/ws';
 import type { DashboardSnapshot, DashboardUpdate } from '@/types/dashboard';
+import { fetchAuthStatus } from '@/api';
 import { useDashboardStore } from './dashboard';
 
 const RECONNECT_BASE_MS = 1_000;
@@ -71,6 +72,7 @@ export const useWebSocketStore = defineStore('websocket', () => {
     clearReconnectTimer();
     connectionState.value = 'connecting';
     const socketGeneration = ++generation;
+    let opened = false;
 
     let socket: WebSocket;
     try {
@@ -85,6 +87,7 @@ export const useWebSocketStore = defineStore('websocket', () => {
 
     socket.onopen = () => {
       if (!isCurrent(socket, socketGeneration)) return;
+      opened = true;
       connectionState.value = 'connected';
       lastMessageAt.value = Date.now();
       const dashboardStore = useDashboardStore();
@@ -114,9 +117,11 @@ export const useWebSocketStore = defineStore('websocket', () => {
       clearStableTimer();
       markDisconnected();
       if (event.code === 1008) {
-        sessionExpired.value = true;
-        activeUrl = null;
-        clearReconnectTimer();
+        markSessionExpired();
+        return;
+      }
+      if (event.code === 1006 && !opened && !intentionalDisconnect) {
+        void verifySessionBeforeReconnect(url, socketGeneration);
         return;
       }
       if (!intentionalDisconnect) scheduleReconnect(url);
@@ -151,6 +156,33 @@ export const useWebSocketStore = defineStore('websocket', () => {
       reconnectTimer = null;
       if (!intentionalDisconnect && !offline.value && activeUrl === url) connect(url);
     }, delay);
+  }
+
+  async function verifySessionBeforeReconnect(url: string, socketGeneration: number) {
+    try {
+      const status = await fetchAuthStatus();
+      if (!isPendingReconnect(url, socketGeneration)) return;
+      if (!status.authenticated) {
+        markSessionExpired();
+        return;
+      }
+    } catch {
+      if (!isPendingReconnect(url, socketGeneration)) return;
+    }
+    scheduleReconnect(url);
+  }
+
+  function isPendingReconnect(url: string, socketGeneration: number): boolean {
+    return generation === socketGeneration
+      && activeUrl === url
+      && !intentionalDisconnect
+      && !sessionExpired.value;
+  }
+
+  function markSessionExpired() {
+    sessionExpired.value = true;
+    activeUrl = null;
+    clearReconnectTimer();
   }
 
   function startWatchdog(socket: WebSocket, socketGeneration: number) {

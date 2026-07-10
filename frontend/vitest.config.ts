@@ -11,6 +11,7 @@ export default defineConfig({
   },
   test: {
     environment: 'jsdom',
+    environmentOptions: { jsdom: { url: 'https://routerview.test/' } },
     setupFiles: ['./src/test/setup.ts'],
     clearMocks: true,
     restoreMocks: true,

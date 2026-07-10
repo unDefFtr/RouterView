@@ -14,6 +14,7 @@ import {
   arpStatusLabel,
 } from '@/composables/useDeviceHelpers';
 import { useDeviceOverrides } from '@/composables/useDeviceOverrides';
+import { useAuthStore } from '@/stores/auth';
 
 const {
   displayName,
@@ -22,6 +23,7 @@ const {
   hasOverride,
   saveOverride,
 } = useDeviceOverrides();
+const auth = useAuthStore();
 
 // ── Device type options for the edit dropdown ────────────────
 
@@ -198,7 +200,7 @@ function signalWidth(dbm: number | null | undefined): string {
       </div>
       <!-- Edit button -->
       <button
-        v-if="!isEditing"
+        v-if="!isEditing && auth.can('manage_devices')"
         class="edit-btn"
         type="button"
         title="编辑备注和类型"

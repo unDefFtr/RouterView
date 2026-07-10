@@ -4,6 +4,7 @@ import { createPinia, setActivePinia } from 'pinia';
 import type { Device } from '@/types/dashboard';
 import DeviceDetail from '@/components/devices/DeviceDetail.vue';
 import { useDashboardStore } from '@/stores/dashboard';
+import { useAuthStore } from '@/stores/auth';
 import {
   reconcileDeviceOverrides,
   useDeviceOverrides,
@@ -32,6 +33,12 @@ const device: Device = {
 describe('useDeviceOverrides', () => {
   beforeEach(async () => {
     setActivePinia(createPinia());
+    const auth = useAuthStore();
+    auth.state = 'authenticated';
+    auth.user = {
+      username: 'admin', role: 'admin', session_kind: 'standard',
+      capabilities: ['read', 'configure', 'manage_devices', 'manage_sessions'],
+    };
     apiMocks.fetchDeviceOverrides.mockResolvedValue([]);
     apiMocks.updateDeviceOverride.mockResolvedValue([]);
     await useDeviceOverrides().loadOverrides();

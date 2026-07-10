@@ -1,7 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { flushPromises } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 import { useDashboardStore } from './dashboard';
 import { useWebSocketStore } from './websocket';
+
+const apiMocks = vi.hoisted(() => ({
+  fetchAuthStatus: vi.fn(),
+}));
+
+vi.mock('@/api', () => apiMocks);
 
 class MockWebSocket {
   static readonly CONNECTING = 0;
@@ -48,6 +55,8 @@ describe('websocket store', () => {
     vi.useFakeTimers();
     setActivePinia(createPinia());
     MockWebSocket.instances.length = 0;
+    apiMocks.fetchAuthStatus.mockReset();
+    apiMocks.fetchAuthStatus.mockResolvedValue({ setup_required: false, authenticated: true });
     Object.defineProperty(navigator, 'onLine', { configurable: true, value: true });
     vi.stubGlobal('WebSocket', MockWebSocket);
   });
@@ -151,6 +160,25 @@ describe('websocket store', () => {
 
     MockWebSocket.instances[0].serverClose(1008, 'session expired');
 
+    expect(store.connectionState).toBe('disconnected');
+    expect(store.sessionExpired).toBe(true);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(MockWebSocket.instances).toHaveLength(1);
+    store.disconnect();
+  });
+
+  it('rechecks authentication after an abnormal handshake close and stops when revoked', async () => {
+    apiMocks.fetchAuthStatus.mockResolvedValueOnce({
+      setup_required: false,
+      authenticated: false,
+    });
+    const store = useWebSocketStore();
+    store.connect('wss://routerview.test/ws');
+
+    MockWebSocket.instances[0].serverClose(1006, 'handshake rejected');
+    await flushPromises();
+
+    expect(apiMocks.fetchAuthStatus).toHaveBeenCalledOnce();
     expect(store.connectionState).toBe('disconnected');
     expect(store.sessionExpired).toBe(true);
     await vi.advanceTimersByTimeAsync(120_000);

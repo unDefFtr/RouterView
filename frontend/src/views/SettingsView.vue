@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useThemeStore, type ThemePreference } from '@/stores/theme';
 import { useDashboardStore } from '@/stores/dashboard';
@@ -11,6 +11,7 @@ import {
   fetchHealth,
   updateConfig,
   testConnection,
+  ApiError,
   type FullConfig,
   type HealthResponse,
 } from '@/api';
@@ -36,14 +37,30 @@ const config = ref<FullConfig | null>(null);
 const configLoading = ref(true);
 const configError = ref<string | null>(null);
 const showPassword = ref(false);
+const connection = reactive({
+  router_host: '',
+  router_port: 443,
+  router_scheme: 'https' as 'http' | 'https',
+  router_username: '',
+  router_password: '',
+  accept_invalid_certs: false,
+});
 
-async function loadConfig() {
+async function loadConfig(): Promise<boolean> {
   configLoading.value = true;
   configError.value = null;
   try {
     config.value = await fetchFullConfig();
-  } catch (e: any) {
-    configError.value = e.message || '加载配置失败';
+    connection.router_host = config.value.router_host;
+    connection.router_port = config.value.router_port;
+    connection.router_scheme = config.value.router_scheme;
+    connection.router_username = config.value.router_username;
+    connection.router_password = '';
+    connection.accept_invalid_certs = config.value.accept_invalid_certs;
+    return true;
+  } catch (error: unknown) {
+    configError.value = error instanceof Error ? error.message : '加载配置失败';
+    return false;
   } finally {
     configLoading.value = false;
   }
@@ -52,25 +69,58 @@ async function loadConfig() {
 // ── Field-level save feedback ─────────────────────────────
 
 const saveStatus = ref<Record<string, 'saving' | 'saved' | 'error'>>({});
+let editGeneration = 0;
+let debounceTimers: Record<string, ReturnType<typeof setTimeout>> = {};
+let feedbackTimers: Record<string, ReturnType<typeof setTimeout>> = {};
+let fieldSaveQueue: Promise<void> = Promise.resolve();
 
-async function saveField(key: string, value: unknown) {
+function clearTimers(timers: Record<string, ReturnType<typeof setTimeout>>): void {
+  Object.values(timers).forEach(timer => clearTimeout(timer));
+}
+
+function cancelPendingEdits(): void {
+  editGeneration++;
+  clearTimers(debounceTimers);
+  clearTimers(feedbackTimers);
+  debounceTimers = {};
+  feedbackTimers = {};
+  saveStatus.value = {};
+}
+
+function saveField(key: string, value: unknown, generation = editGeneration): Promise<void> {
+  const operation = fieldSaveQueue.then(() => performFieldSave(key, value, generation));
+  fieldSaveQueue = operation.then(() => undefined, () => undefined);
+  return operation;
+}
+
+async function performFieldSave(key: string, value: unknown, generation: number): Promise<void> {
+  if (generation !== editGeneration) return;
+  configError.value = null;
   saveStatus.value[key] = 'saving';
   try {
     const result = await updateConfig({ [key]: value });
-    // Check if restart was required
-    if (result.requires_restart.includes(key)) {
-      saveStatus.value[key] = 'saved';
-    } else {
-      saveStatus.value[key] = 'saved';
-    }
-    // Clear status after 2s
-    setTimeout(() => {
-      if (saveStatus.value[key] === 'saved') {
+    if (generation !== editGeneration) return;
+    if (config.value) config.value.revision = result.revision;
+    saveStatus.value[key] = 'saved';
+    if (feedbackTimers[key]) clearTimeout(feedbackTimers[key]);
+    feedbackTimers[key] = setTimeout(() => {
+      if (generation === editGeneration && saveStatus.value[key] === 'saved') {
         delete saveStatus.value[key];
       }
+      delete feedbackTimers[key];
     }, 2000);
-  } catch {
-    saveStatus.value[key] = 'error';
+  } catch (error) {
+    if (generation !== editGeneration) return;
+    if (error instanceof ApiError && error.status === 409) {
+      cancelPendingEdits();
+      const reloaded = await loadConfig();
+      configError.value = reloaded
+        ? '配置已被其他会话修改，已重新加载，请确认后再次保存。'
+        : `配置已被其他会话修改，但重新加载失败：${configError.value ?? '未知错误'}`;
+    } else {
+      saveStatus.value[key] = 'error';
+      configError.value = error instanceof Error ? error.message : '配置保存失败';
+    }
   }
 }
 
@@ -88,32 +138,124 @@ function onThemeChange(pref: ThemePreference) {
 
 const testing = ref(false);
 const testResult = ref<{ success: boolean; model?: string; version?: string; error?: string } | null>(null);
+const connectionVerified = ref<string | null>(null);
+const savingConnection = ref(false);
+const connectionSaved = ref(false);
+let connectionTestGeneration = 0;
+let connectionTestController: AbortController | null = null;
+
+function connectionPayload() {
+  return {
+    router_type: 'routeros' as const,
+    router_host: connection.router_host.trim(),
+    router_port: connection.router_port,
+    router_scheme: connection.router_scheme,
+    router_username: connection.router_username.trim(),
+    router_password: connection.router_password,
+    accept_invalid_certs: connection.accept_invalid_certs,
+  };
+}
+
+const connectionFingerprint = computed(() => JSON.stringify(connectionPayload()));
+const connectionValid = computed(() => {
+  const draft = connectionPayload();
+  return draft.router_host.length > 0
+    && draft.router_username.length > 0
+    && draft.router_password.length > 0
+    && Number.isInteger(draft.router_port)
+    && draft.router_port >= 1
+    && draft.router_port <= 65_535;
+});
+
+watch(connectionFingerprint, () => {
+  connectionTestGeneration++;
+  connectionTestController?.abort();
+  connectionTestController = null;
+  testing.value = false;
+  connectionVerified.value = null;
+  connectionSaved.value = false;
+  testResult.value = null;
+});
 
 async function runConnectionTest() {
+  if (!connectionValid.value) {
+    testResult.value = { success: false, error: '请填写完整连接信息和密码' };
+    return;
+  }
+  connectionTestController?.abort();
+  const controller = new AbortController();
+  connectionTestController = controller;
+  const generation = ++connectionTestGeneration;
+  const payload = connectionPayload();
+  const fingerprint = JSON.stringify(payload);
   testing.value = true;
   testResult.value = null;
   try {
-    // Send the current form values so the backend tests with what the user typed
-    testResult.value = await testConnection({
-      routeros_host: config.value?.routeros_host,
-      routeros_port: config.value?.routeros_port,
-      routeros_scheme: config.value?.routeros_scheme,
-      accept_invalid_certs: config.value?.accept_invalid_certs,
-    });
-  } catch (e: any) {
-    testResult.value = { success: false, error: e.message };
+    const result = await testConnection(payload, controller.signal);
+    if (generation !== connectionTestGeneration) return;
+    testResult.value = result;
+    connectionVerified.value = result.success ? fingerprint : null;
+  } catch (error: unknown) {
+    if (generation !== connectionTestGeneration) return;
+    if (error instanceof DOMException && error.name === 'AbortError') return;
+    testResult.value = {
+      success: false,
+      error: error instanceof Error ? error.message : '连接测试失败',
+    };
   } finally {
-    testing.value = false;
+    if (generation === connectionTestGeneration) {
+      testing.value = false;
+      if (connectionTestController === controller) connectionTestController = null;
+    }
   }
 }
 
-// ── Debounced save for number inputs ──────────────────────
-
-let debounceTimers: Record<string, ReturnType<typeof setTimeout>> = {};
+async function saveConnection() {
+  const payload = connectionPayload();
+  const fingerprint = JSON.stringify(payload);
+  if (connectionVerified.value !== fingerprint || savingConnection.value) return;
+  savingConnection.value = true;
+  configError.value = null;
+  try {
+    const result = await updateConfig({ ...payload, password_mode: 'replace' });
+    if (config.value) {
+      config.value.revision = result.revision;
+      config.value.router_host = payload.router_host;
+      config.value.router_port = payload.router_port;
+      config.value.router_scheme = payload.router_scheme;
+      config.value.router_username = payload.router_username;
+      config.value.accept_invalid_certs = payload.accept_invalid_certs;
+      config.value.password_set = true;
+      config.value.router_configured = true;
+    }
+    if (connectionFingerprint.value !== fingerprint) return;
+    connection.router_password = '';
+    connectionVerified.value = null;
+    testResult.value = null;
+    await nextTick();
+    connectionSaved.value = true;
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 409) {
+      cancelPendingEdits();
+      const reloaded = await loadConfig();
+      configError.value = reloaded
+        ? '配置已被其他会话修改，已重新加载；连接设置未自动重试。'
+        : `配置已被其他会话修改，但重新加载失败：${configError.value ?? '未知错误'}`;
+    } else {
+      configError.value = error instanceof Error ? error.message : '连接设置保存失败';
+    }
+  } finally {
+    savingConnection.value = false;
+  }
+}
 
 function debounceSave(key: string, value: unknown, ms = 600) {
   if (debounceTimers[key]) clearTimeout(debounceTimers[key]);
-  debounceTimers[key] = setTimeout(() => saveField(key, value), ms);
+  const generation = editGeneration;
+  debounceTimers[key] = setTimeout(() => {
+    delete debounceTimers[key];
+    void saveField(key, value, generation);
+  }, ms);
 }
 
 // ── Lifecycle ─────────────────────────────────────────────
@@ -122,11 +264,19 @@ onMounted(() => {
   loadHealth();
   loadConfig();
 });
+
+onUnmounted(() => {
+  cancelPendingEdits();
+  connectionTestGeneration++;
+  connectionTestController?.abort();
+  connectionTestController = null;
+});
 </script>
 
 <template>
   <div class="settings-view">
     <div class="settings-scroll">
+      <p v-if="configError" class="settings-error" role="alert">{{ configError }}</p>
       <div class="settings-grid" :class="{ portrait: isPortrait }">
         <div class="settings-col">
 
@@ -191,6 +341,9 @@ onMounted(() => {
             </div>
           </label>
         </div>
+        <span v-if="saveStatus.theme === 'saving'" class="save-badge saving">保存中</span>
+        <span v-else-if="saveStatus.theme === 'saved'" class="save-badge">已保存</span>
+        <span v-else-if="saveStatus.theme === 'error'" class="save-badge error">主题保存失败</span>
       </section>
 
       <ProbeTargetEditor />
@@ -204,46 +357,45 @@ onMounted(() => {
           <FeatherIcon name="server" :size="16" />
           <h2>RouterOS 连接</h2>
           <span v-if="configLoading" class="section-hint">加载中...</span>
-          <span v-else-if="configError" class="section-hint error">{{ configError }}</span>
         </div>
 
         <template v-if="config">
           <div class="field-group">
             <div class="field">
-              <label class="field-label">主机地址</label>
+              <label class="field-label" for="settings-router-host">主机地址</label>
               <div class="field-control">
                 <input
                   class="field-input mono"
+                  id="settings-router-host"
                   type="text"
-                  :value="config.routeros_host"
-                  @change="(e: any) => { config!.routeros_host = e.target.value; saveField('routeros_host', e.target.value) }"
+                  v-model="connection.router_host"
+                  :disabled="savingConnection"
                 />
-                <span v-if="saveStatus['routeros_host'] === 'saved'" class="save-badge">已保存</span>
-                <span v-if="saveStatus['routeros_host'] === 'error'" class="save-badge error">失败</span>
               </div>
-              <span class="field-hint">修改后自动重连，即时生效</span>
+              <span class="field-hint">连接信息测试通过后统一保存</span>
             </div>
 
             <div class="field">
-              <label class="field-label">端口</label>
+              <label class="field-label" for="settings-router-port">端口</label>
               <div class="field-control">
                 <input
                   class="field-input mono short"
+                  id="settings-router-port"
                   type="number"
-                  :value="config.routeros_port"
-                  @change="(e: any) => { config!.routeros_port = parseInt(e.target.value) || 443; saveField('routeros_port', config!.routeros_port) }"
+                  v-model.number="connection.router_port"
+                  :disabled="savingConnection"
                 />
-                <span v-if="saveStatus['routeros_port'] === 'saved'" class="save-badge">已保存</span>
               </div>
             </div>
 
             <div class="field">
-              <label class="field-label">连接方式</label>
+              <label class="field-label" for="settings-router-scheme">连接方式</label>
               <div class="field-control">
                 <select
                   class="field-input"
-                  :value="config.routeros_scheme"
-                  @change="(e: any) => { config!.routeros_scheme = e.target.value; saveField('routeros_scheme', e.target.value) }"
+                  id="settings-router-scheme"
+                  v-model="connection.router_scheme"
+                  :disabled="savingConnection"
                 >
                   <option value="https">HTTPS (推荐)</option>
                   <option value="http">HTTP</option>
@@ -252,48 +404,52 @@ onMounted(() => {
             </div>
 
             <div class="field">
-              <label class="field-label">用户名</label>
+              <label class="field-label" for="settings-router-username">用户名</label>
               <div class="field-control">
                 <input
                   class="field-input"
+                  id="settings-router-username"
                   type="text"
-                  :value="config.routeros_username"
+                  v-model="connection.router_username"
+                  :disabled="savingConnection"
                   placeholder="admin"
-                  @change="(e: any) => { config!.routeros_username = e.target.value; saveField('routeros_username', e.target.value) }"
                 />
-                <span v-if="saveStatus['routeros_username'] === 'saved'" class="save-badge">已保存</span>
               </div>
             </div>
 
             <div class="field">
-              <label class="field-label">密码</label>
+              <label class="field-label" for="settings-router-password">密码</label>
               <div class="field-control">
                 <input
                   class="field-input mono"
+                  id="settings-router-password"
+                  v-model="connection.router_password"
                   :type="showPassword ? 'text' : 'password'"
-                  placeholder="留空表示未设置"
-                  @change="(e: any) => { saveField('routeros_password', e.target.value || '') }"
+                  :disabled="savingConnection"
+                  placeholder="输入密码以测试并保存"
                 />
                 <button
                   type="button"
                   class="toggle-vis-btn"
                   @click="showPassword = !showPassword"
                   :title="showPassword ? '隐藏密码' : '显示密码'"
+                  :aria-label="showPassword ? '隐藏密码' : '显示密码'"
                 >
                   <FeatherIcon :name="showPassword ? 'eye-off' : 'eye'" :size="14" />
                 </button>
-                <span v-if="config.routeros_password" class="save-badge saved-hint">已设置</span>
+                <span v-if="config.password_set && !connection.router_password" class="save-badge saved-hint">已设置</span>
               </div>
             </div>
 
             <div class="field checkbox-field">
-              <label class="field-label">允许自签证书</label>
+              <label class="field-label" for="settings-accept-invalid-certs">允许自签证书</label>
               <div class="field-control">
                 <label class="toggle">
                   <input
+                    id="settings-accept-invalid-certs"
                     type="checkbox"
-                    :checked="config.accept_invalid_certs"
-                    @change="(e: any) => { config!.accept_invalid_certs = e.target.checked; saveField('accept_invalid_certs', e.target.checked) }"
+                    v-model="connection.accept_invalid_certs"
+                    :disabled="savingConnection"
                   />
                   <span class="toggle-slider" />
                 </label>
@@ -303,10 +459,18 @@ onMounted(() => {
 
           <!-- Connection test -->
           <div class="action-row">
-            <button class="btn-secondary" :disabled="testing" @click="runConnectionTest">
+            <button class="btn-secondary" :disabled="testing || savingConnection || !connectionValid" @click="runConnectionTest">
               <span v-if="testing" class="spinner-sm" />
               <span>{{ testing ? '测试中...' : '测试连接' }}</span>
             </button>
+            <button
+              class="btn-primary"
+              :disabled="savingConnection || connectionVerified !== connectionFingerprint"
+              @click="saveConnection"
+            >
+              {{ savingConnection ? '保存中...' : '保存连接' }}
+            </button>
+            <span v-if="connectionSaved" class="save-badge">已保存</span>
             <div v-if="testResult" class="test-result" :class="{ success: testResult.success, fail: !testResult.success }">
               <template v-if="testResult.success">
                 <FeatherIcon name="check-circle" :size="14" />
@@ -331,9 +495,10 @@ onMounted(() => {
         <template v-if="config">
           <div class="field-group">
             <div class="field">
-              <label class="field-label">主轮询间隔 (秒)</label>
+              <label class="field-label" for="settings-poll-interval">主轮询间隔 (秒)</label>
               <div class="field-control">
                 <input
+                  id="settings-poll-interval"
                   class="field-input mono short"
                   type="number"
                   min="1"
@@ -349,9 +514,10 @@ onMounted(() => {
             </div>
 
             <div class="field">
-              <label class="field-label">延迟探测间隔 (秒)</label>
+              <label class="field-label" for="settings-probe-interval">延迟探测间隔 (秒)</label>
               <div class="field-control">
                 <input
+                  id="settings-probe-interval"
                   class="field-input mono short"
                   type="number"
                   min="10"
@@ -359,15 +525,18 @@ onMounted(() => {
                   :value="config.probe_interval_secs"
                   @input="(e: any) => { const v = parseInt(e.target.value) || 60; config!.probe_interval_secs = v; debounceSave('probe_interval_secs', v) }"
                 />
+                <span v-if="saveStatus['probe_interval_secs'] === 'saving'" class="save-badge saving">保存中</span>
                 <span v-if="saveStatus['probe_interval_secs'] === 'saved'" class="save-badge">已保存 — 即时生效</span>
+                <span v-if="saveStatus['probe_interval_secs'] === 'error'" class="save-badge error">失败</span>
               </div>
               <span class="field-hint">Ping 探测 ISP / DNS / CDN 的间隔，10–600 秒。</span>
             </div>
 
             <div class="field">
-              <label class="field-label">原始数据保留 (天)</label>
+              <label class="field-label" for="settings-raw-retention">原始数据保留 (天)</label>
               <div class="field-control">
                 <input
+                  id="settings-raw-retention"
                   class="field-input mono short"
                   type="number"
                   min="1"
@@ -375,15 +544,18 @@ onMounted(() => {
                   :value="config.db_raw_retention_days"
                   @input="(e: any) => { const v = parseInt(e.target.value) || 7; config!.db_raw_retention_days = v; debounceSave('db_raw_retention_days', v) }"
                 />
+                <span v-if="saveStatus['db_raw_retention_days'] === 'saving'" class="save-badge saving">保存中</span>
                 <span v-if="saveStatus['db_raw_retention_days'] === 'saved'" class="save-badge">已保存</span>
+                <span v-if="saveStatus['db_raw_retention_days'] === 'error'" class="save-badge error">失败</span>
               </div>
               <span class="field-hint">高精度数据（每 5 秒采样）的保留天数，超期后聚合为分钟级。</span>
             </div>
 
             <div class="field">
-              <label class="field-label">聚合数据保留 (天)</label>
+              <label class="field-label" for="settings-total-retention">聚合数据保留 (天)</label>
               <div class="field-control">
                 <input
+                  id="settings-total-retention"
                   class="field-input mono short"
                   type="number"
                   min="7"
@@ -391,15 +563,18 @@ onMounted(() => {
                   :value="config.db_total_retention_days"
                   @input="(e: any) => { const v = parseInt(e.target.value) || 90; config!.db_total_retention_days = v; debounceSave('db_total_retention_days', v) }"
                 />
+                <span v-if="saveStatus['db_total_retention_days'] === 'saving'" class="save-badge saving">保存中</span>
                 <span v-if="saveStatus['db_total_retention_days'] === 'saved'" class="save-badge">已保存</span>
+                <span v-if="saveStatus['db_total_retention_days'] === 'error'" class="save-badge error">失败</span>
               </div>
               <span class="field-hint">所有聚合数据的最大保留天数，超期后自动清理。</span>
             </div>
 
             <div class="field">
-              <label class="field-label">延迟阈值：优秀 (ms)</label>
+              <label class="field-label" for="settings-latency-good">延迟阈值：优秀 (ms)</label>
               <div class="field-control">
                 <input
+                  id="settings-latency-good"
                   class="field-input mono short"
                   type="number"
                   min="1"
@@ -407,15 +582,18 @@ onMounted(() => {
                   :value="config.latency_good_ms"
                   @input="(e: any) => { const v = parseInt(e.target.value) || 30; config!.latency_good_ms = v; debounceSave('latency_good_ms', v) }"
                 />
+                <span v-if="saveStatus['latency_good_ms'] === 'saving'" class="save-badge saving">保存中</span>
                 <span v-if="saveStatus['latency_good_ms'] === 'saved'" class="save-badge">已保存 — 即时生效</span>
+                <span v-if="saveStatus['latency_good_ms'] === 'error'" class="save-badge error">失败</span>
               </div>
               <span class="field-hint">延迟低于此值显示为"低延迟"（绿色），默认 30ms。</span>
             </div>
 
             <div class="field">
-              <label class="field-label">延迟阈值：较差 (ms)</label>
+              <label class="field-label" for="settings-latency-poor">延迟阈值：较差 (ms)</label>
               <div class="field-control">
                 <input
+                  id="settings-latency-poor"
                   class="field-input mono short"
                   type="number"
                   min="1"
@@ -423,7 +601,9 @@ onMounted(() => {
                   :value="config.latency_poor_ms"
                   @input="(e: any) => { const v = parseInt(e.target.value) || 100; config!.latency_poor_ms = v; debounceSave('latency_poor_ms', v) }"
                 />
+                <span v-if="saveStatus['latency_poor_ms'] === 'saving'" class="save-badge saving">保存中</span>
                 <span v-if="saveStatus['latency_poor_ms'] === 'saved'" class="save-badge">已保存 — 即时生效</span>
+                <span v-if="saveStatus['latency_poor_ms'] === 'error'" class="save-badge error">失败</span>
               </div>
               <span class="field-hint">延迟高于此值显示为"高延迟"（红色），介于两阈值之间为"一般"（橙色）。默认 100ms。</span>
             </div>
@@ -449,6 +629,15 @@ onMounted(() => {
   overflow-y: auto;
   padding: var(--content-gap);
   padding-bottom: calc(var(--content-gap) + var(--bottom-bar-height, 0px));
+}
+
+.settings-error {
+  margin-bottom: var(--content-gap);
+  padding: 9px 11px;
+  border-radius: var(--border-radius-sm);
+  background: var(--color-danger-subtle);
+  color: var(--color-danger);
+  font-size: 0.76rem;
 }
 
 /* ── Two-column grid (landscape only) ────────────────── */
@@ -809,6 +998,26 @@ onMounted(() => {
 
 .btn-secondary:disabled {
   opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  display: flex;
+  align-items: center;
+  min-height: 34px;
+  padding: 7px 16px;
+  border: 1px solid var(--color-accent);
+  border-radius: var(--border-radius-sm);
+  background: var(--color-accent);
+  color: var(--color-text-inverse);
+  font: inherit;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.btn-primary:disabled {
+  opacity: 0.55;
   cursor: not-allowed;
 }
 

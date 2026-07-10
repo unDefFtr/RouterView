@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, reactive, computed, watch } from 'vue';
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
 import { useThemeStore, type ThemePreference } from '@/stores/theme';
 import { useViewport } from '@/composables/useViewport';
@@ -7,6 +7,8 @@ import FeatherIcon from '@/components/shared/FeatherIcon.vue';
 import {
   updateConfig,
   testConnection,
+  fetchFullConfig,
+  ApiError,
   type ConnectionTestResult,
 } from '@/api';
 
@@ -37,11 +39,11 @@ function prevStep() {
 // ── Form state ──────────────────────────────────────────
 
 const form = reactive({
-  routeros_host: '192.168.88.1',
-  routeros_port: 443,
-  routeros_scheme: 'https' as 'http' | 'https',
-  routeros_username: 'admin',
-  routeros_password: '',
+  router_host: '192.168.88.1',
+  router_port: 443,
+  router_scheme: 'https' as 'http' | 'https',
+  router_username: 'admin',
+  router_password: '',
   accept_invalid_certs: false,
   poll_interval_secs: 3,
   theme: 'system' as ThemePreference,
@@ -53,14 +55,16 @@ const testing = ref(false);
 const testResult = ref<ConnectionTestResult | null>(null);
 const verifiedFingerprint = ref<string | null>(null);
 let testGeneration = 0;
+let testController: AbortController | null = null;
 
 function connectionDraft() {
   return {
-    routeros_host: form.routeros_host.trim(),
-    routeros_port: form.routeros_port,
-    routeros_scheme: form.routeros_scheme,
-    routeros_username: form.routeros_username.trim(),
-    routeros_password: form.routeros_password,
+    router_type: 'routeros' as const,
+    router_host: form.router_host.trim(),
+    router_port: form.router_port,
+    router_scheme: form.router_scheme,
+    router_username: form.router_username.trim(),
+    router_password: form.router_password,
     accept_invalid_certs: form.accept_invalid_certs,
   };
 }
@@ -68,11 +72,12 @@ function connectionDraft() {
 const connectionFingerprint = computed(() => JSON.stringify(connectionDraft()));
 const connectionFieldsValid = computed(() => {
   const draft = connectionDraft();
-  return draft.routeros_host.length > 0
-    && draft.routeros_username.length > 0
-    && Number.isInteger(draft.routeros_port)
-    && draft.routeros_port >= 1
-    && draft.routeros_port <= 65_535;
+  return draft.router_host.length > 0
+    && draft.router_username.length > 0
+    && draft.router_password.length > 0
+    && Number.isInteger(draft.router_port)
+    && draft.router_port >= 1
+    && draft.router_port <= 65_535;
 });
 const connectionVerified = computed(() =>
   verifiedFingerprint.value === connectionFingerprint.value,
@@ -80,17 +85,22 @@ const connectionVerified = computed(() =>
 
 watch(connectionFingerprint, () => {
   testGeneration++;
+  testController?.abort();
+  testController = null;
   testing.value = false;
   testResult.value = null;
   verifiedFingerprint.value = null;
   saveError.value = null;
-});
+}, { flush: 'sync' });
 
 async function runConnectionTest() {
   if (!connectionFieldsValid.value) {
     testResult.value = { success: false, error: '请填写有效的主机、端口和用户名' };
     return;
   }
+  testController?.abort();
+  const controller = new AbortController();
+  testController = controller;
   const generation = ++testGeneration;
   const draft = connectionDraft();
   const fingerprint = JSON.stringify(draft);
@@ -98,7 +108,7 @@ async function runConnectionTest() {
   testResult.value = null;
   verifiedFingerprint.value = null;
   try {
-    const result = await testConnection(draft);
+    const result = await testConnection(draft, controller.signal);
     if (generation !== testGeneration) return;
     testResult.value = result;
     verifiedFingerprint.value = result.success ? fingerprint : null;
@@ -109,7 +119,10 @@ async function runConnectionTest() {
       error: error instanceof Error ? error.message : '连接测试失败',
     };
   } finally {
-    if (generation === testGeneration) testing.value = false;
+    if (generation === testGeneration) {
+      testing.value = false;
+      if (testController === controller) testController = null;
+    }
   }
 }
 
@@ -141,6 +154,23 @@ const pollIntervalValid = computed(() =>
   && form.poll_interval_secs <= 30,
 );
 
+async function loadCurrentConfig(): Promise<void> {
+  const current = await fetchFullConfig();
+  form.router_host = current.router_host;
+  form.router_port = current.router_port;
+  form.router_scheme = current.router_scheme;
+  form.router_username = current.router_username;
+  form.router_password = '';
+  form.accept_invalid_certs = current.accept_invalid_certs;
+  form.poll_interval_secs = current.poll_interval_secs;
+  if (['system', 'dark', 'light'].includes(current.theme)) {
+    form.theme = current.theme as ThemePreference;
+    themeStore.setPreference(form.theme);
+  }
+  verifiedFingerprint.value = null;
+  testResult.value = null;
+}
+
 async function finishWizard() {
   if (!connectionVerified.value) {
     currentStep.value = 1;
@@ -158,9 +188,10 @@ async function finishWizard() {
     // Save all config fields + mark wizard as completed
     await updateConfig({
       ...connectionDraft(),
+      password_mode: 'replace',
       poll_interval_secs: form.poll_interval_secs,
       theme: form.theme,
-      wizard_completed: 'true',
+      wizard_completed: true,
     });
     saveDone.value = true;
     // Auto-navigate to dashboard after a brief pause
@@ -168,7 +199,25 @@ async function finishWizard() {
       router.push('/');
     }, 1500);
   } catch (error: unknown) {
-    saveError.value = error instanceof Error ? error.message : '保存配置失败';
+    if (error instanceof ApiError && error.status === 409) {
+      testGeneration++;
+      testController?.abort();
+      testController = null;
+      testing.value = false;
+      verifiedFingerprint.value = null;
+      testResult.value = null;
+      currentStep.value = 1;
+      try {
+        await loadCurrentConfig();
+        saveError.value = '配置已被其他会话修改，表单已重新加载。请重新输入密码并测试连接。';
+      } catch (reloadError: unknown) {
+        saveError.value = reloadError instanceof Error
+          ? `配置冲突且重新加载失败：${reloadError.message}`
+          : '配置冲突且重新加载失败';
+      }
+    } else {
+      saveError.value = error instanceof Error ? error.message : '保存配置失败';
+    }
   } finally {
     saving.value = false;
   }
@@ -179,6 +228,20 @@ async function finishWizard() {
 const canProceedFromStep1 = computed(() =>
   connectionFieldsValid.value && connectionVerified.value,
 );
+
+onMounted(async () => {
+  try {
+    await loadCurrentConfig();
+  } catch (error) {
+    saveError.value = error instanceof Error ? error.message : '无法加载当前配置版本';
+  }
+});
+
+onUnmounted(() => {
+  testGeneration++;
+  testController?.abort();
+  testController = null;
+});
 </script>
 
 <template>
@@ -226,6 +289,11 @@ const canProceedFromStep1 = computed(() =>
         </div>
       </div>
 
+      <div v-if="saveError" class="save-fail" role="alert">
+        <FeatherIcon name="alert-triangle" :size="16" />
+        <span>{{ saveError }}</span>
+      </div>
+
       <!-- ═══════ Step 1: RouterOS Connection ═══════ -->
       <div v-if="currentStep === 1" class="wizard-body">
         <section class="wizard-section">
@@ -239,7 +307,7 @@ const canProceedFromStep1 = computed(() =>
               <label class="field-label" for="wizard-router-host">主机地址</label>
               <input
                 id="wizard-router-host"
-                v-model="form.routeros_host"
+                v-model="form.router_host"
                 class="field-input mono"
                 type="text"
                 placeholder="192.168.88.1"
@@ -251,7 +319,7 @@ const canProceedFromStep1 = computed(() =>
                 <label class="field-label" for="wizard-router-port">端口</label>
                 <input
                   id="wizard-router-port"
-                  v-model.number="form.routeros_port"
+                  v-model.number="form.router_port"
                   class="field-input mono short"
                   type="number"
                   min="1"
@@ -261,7 +329,7 @@ const canProceedFromStep1 = computed(() =>
               </div>
               <div class="field" style="flex: 2">
                 <label class="field-label" for="wizard-router-scheme">连接方式</label>
-                <select id="wizard-router-scheme" v-model="form.routeros_scheme" class="field-input">
+                <select id="wizard-router-scheme" v-model="form.router_scheme" class="field-input">
                   <option value="https">HTTPS (推荐)</option>
                   <option value="http">HTTP</option>
                 </select>
@@ -272,7 +340,7 @@ const canProceedFromStep1 = computed(() =>
               <label class="field-label" for="wizard-router-username">用户名</label>
               <input
                 id="wizard-router-username"
-                v-model="form.routeros_username"
+                v-model="form.router_username"
                 class="field-input"
                 type="text"
                 placeholder="admin"
@@ -284,7 +352,7 @@ const canProceedFromStep1 = computed(() =>
               <div class="field-control">
                 <input
                   id="wizard-router-password"
-                  v-model="form.routeros_password"
+                  v-model="form.router_password"
                   class="field-input mono"
                   :type="showPassword ? 'text' : 'password'"
                   placeholder="输入 RouterOS 密码"
@@ -302,10 +370,10 @@ const canProceedFromStep1 = computed(() =>
             </div>
 
             <div class="field checkbox-field">
-              <label class="field-label">允许自签证书</label>
+              <label class="field-label" for="wizard-accept-invalid-certs">允许自签证书</label>
               <div class="field-control">
                 <label class="toggle">
-                  <input v-model="form.accept_invalid_certs" type="checkbox" />
+                  <input id="wizard-accept-invalid-certs" v-model="form.accept_invalid_certs" type="checkbox" />
                   <span class="toggle-slider" />
                 </label>
                 <span class="field-hint-inline">仅 HTTPS 时需要，用于自签名证书</span>
@@ -418,16 +486,16 @@ const canProceedFromStep1 = computed(() =>
             <div class="summary-item">
               <span class="summary-label">RouterOS 地址</span>
               <span class="summary-value mono">
-                {{ form.routeros_scheme }}://{{ form.routeros_host }}:{{ form.routeros_port }}
+                {{ form.router_scheme }}://{{ form.router_host }}:{{ form.router_port }}
               </span>
             </div>
             <div class="summary-item">
               <span class="summary-label">用户名</span>
-              <span class="summary-value">{{ form.routeros_username }}</span>
+              <span class="summary-value">{{ form.router_username }}</span>
             </div>
             <div class="summary-item">
               <span class="summary-label">密码</span>
-              <span class="summary-value">{{ form.routeros_password ? '已设置' : '未设置' }}</span>
+              <span class="summary-value">{{ form.router_password ? '已设置' : '未设置' }}</span>
             </div>
             <div class="summary-item">
               <span class="summary-label">轮询间隔</span>
@@ -445,10 +513,6 @@ const canProceedFromStep1 = computed(() =>
           <div v-if="saveDone" class="save-success">
             <FeatherIcon name="check-circle" :size="20" />
             <span>配置已保存，正在跳转...</span>
-          </div>
-          <div v-else-if="saveError" class="save-fail">
-            <FeatherIcon name="alert-triangle" :size="16" />
-            <span>{{ saveError }}</span>
           </div>
         </section>
       </div>

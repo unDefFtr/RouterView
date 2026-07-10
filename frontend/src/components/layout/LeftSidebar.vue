@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { useNavigation } from '@/composables/useNavigation';
+import { computed } from 'vue';
 import { RouterLink } from 'vue-router';
 import FeatherIcon from '@/components/shared/FeatherIcon.vue';
 
@@ -17,7 +18,8 @@ function featherName(icon: string): string {
 const { items, activeId } = useNavigation();
 
 // Settings lives in the bottom gear slot, not in the main nav strip
-const navItems = items.filter(i => i.id !== 'settings');
+const navItems = computed(() => items.value.filter(i => i.id !== 'settings'));
+const hasSettings = computed(() => items.value.some(i => i.id === 'settings'));
 </script>
 
 <template>
@@ -39,7 +41,7 @@ const navItems = items.filter(i => i.id !== 'settings');
   </nav>
 
   <!-- Settings gear at bottom -->
-  <div class="sidebar-bottom">
+  <div v-if="hasSettings" class="sidebar-bottom">
     <RouterLink
       class="settings-btn"
       :class="{ active: activeId === 'settings' }"
