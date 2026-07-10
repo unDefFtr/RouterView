@@ -66,6 +66,8 @@ services:
     restart: unless-stopped
     environment:
       ROUTERVIEW_DOMAIN: ${ROUTERVIEW_DOMAIN:-routerview.local}
+    extra_hosts:
+      - "${ROUTERVIEW_DOMAIN:-routerview.local}=127.0.0.1"
     depends_on:
       backend:
         condition: service_healthy
@@ -92,7 +94,7 @@ services:
         - CMD-SHELL
         - >-
           wget --no-check-certificate -q --spider
-          --header="Host: $${ROUTERVIEW_DOMAIN}" https://127.0.0.1/api/health
+          https://$${ROUTERVIEW_DOMAIN}/api/health
       interval: 30s
       timeout: 5s
       start_period: 15s
