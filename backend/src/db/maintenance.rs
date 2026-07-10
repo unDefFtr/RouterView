@@ -874,7 +874,10 @@ fn ensure_available_space(path: &Path, required_bytes: u64) -> DatabaseResult<()
         return Err(DatabaseError::Io(std::io::Error::last_os_error()));
     }
     let stats = unsafe { stats.assume_init() };
-    let available_bytes = (stats.f_bavail as u64).saturating_mul(stats.f_frsize);
+    let available_bytes = (stats.f_bavail as u128)
+        .saturating_mul(stats.f_frsize as u128)
+        .try_into()
+        .unwrap_or(u64::MAX);
     if available_bytes < required_bytes {
         return Err(DatabaseError::InsufficientSpace {
             path: path.to_path_buf(),
