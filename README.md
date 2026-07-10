@@ -13,17 +13,41 @@ CA, serves the frontend, and proxies `/api/*` and `/ws` to the backend.
 Prerequisites: Docker Engine with Compose v2, a local DNS record for the chosen
 name, and a host that can reach the router management network.
 
+Use the Compose file from the same release as both images. For v0.2.0:
+
 ```bash
+git clone --depth 1 --branch v0.2.0 \
+  https://github.com/unDefFtr/RouterView.git routerview
+cd routerview
 cp .env.compose.example .env
 install -d -m 0700 secrets
 openssl rand -out secrets/routerview_master_key 32
 chmod 0444 secrets/routerview_master_key
-# Edit .env, especially ROUTERVIEW_DOMAIN and ROUTER_MANAGEMENT_CIDRS.
-docker compose config --quiet
-docker compose build
-docker compose run --rm --no-deps backend admin setup admin
-docker compose up -d
 ```
+
+Edit `.env`, especially `ROUTERVIEW_DOMAIN` and `ROUTER_MANAGEMENT_CIDRS`, and
+set both published images to the same exact version:
+
+```dotenv
+ROUTERVIEW_BACKEND_IMAGE=ghcr.io/undefftr/routerview-backend:0.2.0
+ROUTERVIEW_CADDY_IMAGE=ghcr.io/undefftr/routerview-caddy:0.2.0
+```
+
+```bash
+docker compose config --quiet
+docker compose config --images
+docker compose pull
+docker compose run --rm --no-deps backend admin setup admin
+docker compose up -d --no-build --wait --wait-timeout 180
+docker compose ps
+```
+
+The GHCR packages are public and do not require `docker login`. Keep backend and
+Caddy on the same exact version; do not use the moving `latest` tag for a
+production deployment. The Caddy image already contains the matching frontend.
+To build from source instead, leave the image variables unset and replace
+`docker compose pull` with `docker compose build`. The final `up --no-build`
+then uses the images selected by the explicit pull or build step.
 
 The backend has no published port. Do not add one, and do not expose Caddy to
 the public Internet. Trust Caddy's local root certificate on each client before

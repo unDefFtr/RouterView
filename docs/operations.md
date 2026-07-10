@@ -60,7 +60,37 @@ backup files.
 
 ## Install and first setup
 
-Validate interpolation and build the images:
+Use `compose.yaml` from the same Git release as the images. Mixing a newer
+Compose model with older containers is unsupported.
+
+### Published GHCR images
+
+The v0.2.0 images are public and support `linux/amd64` and `linux/arm64`. Set
+both image variables in `.env` to the same exact version:
+
+```dotenv
+ROUTERVIEW_BACKEND_IMAGE=ghcr.io/undefftr/routerview-backend:0.2.0
+ROUTERVIEW_CADDY_IMAGE=ghcr.io/undefftr/routerview-caddy:0.2.0
+```
+
+Validate the resolved image names and pull them before running any one-shot
+maintenance command:
+
+```bash
+docker compose config --quiet
+docker compose config --images
+docker compose pull
+```
+
+No GHCR login is required for these public packages. Production deployments
+must use an exact version or OCI index digest, not the moving `latest` or `0.2`
+tags. The backend and Caddy images must always be upgraded or rolled back
+together. The Caddy image contains the frontend built from the same release.
+
+### Local source build
+
+To build the same checkout locally instead, leave `ROUTERVIEW_BACKEND_IMAGE`
+and `ROUTERVIEW_CADDY_IMAGE` unset, then run:
 
 ```bash
 docker compose config --quiet
@@ -88,7 +118,7 @@ container mounts the same database and master-key secret as the service:
 
 ```bash
 docker compose run --rm --no-deps backend admin setup admin
-docker compose up -d
+docker compose up -d --no-build --wait --wait-timeout 180
 docker compose ps
 ```
 
@@ -105,7 +135,7 @@ container. Resetting it revokes all existing sessions and unused pairing codes:
 ```bash
 docker compose stop caddy backend
 docker compose run --rm --no-deps backend admin reset-password admin
-docker compose up -d
+docker compose up -d --no-build --wait --wait-timeout 180
 ```
 
 Use the authenticated UI to set the RouterOS password. Do not add
@@ -196,7 +226,7 @@ docker compose run --rm --no-deps backend db migrate \
   --backup-dir /var/backups/routerview
 docker compose run --rm --no-deps backend db check
 docker compose run --rm --no-deps backend keys verify
-docker compose up -d --wait
+docker compose up -d --no-build --wait --wait-timeout 180
 ```
 
 The explicit backup directory keeps the pre-restore recovery backup in
@@ -207,8 +237,25 @@ restored instance passes readiness and traffic sampling checks.
 
 ## Upgrade and migration
 
-1. Read the release notes and back up the master key separately.
-2. Pull or build the target images without stopping the current deployment.
+1. Read the release notes, record the current output of
+   `docker compose config --images`, and back up the master key separately.
+2. Update the checkout to the target Git release so its `compose.yaml` matches
+   the target containers. Prepare both target images without stopping the
+   current deployment. For a GHCR deployment, update both image variables to
+   the same exact version and pull them:
+
+   ```bash
+   docker compose config --images
+   docker compose pull
+   ```
+
+   For a source deployment, build the checked-out release instead:
+
+   ```bash
+   docker compose build
+   ```
+
+   Never upgrade only one image or use `latest` for a production upgrade.
 3. While the current backend is still running, create an online backup:
 
    ```bash
@@ -233,7 +280,7 @@ restored instance passes readiness and traffic sampling checks.
    connectivity, the first exact traffic sample, and retained historical data:
 
    ```bash
-   docker compose up -d
+   docker compose up -d --no-build --wait --wait-timeout 180
    docker compose ps
    ```
 
@@ -243,9 +290,12 @@ copied into a backup, or a temporary migration table is inconsistent. The
 separate `keys verify` steps make decryption a required operational precondition
 and postcondition.
 
-For rollback before any new-schema writes, restore the pre-migration backup and
-start the previous images. After new-schema writes, first export a compatibility
-database while the new binary is still available:
+For a GHCR rollback, set both image variables to the previous exact version or
+recorded digests and run `docker compose pull` before restoring and starting the
+stack. Never mix backend and Caddy versions. Before any new-schema writes,
+restore the pre-migration backup and start the previous images. After new-schema
+writes, first export a compatibility database while the new binary is still
+available:
 
 ```bash
 docker compose stop caddy backend
@@ -302,7 +352,7 @@ then restart the stack:
 
 ```bash
 docker compose run --rm --no-deps backend keys verify
-docker compose up -d
+docker compose up -d --no-build --wait --wait-timeout 180
 docker compose ps
 ```
 
