@@ -36,6 +36,7 @@ Thumbs.db
 *.db
 *.db-shm
 *.db-wal
+*.db.lock
 
 # Production secrets and local operational output
 secrets/
