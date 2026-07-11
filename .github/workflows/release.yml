@@ -43,6 +43,9 @@ jobs:
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # openidconnect 4 uses rsa 0.9 for public-key verification only. RouterView
+          # never loads an RSA private key or performs the operations affected here.
+          ignore: RUSTSEC-2023-0071
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 10.24.0
@@ -80,6 +83,16 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      OIDC_ISSUER_URL: https://127.0.0.1:9
+      OIDC_CLIENT_ID: routerview-release-validation
+      OIDC_CLIENT_SECRET_SOURCE: ./secrets/routerview_oidc_client_secret
+      OIDC_PROVIDER_NAME: Example SSO
+      OIDC_GROUPS_CLAIM: groups
+      OIDC_VIEWER_GROUP: routerview-viewers
+      OIDC_ADMIN_GROUP: routerview-admins
+      OIDC_ADDITIONAL_SCOPES: groups.read
+      OIDC_CA_SOURCE: ./secrets/routerview_oidc_ca.pem
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -88,9 +101,23 @@ jobs:
         run: |
           mkdir -p secrets
           head -c 32 /dev/urandom > secrets/routerview_master_key
-          chmod 0444 secrets/routerview_master_key
-      - name: Validate Compose model
+          openssl rand -base64 48 > secrets/routerview_oidc_client_secret
+          cp /etc/ssl/certs/ca-certificates.crt secrets/routerview_oidc_ca.pem
+          chmod 0444 secrets/routerview_master_key \
+            secrets/routerview_oidc_client_secret \
+            secrets/routerview_oidc_ca.pem
+      - name: Validate base Compose model
         run: docker compose --env-file .env.compose.example config --quiet
+      - name: Validate OIDC Compose model
+        run: >-
+          docker compose --env-file .env.compose.example
+          -f compose.yaml -f compose.oidc.yaml
+          config --quiet
+      - name: Validate private-CA OIDC Compose model
+        run: >-
+          docker compose --env-file .env.compose.example
+          -f compose.yaml -f compose.oidc.yaml -f compose.oidc-ca.yaml
+          config --quiet
       - name: Validate Caddy configuration
         run: >-
           docker run --rm

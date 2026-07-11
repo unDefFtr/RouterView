@@ -1,0 +1,20 @@
+services:
+  backend:
+    environment:
+      OIDC_ENABLED: "true"
+      OIDC_ISSUER_URL: ${OIDC_ISSUER_URL:?Set OIDC_ISSUER_URL in .env}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:?Set OIDC_CLIENT_ID in .env}
+      OIDC_CLIENT_SECRET_FILE: /run/secrets/routerview_oidc_client_secret
+      OIDC_PROVIDER_NAME: ${OIDC_PROVIDER_NAME:?Set OIDC_PROVIDER_NAME in .env}
+      OIDC_GROUPS_CLAIM: ${OIDC_GROUPS_CLAIM:-groups}
+      OIDC_VIEWER_GROUP: ${OIDC_VIEWER_GROUP:?Set OIDC_VIEWER_GROUP in .env}
+      OIDC_ADMIN_GROUP: ${OIDC_ADMIN_GROUP:?Set OIDC_ADMIN_GROUP in .env}
+      OIDC_ADDITIONAL_SCOPES: ${OIDC_ADDITIONAL_SCOPES:-}
+      OIDC_CA_FILE: ""
+    secrets:
+      - source: routerview_oidc_client_secret
+        target: routerview_oidc_client_secret
+
+secrets:
+  routerview_oidc_client_secret:
+    file: ${OIDC_CLIENT_SECRET_SOURCE:?Set OIDC_CLIENT_SECRET_SOURCE in .env}

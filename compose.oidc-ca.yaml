@@ -1,0 +1,11 @@
+services:
+  backend:
+    environment:
+      OIDC_CA_FILE: /run/secrets/routerview_oidc_ca.pem
+    volumes:
+      - type: bind
+        source: ${OIDC_CA_SOURCE:?Set OIDC_CA_SOURCE in .env}
+        target: /run/secrets/routerview_oidc_ca.pem
+        read_only: true
+        bind:
+          create_host_path: false

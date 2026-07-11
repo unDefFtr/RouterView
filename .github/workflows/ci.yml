@@ -81,6 +81,16 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      OIDC_ISSUER_URL: https://127.0.0.1:9
+      OIDC_CLIENT_ID: routerview-ci
+      OIDC_CLIENT_SECRET_SOURCE: ./secrets/routerview_oidc_client_secret
+      OIDC_PROVIDER_NAME: Example SSO
+      OIDC_GROUPS_CLAIM: groups
+      OIDC_VIEWER_GROUP: routerview-viewers
+      OIDC_ADMIN_GROUP: routerview-admins
+      OIDC_ADDITIONAL_SCOPES: groups.read
+      OIDC_CA_SOURCE: ./secrets/routerview_oidc_ca.pem
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -89,9 +99,23 @@ jobs:
         run: |
           mkdir -p secrets
           head -c 32 /dev/urandom > secrets/routerview_master_key
-          chmod 0444 secrets/routerview_master_key
-      - name: Validate Compose model
+          openssl rand -base64 48 > secrets/routerview_oidc_client_secret
+          cp /etc/ssl/certs/ca-certificates.crt secrets/routerview_oidc_ca.pem
+          chmod 0444 secrets/routerview_master_key \
+            secrets/routerview_oidc_client_secret \
+            secrets/routerview_oidc_ca.pem
+      - name: Validate base Compose model
         run: docker compose --env-file .env.compose.example config --quiet
+      - name: Validate OIDC Compose model
+        run: >-
+          docker compose --env-file .env.compose.example
+          -f compose.yaml -f compose.oidc.yaml
+          config --quiet
+      - name: Validate private-CA OIDC Compose model
+        run: >-
+          docker compose --env-file .env.compose.example
+          -f compose.yaml -f compose.oidc.yaml -f compose.oidc-ca.yaml
+          config --quiet
       - name: Build Caddy runtime image
         run: docker build --target caddy-runtime --tag routerview-caddy:ci .
       - name: Verify Caddy image delegates health to Compose
@@ -119,16 +143,20 @@ jobs:
           ROUTERVIEW_HTTPS_BIND: 127.0.0.1
         run: >-
           docker compose --env-file .env.compose.example
+          -f compose.yaml -f compose.oidc.yaml
           up --detach --build --wait --wait-timeout 180
       - name: Verify Compose deployment
         run: |
           set -euo pipefail
-          docker compose --env-file .env.compose.example ps --format json \
+          docker compose --env-file .env.compose.example \
+            -f compose.yaml -f compose.oidc.yaml ps --format json \
             | jq --slurp --exit-status \
               'length == 2 and all(.[]; .Health == "healthy")' >/dev/null
 
-          backend_id="$(docker compose --env-file .env.compose.example ps -q backend)"
-          caddy_id="$(docker compose --env-file .env.compose.example ps -q caddy)"
+          backend_id="$(docker compose --env-file .env.compose.example \
+            -f compose.yaml -f compose.oidc.yaml ps -q backend)"
+          caddy_id="$(docker compose --env-file .env.compose.example \
+            -f compose.yaml -f compose.oidc.yaml ps -q caddy)"
           docker inspect "$backend_id" | jq --exit-status '
             .[0] |
             .Config.User == "10001:10001" and
@@ -137,6 +165,9 @@ jobs:
             .HostConfig.CapAdd == ["CAP_NET_RAW"] and
             .HostConfig.SecurityOpt == ["no-new-privileges:true"] and
             .HostConfig.PortBindings == {} and
+            any(.Mounts[];
+              .Destination == "/run/secrets/routerview_oidc_client_secret" and
+              .RW == false) and
             (.NetworkSettings.Networks | keys | sort) ==
               ["routerview_app", "routerview_router_access"]
           ' >/dev/null
@@ -155,7 +186,8 @@ jobs:
               ["routerview_app", "routerview_edge"]
           ' >/dev/null
 
-          docker compose --env-file .env.compose.example cp \
+          docker compose --env-file .env.compose.example \
+            -f compose.yaml -f compose.oidc.yaml cp \
             caddy:/data/caddy/pki/authorities/local/root.crt \
             /tmp/routerview-local-ca.crt
           health_code="$(curl --silent --show-error \
@@ -169,6 +201,20 @@ jobs:
             '.status == "ok" and .version == "0.2.0"' \
             /tmp/routerview-health.json >/dev/null
 
+          auth_status_code="$(curl --silent --show-error \
+            --resolve routerview.local:443:127.0.0.1 \
+            --cacert /tmp/routerview-local-ca.crt \
+            --output /tmp/routerview-auth-status.json \
+            --write-out '%{http_code}' \
+            https://routerview.local/api/auth/status)"
+          test "$auth_status_code" = 200
+          jq --exit-status '
+            .oidc == {
+              "provider_name": "Example SSO",
+              "available": false
+            }
+          ' /tmp/routerview-auth-status.json >/dev/null
+
           redirect_code="$(curl --silent --show-error \
             --header 'Host: routerview.local' \
             --dump-header /tmp/routerview-redirect.headers \
@@ -180,10 +226,63 @@ jobs:
           redirect_location="$(sed -n 's/^Location: //Ip' \
             /tmp/routerview-redirect.headers | tr -d '\r')"
           test "$redirect_location" = 'https://routerview.local/'
+
+          insecure_callback_code="$(curl --silent --show-error \
+            --header 'Host: routerview.local' \
+            --dump-header /tmp/routerview-insecure-callback.headers \
+            --output /dev/null \
+            --write-out '%{http_code}' \
+            'http://127.0.0.1/api/auth/oidc/callback?code=OIDC_HTTP_TEST_CODE&state=OIDC_HTTP_TEST_STATE')"
+          test "$insecure_callback_code" = 404
+          ! grep --ignore-case '^Location:' \
+            /tmp/routerview-insecure-callback.headers
+          grep --ignore-case '^Cache-Control: no-store' \
+            /tmp/routerview-insecure-callback.headers >/dev/null
+          ! grep --fixed-strings 'OIDC_HTTP_TEST_CODE' \
+            /tmp/routerview-insecure-callback.headers
+          ! grep --fixed-strings 'OIDC_HTTP_TEST_STATE' \
+            /tmp/routerview-insecure-callback.headers
+
+          docker compose --env-file .env.compose.example \
+            -f compose.yaml -f compose.oidc.yaml stop backend
+          callback_code="$(curl --silent --show-error \
+            --resolve routerview.local:443:127.0.0.1 \
+            --cacert /tmp/routerview-local-ca.crt \
+            --header 'Cookie: __Host-routerview_oidc_flow=OIDC_COOKIE_TEST_SECRET' \
+            --header 'Referer: https://idp.example/authorize?state=OIDC_REFERER_TEST_STATE&nonce=OIDC_REFERER_TEST_NONCE' \
+            --output /dev/null \
+            --write-out '%{http_code}' \
+            'https://routerview.local/api/auth/oidc/callback?code=OIDC_LOG_TEST_CODE&state=OIDC_LOG_TEST_STATE')"
+          test "$callback_code" = 502
+          docker compose --env-file .env.compose.example \
+            -f compose.yaml -f compose.oidc.yaml logs --no-color caddy \
+            > /tmp/routerview-caddy.log
+          grep --fixed-strings \
+            '"uri":"/api/auth/oidc/callback"' \
+            /tmp/routerview-caddy.log >/dev/null
+          grep --fixed-strings '"Cookie":["REDACTED"]' \
+            /tmp/routerview-caddy.log >/dev/null
+          ! grep --fixed-strings '"Referer"' \
+            /tmp/routerview-caddy.log
+          ! grep --fixed-strings 'OIDC_LOG_TEST_CODE' \
+            /tmp/routerview-caddy.log
+          ! grep --fixed-strings 'OIDC_LOG_TEST_STATE' \
+            /tmp/routerview-caddy.log
+          ! grep --fixed-strings 'OIDC_HTTP_TEST_CODE' \
+            /tmp/routerview-caddy.log
+          ! grep --fixed-strings 'OIDC_HTTP_TEST_STATE' \
+            /tmp/routerview-caddy.log
+          ! grep --fixed-strings 'OIDC_COOKIE_TEST_SECRET' \
+            /tmp/routerview-caddy.log
+          ! grep --fixed-strings 'OIDC_REFERER_TEST_STATE' \
+            /tmp/routerview-caddy.log
+          ! grep --fixed-strings 'OIDC_REFERER_TEST_NONCE' \
+            /tmp/routerview-caddy.log
       - name: Stop Compose deployment
         if: always()
         run: >-
           docker compose --env-file .env.compose.example
+          -f compose.yaml -f compose.oidc.yaml
           down --volumes --remove-orphans
 
   dependency-audit:
@@ -199,6 +298,9 @@ jobs:
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # openidconnect 4 uses rsa 0.9 for public-key verification only. RouterView
+          # never loads an RSA private key or performs the operations affected here.
+          ignore: RUSTSEC-2023-0071
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 10.24.0

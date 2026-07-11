@@ -2,7 +2,12 @@
 	admin off
 	skip_install_trust
 	log {
-		format json
+		format filter {
+			# Preserve the request path while preventing callback secrets from entering logs.
+			request>uri regexp "[?].*$" ""
+			request>headers>Referer delete
+			wrap json
+		}
 		level INFO
 	}
 	servers {
@@ -13,6 +18,9 @@
 http://{$ROUTERVIEW_DOMAIN:routerview.local} {
 	route {
 		header -Server
+		@oidcCallback path /api/auth/oidc/callback
+		header @oidcCallback Cache-Control "no-store"
+		respond @oidcCallback 404
 		redir https://{$ROUTERVIEW_DOMAIN:routerview.local}{uri} 308
 	}
 }
