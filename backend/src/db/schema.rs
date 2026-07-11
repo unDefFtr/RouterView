@@ -132,6 +132,17 @@ pub fn apply_migrations(
                 before,
             )?;
         }
+        if original_version < 7 {
+            migrate_v7_oidc_sessions(&tx)?;
+            record_migration(
+                &tx,
+                7,
+                "oidc_session_identity",
+                original_version,
+                backup,
+                before,
+            )?;
+        }
 
         let after = legacy_counts(&tx)?;
         if before != after {
@@ -291,6 +302,53 @@ fn migrate_v3_security(conn: &Connection) -> DatabaseResult<()> {
         "INSERT OR IGNORE INTO schema_migrations(name)
          VALUES ('admin_credential_version_v1')",
         [],
+    )?;
+    Ok(())
+}
+
+fn migrate_v7_oidc_sessions(conn: &Connection) -> DatabaseResult<()> {
+    let columns = [
+        (
+            "auth_method",
+            "ALTER TABLE auth_sessions ADD COLUMN auth_method TEXT NOT NULL DEFAULT 'password' CHECK (auth_method IN ('password', 'oidc', 'pairing'))",
+        ),
+        (
+            "display_name",
+            "ALTER TABLE auth_sessions ADD COLUMN display_name TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "provider_name",
+            "ALTER TABLE auth_sessions ADD COLUMN provider_name TEXT",
+        ),
+        (
+            "identity_issuer",
+            "ALTER TABLE auth_sessions ADD COLUMN identity_issuer TEXT",
+        ),
+        (
+            "identity_subject",
+            "ALTER TABLE auth_sessions ADD COLUMN identity_subject TEXT",
+        ),
+        (
+            "oidc_policy_fingerprint",
+            "ALTER TABLE auth_sessions ADD COLUMN oidc_policy_fingerprint BLOB",
+        ),
+    ];
+    for (column, statement) in columns {
+        let exists = conn
+            .prepare("SELECT 1 FROM pragma_table_info('auth_sessions') WHERE name = ?1")?
+            .exists([column])?;
+        if !exists {
+            conn.execute(statement, [])?;
+        }
+    }
+    conn.execute_batch(
+        "UPDATE auth_sessions
+         SET auth_method = CASE WHEN kind = 'fixed' THEN 'pairing' ELSE 'password' END,
+             display_name = username
+         WHERE display_name = '';
+         CREATE INDEX IF NOT EXISTS idx_auth_sessions_oidc_identity
+             ON auth_sessions(identity_issuer, identity_subject)
+             WHERE auth_method = 'oidc';",
     )?;
     Ok(())
 }
@@ -726,4 +784,191 @@ fn table_count_if_present(conn: &Connection, table: &str) -> DatabaseResult<u64>
         }
     };
     Ok(conn.query_row(sql, [], |row| row.get(0))?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v7_migration_preserves_sessions_and_pairings_and_backfills_metadata() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE auth_sessions (
+                 id TEXT PRIMARY KEY,
+                 token_hash BLOB NOT NULL UNIQUE,
+                 csrf_hash BLOB NOT NULL,
+                 username TEXT NOT NULL,
+                 role TEXT NOT NULL CHECK (role IN ('viewer', 'admin')),
+                 kind TEXT NOT NULL CHECK (kind IN ('standard', 'fixed')),
+                 label TEXT,
+                 created_at INTEGER NOT NULL,
+                 last_seen_at INTEGER NOT NULL,
+                 idle_expires_at INTEGER,
+                 absolute_expires_at INTEGER NOT NULL,
+                 revoked_at INTEGER
+             );
+             CREATE TABLE pairing_codes (
+                 id TEXT PRIMARY KEY,
+                 code_hash BLOB NOT NULL UNIQUE,
+                 role TEXT NOT NULL CHECK (role IN ('viewer', 'admin')),
+                 label TEXT NOT NULL,
+                 created_by_session_id TEXT NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 expires_at INTEGER NOT NULL,
+                 used_at INTEGER,
+                 FOREIGN KEY(created_by_session_id) REFERENCES auth_sessions(id)
+             );
+             INSERT INTO auth_sessions VALUES
+                 ('browser', X'01', X'02', 'local-admin', 'admin', 'standard', NULL,
+                  100, 100, 1000, 2000, NULL),
+                 ('device', X'03', X'04', 'local-admin', 'viewer', 'fixed', 'wall',
+                  101, 101, NULL, 3000, NULL);
+             INSERT INTO pairing_codes VALUES
+                 ('pairing', X'05', 'viewer', 'tablet', 'browser', 100, 500, NULL);
+             PRAGMA user_version = 6;",
+        )
+        .unwrap();
+
+        apply_migrations(&mut conn, 6, None).unwrap();
+
+        assert_eq!(user_version(&conn).unwrap(), 7);
+        let sessions = conn
+            .prepare(
+                "SELECT id, auth_method, display_name, provider_name, identity_issuer,
+                        identity_subject, oidc_policy_fingerprint
+                 FROM auth_sessions ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<Vec<u8>>>(6)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            sessions,
+            vec![
+                (
+                    "browser".into(),
+                    "password".into(),
+                    "local-admin".into(),
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                (
+                    "device".into(),
+                    "pairing".into(),
+                    "local-admin".into(),
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            ]
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM pairing_codes", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT name FROM database_migrations WHERE version = 7",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "oidc_session_identity"
+        );
+    }
+
+    #[test]
+    fn v7_backfill_failure_rolls_back_added_columns_and_version() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE database_migrations (
+                 version                 INTEGER PRIMARY KEY,
+                 name                    TEXT NOT NULL,
+                 source_version          INTEGER NOT NULL,
+                 applied_at              INTEGER NOT NULL DEFAULT (unixepoch()),
+                 backup_path             TEXT,
+                 backup_sha256           TEXT,
+                 legacy_points_count     INTEGER NOT NULL,
+                 legacy_rollups_count    INTEGER NOT NULL
+             );
+             CREATE TABLE auth_sessions (
+                 id TEXT PRIMARY KEY,
+                 token_hash BLOB NOT NULL UNIQUE,
+                 csrf_hash BLOB NOT NULL,
+                 username TEXT NOT NULL,
+                 role TEXT NOT NULL CHECK (role IN ('viewer', 'admin')),
+                 kind TEXT NOT NULL CHECK (kind IN ('standard', 'fixed')),
+                 label TEXT,
+                 created_at INTEGER NOT NULL,
+                 last_seen_at INTEGER NOT NULL,
+                 idle_expires_at INTEGER,
+                 absolute_expires_at INTEGER NOT NULL,
+                 revoked_at INTEGER
+             );
+             INSERT INTO auth_sessions VALUES
+                 ('browser', X'01', X'02', 'local-admin', 'admin', 'standard', NULL,
+                  100, 100, 1000, 2000, NULL);
+             CREATE TRIGGER fail_v7_backfill
+             BEFORE UPDATE ON auth_sessions
+             BEGIN
+                 SELECT RAISE(ABORT, 'forced v7 backfill failure');
+             END;
+             PRAGMA user_version = 6;",
+        )
+        .unwrap();
+
+        let error = apply_migrations(&mut conn, 6, None).unwrap_err();
+        assert!(error.to_string().contains("forced v7 backfill failure"));
+        assert_eq!(user_version(&conn).unwrap(), 6);
+        for column in [
+            "auth_method",
+            "display_name",
+            "provider_name",
+            "identity_issuer",
+            "identity_subject",
+            "oidc_policy_fingerprint",
+        ] {
+            assert!(!conn
+                .prepare("SELECT 1 FROM pragma_table_info('auth_sessions') WHERE name = ?1")
+                .unwrap()
+                .exists([column])
+                .unwrap());
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT username, kind FROM auth_sessions WHERE id = 'browser'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap(),
+            ("local-admin".into(), "standard".into())
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM database_migrations WHERE version = 7",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+    }
 }

@@ -44,7 +44,7 @@ pub async fn run_session(socket: WebSocket, state: Arc<AppState>, auth_session: 
         return;
     }
 
-    if !auth::revalidate_session(&state.traffic_db, &auth_session).unwrap_or(false) {
+    if !auth::revalidate_session(&state, &auth_session).unwrap_or(false) {
         send_close(
             &mut sender,
             CloseFrame {
@@ -107,7 +107,7 @@ pub async fn run_session(socket: WebSocket, state: Arc<AppState>, auth_session: 
             }
 
             _ = session_check.tick() => {
-                if !auth::revalidate_session(&state.traffic_db, &auth_session).unwrap_or(false) {
+                if !auth::revalidate_session(&state, &auth_session).unwrap_or(false) {
                     send_close(
                         &mut sender,
                         CloseFrame {

@@ -3,6 +3,7 @@ mod config_store;
 mod db;
 mod error;
 mod key_cli;
+mod oidc;
 mod oui;
 mod router;
 mod state;
@@ -52,6 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load configuration from environment
     let env_config = Config::from_env()?;
+    let oidc = Arc::new(oidc::OidcManager::new(env_config.oidc.clone())?);
 
     // Open SQLite traffic history database
     let db_path = std::path::PathBuf::from(&env_config.db_path);
@@ -65,6 +67,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Merge env config with DB overrides
     let merged_config = ConfigStore::load(&traffic_db, &env_config, &secret_cipher)?;
     traffic_db.finish_migrations()?;
+    traffic_db.revoke_oidc_sessions_with_other_policy(
+        oidc.policy_fingerprint(),
+        chrono::Utc::now().timestamp(),
+    )?;
     let config = Arc::new(tokio::sync::RwLock::new(merged_config));
 
     {
@@ -108,6 +114,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let poller_control = poll_engine.control();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
+    oidc.spawn_discovery(shutdown_tx.subscribe());
+
     // Build shared application state
     let app_state = Arc::new(AppState {
         config: config.clone(),
@@ -127,6 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         auth_security: Arc::new(auth::AuthSecurity::new(
             env_config.trusted_proxy_cidrs.clone(),
         )?),
+        oidc,
         setup_token_path: std::path::PathBuf::from(&env_config.setup_token_file),
         poller_control: poller_control.clone(),
         shutdown_tx: shutdown_tx.clone(),

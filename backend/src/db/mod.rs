@@ -72,6 +72,15 @@ pub struct AuthSessionRecord {
     pub username: String,
     pub role: String,
     pub kind: String,
+    pub auth_method: String,
+    pub display_name: String,
+    pub provider_name: Option<String>,
+    #[serde(skip_serializing)]
+    pub identity_issuer: Option<String>,
+    #[serde(skip_serializing)]
+    pub identity_subject: Option<String>,
+    #[serde(skip_serializing)]
+    pub oidc_policy_fingerprint: Option<Vec<u8>>,
     pub label: Option<String>,
     pub created_at: i64,
     pub last_seen_at: i64,
@@ -629,13 +638,33 @@ impl TrafficDb {
             params![session.username, expected_credential_version],
             |row| row.get(0),
         )?;
-        if !credentials_unchanged || session.kind != "standard" || session.role != "admin" {
+        if !credentials_unchanged
+            || session.kind != "standard"
+            || session.role != "admin"
+            || session.auth_method != "password"
+        {
             tx.rollback()?;
             return Ok(false);
         }
         insert_session_inner(&tx, session)?;
         tx.commit()?;
         Ok(true)
+    }
+
+    pub fn insert_oidc_session(&self, session: &AuthSessionRecord) -> Result<(), rusqlite::Error> {
+        if session.kind != "standard"
+            || session.auth_method != "oidc"
+            || session.identity_issuer.is_none()
+            || session.identity_subject.is_none()
+            || session.oidc_policy_fingerprint.is_none()
+        {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        insert_session_inner(&conn, session)
     }
 
     pub fn session_by_token_hash(
@@ -647,8 +676,10 @@ impl TrafficDb {
             .lock()
             .map_err(|_| rusqlite::Error::InvalidQuery)?;
         conn.query_row(
-            "SELECT id, token_hash, csrf_hash, username, role, kind, label, created_at,
-                    last_seen_at, idle_expires_at, absolute_expires_at, revoked_at
+            "SELECT id, token_hash, csrf_hash, username, role, kind, auth_method,
+                    display_name, provider_name, identity_issuer, identity_subject,
+                    oidc_policy_fingerprint, label, created_at, last_seen_at,
+                    idle_expires_at, absolute_expires_at, revoked_at
              FROM auth_sessions WHERE token_hash = ?1",
             params![token_hash],
             map_session_row,
@@ -713,8 +744,10 @@ impl TrafficDb {
             .lock()
             .map_err(|_| rusqlite::Error::InvalidQuery)?;
         let mut stmt = conn.prepare(
-            "SELECT id, token_hash, csrf_hash, username, role, kind, label, created_at,
-                    last_seen_at, idle_expires_at, absolute_expires_at, revoked_at
+            "SELECT id, token_hash, csrf_hash, username, role, kind, auth_method,
+                    display_name, provider_name, identity_issuer, identity_subject,
+                    oidc_policy_fingerprint, label, created_at, last_seen_at,
+                    idle_expires_at, absolute_expires_at, revoked_at
              FROM auth_sessions ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], map_session_row)?;
@@ -731,6 +764,30 @@ impl TrafficDb {
             params![now, id],
         )?;
         Ok(changed == 1)
+    }
+
+    pub fn revoke_oidc_sessions_with_other_policy(
+        &self,
+        current_fingerprint: Option<&[u8]>,
+        now: i64,
+    ) -> Result<usize, rusqlite::Error> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        match current_fingerprint {
+            Some(fingerprint) => conn.execute(
+                "UPDATE auth_sessions SET revoked_at = ?1
+                 WHERE auth_method = 'oidc' AND revoked_at IS NULL
+                   AND (oidc_policy_fingerprint IS NULL OR oidc_policy_fingerprint <> ?2)",
+                params![now, fingerprint],
+            ),
+            None => conn.execute(
+                "UPDATE auth_sessions SET revoked_at = ?1
+                 WHERE auth_method = 'oidc' AND revoked_at IS NULL",
+                params![now],
+            ),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -754,17 +811,18 @@ impl TrafficDb {
             "SELECT EXISTS(
                  SELECT 1
                  FROM auth_sessions AS session
-                 JOIN admins AS admin ON admin.id = 1
                  WHERE session.id = ?1
                    AND session.username = ?2
                    AND session.role = ?3
                    AND session.kind = ?4
                    AND session.role = 'admin'
-                   AND session.username = admin.username
                    AND session.revoked_at IS NULL
                    AND session.absolute_expires_at > ?5
                    AND (session.idle_expires_at IS NULL OR session.idle_expires_at > ?5)
-                   AND (?6 IS NULL OR admin.credential_version = ?6)
+                   AND (?6 IS NULL OR EXISTS(
+                       SELECT 1 FROM admins AS admin
+                       WHERE admin.id = 1 AND admin.credential_version = ?6
+                   ))
              )",
             params![
                 creator_session_id,
@@ -811,11 +869,9 @@ impl TrafficDb {
                  FROM pairing_codes AS pairing
                  JOIN auth_sessions AS creator
                    ON creator.id = pairing.created_by_session_id
-                 JOIN admins AS admin ON admin.id = 1
                  WHERE pairing.code_hash = ?1
                    AND pairing.used_at IS NULL
                    AND pairing.expires_at > ?2
-                   AND creator.username = admin.username
                    AND creator.role = 'admin'
                    AND creator.revoked_at IS NULL
                    AND creator.absolute_expires_at > ?2
@@ -845,15 +901,13 @@ impl TrafficDb {
         let pairing_and_username = tx
             .query_row(
                 "SELECT pairing.id, pairing.role, pairing.label, pairing.expires_at,
-                        admin.username
+                        creator.username, creator.display_name
                  FROM pairing_codes AS pairing
                  JOIN auth_sessions AS creator
                    ON creator.id = pairing.created_by_session_id
-                 JOIN admins AS admin ON admin.id = 1
                  WHERE pairing.code_hash = ?1
                    AND pairing.used_at IS NULL
                    AND pairing.expires_at > ?2
-                   AND creator.username = admin.username
                    AND creator.role = 'admin'
                    AND creator.revoked_at IS NULL
                    AND creator.absolute_expires_at > ?2
@@ -868,11 +922,12 @@ impl TrafficDb {
                             expires_at: row.get(3)?,
                         },
                         row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((pairing, username)) = pairing_and_username else {
+        let Some((pairing, username, display_name)) = pairing_and_username else {
             tx.rollback()?;
             return Ok(None);
         };
@@ -888,6 +943,12 @@ impl TrafficDb {
             username,
             role: pairing.role,
             kind: "fixed".to_string(),
+            auth_method: "pairing".to_string(),
+            display_name,
+            provider_name: None,
+            identity_issuer: None,
+            identity_subject: None,
+            oidc_policy_fingerprint: None,
             label: Some(pairing.label),
             created_at: now,
             last_seen_at: now,
@@ -915,9 +976,11 @@ fn insert_session_inner(
 ) -> Result<(), rusqlite::Error> {
     conn.execute(
         "INSERT INTO auth_sessions(
-            id, token_hash, csrf_hash, username, role, kind, label, created_at,
-            last_seen_at, idle_expires_at, absolute_expires_at, revoked_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            id, token_hash, csrf_hash, username, role, kind, auth_method, display_name,
+            provider_name, identity_issuer, identity_subject, oidc_policy_fingerprint,
+            label, created_at, last_seen_at, idle_expires_at, absolute_expires_at, revoked_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                   ?15, ?16, ?17, ?18)",
         params![
             session.id,
             session.token_hash,
@@ -925,6 +988,12 @@ fn insert_session_inner(
             session.username,
             session.role,
             session.kind,
+            session.auth_method,
+            session.display_name,
+            session.provider_name,
+            session.identity_issuer,
+            session.identity_subject,
+            session.oidc_policy_fingerprint,
             session.label,
             session.created_at,
             session.last_seen_at,
@@ -968,12 +1037,18 @@ fn map_session_row(row: &rusqlite::Row<'_>) -> Result<AuthSessionRecord, rusqlit
         username: row.get(3)?,
         role: row.get(4)?,
         kind: row.get(5)?,
-        label: row.get(6)?,
-        created_at: row.get(7)?,
-        last_seen_at: row.get(8)?,
-        idle_expires_at: row.get(9)?,
-        absolute_expires_at: row.get(10)?,
-        revoked_at: row.get(11)?,
+        auth_method: row.get(6)?,
+        display_name: row.get(7)?,
+        provider_name: row.get(8)?,
+        identity_issuer: row.get(9)?,
+        identity_subject: row.get(10)?,
+        oidc_policy_fingerprint: row.get(11)?,
+        label: row.get(12)?,
+        created_at: row.get(13)?,
+        last_seen_at: row.get(14)?,
+        idle_expires_at: row.get(15)?,
+        absolute_expires_at: row.get(16)?,
+        revoked_at: row.get(17)?,
     })
 }
 
@@ -1143,6 +1218,12 @@ mod security_tests {
             username: "admin".into(),
             role: "admin".into(),
             kind: "standard".into(),
+            auth_method: "password".into(),
+            display_name: "admin".into(),
+            provider_name: None,
+            identity_issuer: None,
+            identity_subject: None,
+            oidc_policy_fingerprint: None,
             label: None,
             created_at: 100,
             last_seen_at: 100,
@@ -1150,6 +1231,23 @@ mod security_tests {
             absolute_expires_at,
             revoked_at: None,
         }
+    }
+
+    fn oidc_session(
+        id: &str,
+        token_byte: u8,
+        username: &str,
+        fingerprint: &[u8],
+    ) -> AuthSessionRecord {
+        let mut session = standard_session(id, token_byte, 999_999);
+        session.username = username.into();
+        session.display_name = format!("{username} display");
+        session.auth_method = "oidc".into();
+        session.provider_name = Some("Example SSO".into());
+        session.identity_issuer = Some("https://idp.example/".into());
+        session.identity_subject = Some("subject-123".into());
+        session.oidc_policy_fingerprint = Some(fingerprint.to_vec());
+        session
     }
 
     fn pairing(id: &str, role: &str, expires_at: i64) -> PairingRecord {
@@ -1256,6 +1354,179 @@ mod security_tests {
     }
 
     #[test]
+    fn oidc_identity_can_have_multiple_active_browser_sessions() {
+        let db = memory_db();
+        let first = oidc_session("oidc-1", 1, "external-admin", &[7; 32]);
+        let second = oidc_session("oidc-2", 3, "external-admin", &[7; 32]);
+        db.insert_oidc_session(&first).unwrap();
+        db.insert_oidc_session(&second).unwrap();
+
+        let sessions = db.list_sessions().unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions.iter().all(|session| {
+            session.revoked_at.is_none()
+                && session.identity_issuer.as_deref() == Some("https://idp.example/")
+                && session.identity_subject.as_deref() == Some("subject-123")
+        }));
+    }
+
+    #[test]
+    fn startup_policy_reconciliation_revokes_stale_oidc_sessions_and_pairings() {
+        let db = memory_db();
+        db.create_admin("local-admin", "hash-v1").unwrap();
+        let current = oidc_session("current", 1, "external-admin", &[7; 32]);
+        let stale = oidc_session("stale", 3, "external-admin", &[8; 32]);
+        db.insert_oidc_session(&current).unwrap();
+        db.insert_oidc_session(&stale).unwrap();
+        assert!(db
+            .insert_pairing_if_authorized(
+                &pairing("stale-pairing", "viewer", 1_000),
+                &[9; 32],
+                &stale.id,
+                &stale.username,
+                &stale.role,
+                &stale.kind,
+                100,
+                None,
+            )
+            .unwrap());
+
+        assert_eq!(
+            db.revoke_oidc_sessions_with_other_policy(Some(&[7; 32]), 150)
+                .unwrap(),
+            1
+        );
+        assert!(db
+            .session_is_active("current", "external-admin", "admin", "standard", 200)
+            .unwrap());
+        assert!(!db
+            .session_is_active("stale", "external-admin", "admin", "standard", 200)
+            .unwrap());
+        assert!(!db.pairing_is_eligible(&[9; 32], 200).unwrap());
+
+        assert_eq!(
+            db.revoke_oidc_sessions_with_other_policy(None, 250)
+                .unwrap(),
+            1
+        );
+        assert!(!db
+            .session_is_active("current", "external-admin", "admin", "standard", 300)
+            .unwrap());
+    }
+
+    #[test]
+    fn oidc_admin_can_pair_devices_but_admin_pairing_rechecks_local_credentials() {
+        let db = memory_db();
+        db.create_admin("local-admin", "hash-v1").unwrap();
+        let creator = oidc_session("oidc-admin", 1, "external-admin", &[7; 32]);
+        db.insert_oidc_session(&creator).unwrap();
+
+        assert!(db
+            .insert_pairing_if_authorized(
+                &pairing("viewer-pairing", "viewer", 1_000),
+                &[9; 32],
+                &creator.id,
+                &creator.username,
+                &creator.role,
+                &creator.kind,
+                100,
+                None,
+            )
+            .unwrap());
+        let fixed = db
+            .consume_pairing_and_insert_session(
+                &[9; 32],
+                200,
+                "fixed-viewer",
+                &[10; 32],
+                &[11; 32],
+                1_000,
+                1_000,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(fixed.username, "external-admin");
+        assert_eq!(fixed.auth_method, "pairing");
+
+        assert!(db
+            .insert_pairing_if_authorized(
+                &pairing("admin-pairing-current", "admin", 1_000),
+                &[12; 32],
+                &creator.id,
+                &creator.username,
+                &creator.role,
+                &creator.kind,
+                200,
+                Some(1),
+            )
+            .unwrap());
+
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE admins SET credential_version = credential_version + 1",
+                [],
+            )
+            .unwrap();
+        assert!(!db
+            .insert_pairing_if_authorized(
+                &pairing("admin-pairing", "admin", 1_000),
+                &[13; 32],
+                &creator.id,
+                &creator.username,
+                &creator.role,
+                &creator.kind,
+                200,
+                Some(1),
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn oidc_viewer_cannot_create_viewer_or_admin_pairings() {
+        let db = memory_db();
+        db.create_admin("local-admin", "hash-v1").unwrap();
+        let mut creator = oidc_session("oidc-viewer", 1, "external-viewer", &[7; 32]);
+        creator.role = "viewer".into();
+        db.insert_oidc_session(&creator).unwrap();
+
+        assert!(!db
+            .insert_pairing_if_authorized(
+                &pairing("viewer-pairing", "viewer", 1_000),
+                &[9; 32],
+                &creator.id,
+                &creator.username,
+                &creator.role,
+                &creator.kind,
+                100,
+                None,
+            )
+            .unwrap());
+        assert!(!db
+            .insert_pairing_if_authorized(
+                &pairing("admin-pairing", "admin", 1_000),
+                &[10; 32],
+                &creator.id,
+                &creator.username,
+                &creator.role,
+                &creator.kind,
+                100,
+                Some(1),
+            )
+            .unwrap());
+        assert_eq!(
+            db.conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM pairing_codes", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn admin_pairing_insert_rechecks_credential_version() {
         let db = memory_db();
         db.create_admin("admin", "hash-v1").unwrap();
@@ -1290,20 +1561,92 @@ mod security_tests {
         db.create_admin("admin", "hash-v1").unwrap();
         let creator = standard_session("creator", 1, 999_999);
         db.insert_session(&creator).unwrap();
-        insert_pairing(&db, &pairing("pairing-1", "viewer", 1_000), 9, &creator);
+        let oidc_creator = oidc_session("oidc-creator", 3, "external-admin", &[7; 32]);
+        db.insert_oidc_session(&oidc_creator).unwrap();
+
+        insert_pairing(
+            &db,
+            &pairing("consumed-pairing", "viewer", 1_000),
+            9,
+            &creator,
+        );
+        let fixed = db
+            .consume_pairing_and_insert_session(
+                &[9; 32],
+                150,
+                "fixed-viewer",
+                &[10; 32],
+                &[11; 32],
+                1_000,
+                1_000,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(fixed.auth_method, "pairing");
+
+        assert!(db
+            .insert_pairing_if_authorized(
+                &pairing("password-pairing", "viewer", 1_000),
+                &[12; 32],
+                &creator.id,
+                &creator.username,
+                &creator.role,
+                &creator.kind,
+                150,
+                None,
+            )
+            .unwrap());
+        assert!(db
+            .insert_pairing_if_authorized(
+                &pairing("oidc-pairing", "viewer", 1_000),
+                &[13; 32],
+                &oidc_creator.id,
+                &oidc_creator.username,
+                &oidc_creator.role,
+                &oidc_creator.kind,
+                150,
+                None,
+            )
+            .unwrap());
+        assert_eq!(
+            db.list_sessions()
+                .unwrap()
+                .iter()
+                .map(|session| session.auth_method.as_str())
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from(["oidc", "pairing", "password"])
+        );
+        assert!(db.pairing_is_eligible(&[12; 32], 200).unwrap());
+        assert!(db.pairing_is_eligible(&[13; 32], 200).unwrap());
 
         db.replace_admin_password("admin", "hash-v2").unwrap();
         assert_eq!(db.admin().unwrap().unwrap().credential_version, 2);
-        assert!(!db
-            .session_is_active("creator", "admin", "admin", "standard", 200)
-            .unwrap());
-        assert!(!db.pairing_is_eligible(&[9; 32], 200).unwrap());
         assert!(db
-            .consume_pairing_and_insert_session(
-                &[9; 32], 200, "fixed", &[10; 32], &[11; 32], 1_000, 1_000,
-            )
+            .list_sessions()
             .unwrap()
-            .is_none());
+            .iter()
+            .all(|session| session.revoked_at.is_some()));
+        for (code, session_id) in [([12; 32], "password-fixed"), ([13; 32], "oidc-fixed")] {
+            assert!(!db.pairing_is_eligible(&code, 200).unwrap());
+            assert!(db
+                .consume_pairing_and_insert_session(
+                    &code, 200, session_id, &[20; 32], &[21; 32], 1_000, 1_000,
+                )
+                .unwrap()
+                .is_none());
+        }
+        assert_eq!(
+            db.conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM pairing_codes WHERE used_at IS NULL",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

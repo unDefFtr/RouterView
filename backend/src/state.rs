@@ -1,6 +1,7 @@
 use crate::auth::AuthSecurity;
 use crate::config_store::MergedConfig;
 use crate::db::TrafficDb;
+use crate::oidc::OidcManager;
 use crate::poller::engine::PollEngineControl;
 use crate::secrets::SecretCipher;
 use std::path::PathBuf;
@@ -35,6 +36,8 @@ pub struct AppState {
     pub public_origin: String,
     /// Process-wide limits and timing defenses for password authentication.
     pub auth_security: Arc<AuthSecurity>,
+    /// Optional OIDC provider, discovery state and bounded login transactions.
+    pub oidc: Arc<OidcManager>,
     /// Location of the one-time setup token delivered through the filesystem.
     pub setup_token_path: PathBuf,
     /// Poller readiness and shutdown control owned by the process supervisor.

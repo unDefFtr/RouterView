@@ -20,6 +20,7 @@ use argon2::{
     Algorithm, Argon2, Params, Version,
 };
 use axum::{
+    body::Body,
     extract::{ConnectInfo, Request, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::Next,
@@ -64,6 +65,7 @@ pub struct AuthSecurity {
     dummy_password_hash: String,
     login_failures: FailureLimiter<LoginFailureKey>,
     pairing_attempts: FailureLimiter<PairingFailureKey>,
+    admin_pairing_failures: FailureLimiter<AdminPairingFailureKey>,
     trusted_proxy_cidrs: Vec<IpNet>,
 }
 
@@ -75,6 +77,7 @@ impl AuthSecurity {
             dummy_password_hash: hash_password_sync(&random_token())?,
             login_failures: FailureLimiter::default(),
             pairing_attempts: FailureLimiter::default(),
+            admin_pairing_failures: FailureLimiter::default(),
             trusted_proxy_cidrs,
         })
     }
@@ -123,6 +126,12 @@ enum LoginFailureKey {
 enum PairingFailureKey {
     Source(IpAddr),
     Overflow,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum AdminPairingFailureKey {
+    Session(String),
+    Source(IpAddr),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -315,6 +324,10 @@ pub struct SessionContext {
     pub username: String,
     pub role: String,
     pub kind: String,
+    pub auth_method: String,
+    pub display_name: String,
+    pub provider_name: Option<String>,
+    pub oidc_policy_fingerprint: Option<Vec<u8>>,
     pub csrf_hash: Vec<u8>,
 }
 
@@ -358,13 +371,23 @@ pub struct PairRequest {
 pub struct AuthStatusResponse {
     pub setup_required: bool,
     pub authenticated: bool,
+    pub oidc: Option<OidcStatusResponse>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OidcStatusResponse {
+    pub provider_name: String,
+    pub available: bool,
 }
 
 #[derive(Debug, Serialize)]
 pub struct MeResponse {
     pub username: String,
+    pub display_name: String,
     pub role: String,
     pub session_kind: String,
+    pub auth_method: String,
+    pub provider_name: Option<String>,
     pub capabilities: Vec<&'static str>,
 }
 
@@ -373,8 +396,7 @@ pub async fn require_auth(
     mut request: Request,
     next: Next,
 ) -> Result<Response, AppError> {
-    let session = authenticate_headers(&state.traffic_db, request.headers())?
-        .ok_or(AppError::Unauthorized)?;
+    let session = authenticate_headers(&state, request.headers())?.ok_or(AppError::Unauthorized)?;
 
     let path = request.uri().path();
     let is_websocket = path == "/ws";
@@ -420,8 +442,14 @@ pub async fn require_auth(
     Ok(next.run(request).await)
 }
 
-pub fn revalidate_session(db: &TrafficDb, session: &SessionContext) -> Result<bool, AppError> {
-    Ok(db.session_is_active(
+pub fn revalidate_session(state: &AppState, session: &SessionContext) -> Result<bool, AppError> {
+    if !state.oidc.session_policy_valid(
+        &session.auth_method,
+        session.oidc_policy_fingerprint.as_deref(),
+    ) {
+        return Ok(false);
+    }
+    Ok(state.traffic_db.session_is_active(
         &session.id,
         &session.username,
         &session.role,
@@ -441,9 +469,18 @@ pub async fn status(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<AuthStatusResponse>, AppError> {
+    let oidc = if let Some(provider_name) = state.oidc.provider_name() {
+        Some(OidcStatusResponse {
+            provider_name: provider_name.to_string(),
+            available: state.oidc.available().await,
+        })
+    } else {
+        None
+    };
     Ok(Json(AuthStatusResponse {
         setup_required: state.traffic_db.admin()?.is_none(),
-        authenticated: authenticate_headers(&state.traffic_db, &headers)?.is_some(),
+        authenticated: authenticate_headers(&state, &headers)?.is_some(),
+        oidc,
     }))
 }
 
@@ -548,16 +585,24 @@ pub async fn list_sessions(
         .list_sessions()?
         .into_iter()
         .map(|session| {
+            let policy_valid = state.oidc.session_policy_valid(
+                &session.auth_method,
+                session.oidc_policy_fingerprint.as_deref(),
+            );
             serde_json::json!({
                 "id": session.id,
                 "username": session.username,
+                "display_name": session.display_name,
                 "role": session.role,
                 "session_kind": session.kind,
+                "auth_method": session.auth_method,
+                "provider_name": session.provider_name,
                 "label": session.label,
                 "created_at": session.created_at,
                 "last_seen_at": session.last_seen_at,
                 "expires_at": session.absolute_expires_at,
-                "active": session.revoked_at.is_none()
+                "active": policy_valid
+                    && session.revoked_at.is_none()
                     && session.absolute_expires_at > now
                     && session.idle_expires_at.is_none_or(|expiry| expiry > now),
             })
@@ -590,6 +635,8 @@ pub async fn revoke_session(
 pub async fn create_pairing(
     State(state): State<Arc<AppState>>,
     axum::Extension(session): axum::Extension<SessionContext>,
+    ConnectInfo(connection): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     ApiJson(body): ApiJson<CreatePairingRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let label = body.label.trim();
@@ -603,19 +650,48 @@ pub async fn create_pairing(
             "pairing role must be viewer or admin".into(),
         ));
     }
+    let mut successful_password_attempt = None;
     let expected_credential_version = if body.role == "admin" {
+        let source = state.auth_security.client_ip(connection.ip(), &headers)?;
+        let failure_keys = [
+            AdminPairingFailureKey::Session(session.id.clone()),
+            AdminPairingFailureKey::Source(source),
+        ];
+        if let Some(retry_after_secs) = failure_keys
+            .iter()
+            .filter_map(|key| {
+                state
+                    .auth_security
+                    .admin_pairing_failures
+                    .retry_after(key, Instant::now())
+            })
+            .max()
+        {
+            return Err(AppError::RateLimited { retry_after_secs });
+        }
         let admin = state.traffic_db.admin()?.ok_or(AppError::Unauthorized)?;
         let password = body.password.ok_or_else(|| {
             AppError::InvalidData("password is required for an admin pairing".into())
         })?;
-        if password.len() > 128 {
-            return Err(AppError::Unauthorized);
-        }
         let permit = state.auth_security.acquire_argon2().await?;
-        let verified = verify_password(password, admin.password_hash, permit).await?;
-        if !verified {
+        let password_is_bounded = password.len() <= 128;
+        let password = if password_is_bounded {
+            password
+        } else {
+            "invalid-password-input".to_string()
+        };
+        let (verified, attempt_started_at) = verify_admin_pairing_password(
+            state.auth_security.clone(),
+            failure_keys.clone(),
+            password,
+            admin.password_hash,
+            permit,
+        )
+        .await?;
+        if !verified || !password_is_bounded {
             return Err(AppError::Unauthorized);
         }
+        successful_password_attempt = Some((failure_keys, attempt_started_at));
         Some(admin.credential_version)
     } else {
         None
@@ -641,6 +717,14 @@ pub async fn create_pairing(
     )?;
     if !inserted {
         return Err(AppError::Unauthorized);
+    }
+    if let Some((failure_keys, attempt_started_at)) = successful_password_attempt {
+        for key in &failure_keys {
+            state
+                .auth_security
+                .admin_pairing_failures
+                .clear_if_latest(key, attempt_started_at);
+        }
     }
     Ok(Json(serde_json::json!({
         "code": code,
@@ -812,13 +896,13 @@ pub fn create_admin_from_cli(
 }
 
 fn authenticate_headers(
-    db: &TrafficDb,
+    state: &AppState,
     headers: &HeaderMap,
 ) -> Result<Option<SessionContext>, AppError> {
     let Some(token) = cookie_value(headers, SESSION_COOKIE) else {
         return Ok(None);
     };
-    let Some(session) = db.session_by_token_hash(&hash_token(token))? else {
+    let Some(session) = state.traffic_db.session_by_token_hash(&hash_token(token))? else {
         return Ok(None);
     };
     let now = unix_time();
@@ -827,8 +911,15 @@ fn authenticate_headers(
         || session.idle_expires_at.is_some_and(|expiry| expiry <= now);
     if expired {
         if session.revoked_at.is_none() {
-            let _ = db.revoke_session(&session.id, now);
+            let _ = state.traffic_db.revoke_session(&session.id, now);
         }
+        return Ok(None);
+    }
+    if !state.oidc.session_policy_valid(
+        &session.auth_method,
+        session.oidc_policy_fingerprint.as_deref(),
+    ) {
+        let _ = state.traffic_db.revoke_session(&session.id, now);
         return Ok(None);
     }
     Ok(Some(SessionContext {
@@ -836,6 +927,10 @@ fn authenticate_headers(
         username: session.username,
         role: session.role,
         kind: session.kind,
+        auth_method: session.auth_method,
+        display_name: session.display_name,
+        provider_name: session.provider_name,
+        oidc_policy_fingerprint: session.oidc_policy_fingerprint,
         csrf_hash: session.csrf_hash,
     }))
 }
@@ -899,6 +994,17 @@ fn new_session(
             username: username.to_string(),
             role: role.to_string(),
             kind: kind.to_string(),
+            auth_method: if kind == "fixed" {
+                "pairing"
+            } else {
+                "password"
+            }
+            .to_string(),
+            display_name: username.to_string(),
+            provider_name: None,
+            identity_issuer: None,
+            identity_subject: None,
+            oidc_policy_fingerprint: None,
             label,
             created_at: now,
             last_seen_at: now,
@@ -917,25 +1023,80 @@ fn session_response(
     csrf: &str,
 ) -> Result<Response, AppError> {
     let mut headers = HeaderMap::new();
-    let max_age = session.absolute_expires_at.saturating_sub(unix_time());
-    append_cookie(
-        &mut headers,
-        &format!(
-            "{SESSION_COOKIE}={token}; Path=/; Max-Age={max_age}; Secure; HttpOnly; SameSite=Strict"
-        ),
-    )?;
-    append_cookie(
-        &mut headers,
-        &format!("{CSRF_COOKIE}={csrf}; Path=/; Max-Age={max_age}; Secure; SameSite=Strict"),
-    )?;
+    append_session_cookies(&mut headers, session, token, csrf)?;
     let context = SessionContext {
         id: session.id.clone(),
         username: session.username.clone(),
         role: session.role.clone(),
         kind: session.kind.clone(),
+        auth_method: session.auth_method.clone(),
+        display_name: session.display_name.clone(),
+        provider_name: session.provider_name.clone(),
+        oidc_policy_fingerprint: session.oidc_policy_fingerprint.clone(),
         csrf_hash: session.csrf_hash.clone(),
     };
     Ok((headers, Json(me_for(&context))).into_response())
+}
+
+fn append_session_cookies(
+    headers: &mut HeaderMap,
+    session: &AuthSessionRecord,
+    token: &str,
+    csrf: &str,
+) -> Result<(), AppError> {
+    let max_age = session.absolute_expires_at.saturating_sub(unix_time());
+    append_cookie(
+        headers,
+        &format!(
+            "{SESSION_COOKIE}={token}; Path=/; Max-Age={max_age}; Secure; HttpOnly; SameSite=Strict"
+        ),
+    )?;
+    append_cookie(
+        headers,
+        &format!("{CSRF_COOKIE}={csrf}; Path=/; Max-Age={max_age}; Secure; SameSite=Strict"),
+    )?;
+    Ok(())
+}
+
+pub(crate) fn establish_oidc_session(
+    state: &AppState,
+    identity: crate::oidc::OidcIdentity,
+    completion_location: &str,
+) -> Result<Response, AppError> {
+    if state.traffic_db.admin()?.is_none() {
+        return Err(AppError::Unauthorized);
+    }
+    let (mut session, token, csrf) = new_session(
+        &identity.username,
+        &identity.role,
+        "standard",
+        None,
+        STANDARD_ABSOLUTE_SECS,
+    );
+    session.auth_method = "oidc".into();
+    session.display_name = identity.display_name;
+    session.provider_name = Some(identity.provider_name);
+    session.identity_issuer = Some(identity.issuer);
+    session.identity_subject = Some(identity.subject);
+    session.oidc_policy_fingerprint = Some(identity.policy_fingerprint);
+    state.traffic_db.insert_oidc_session(&session)?;
+
+    let mut headers = HeaderMap::new();
+    append_session_cookies(&mut headers, &session, &token, &csrf)?;
+    headers.insert(
+        header::LOCATION,
+        HeaderValue::from_str(completion_location).map_err(|_| {
+            AppError::Internal("failed to construct OIDC completion redirect".into())
+        })?,
+    );
+    Response::builder()
+        .status(StatusCode::SEE_OTHER)
+        .body(Body::empty())
+        .map(|mut response| {
+            *response.headers_mut() = headers;
+            response
+        })
+        .map_err(|_| AppError::Internal("failed to construct OIDC session response".into()))
 }
 
 fn me_for(session: &SessionContext) -> MeResponse {
@@ -946,8 +1107,11 @@ fn me_for(session: &SessionContext) -> MeResponse {
     };
     MeResponse {
         username: session.username.clone(),
+        display_name: session.display_name.clone(),
         role: session.role.clone(),
         session_kind: session.kind.clone(),
+        auth_method: session.auth_method.clone(),
+        provider_name: session.provider_name.clone(),
         capabilities,
     }
 }
@@ -1118,17 +1282,6 @@ async fn hash_password(password: String, permit: OwnedSemaphorePermit) -> Result
     .await
 }
 
-async fn verify_password(
-    password: String,
-    encoded: String,
-    permit: OwnedSemaphorePermit,
-) -> Result<bool, AppError> {
-    run_argon2_task(permit, "password verification task failed", move || {
-        verify_password_sync(&password, &encoded)
-    })
-    .await
-}
-
 async fn verify_login_password(
     security: Arc<AuthSecurity>,
     failure_keys: [LoginFailureKey; 2],
@@ -1143,6 +1296,25 @@ async fn verify_login_password(
         "password verification task failed",
         move || verify_password_sync(&password, &encoded),
     )
+    .await
+}
+
+async fn verify_admin_pairing_password(
+    security: Arc<AuthSecurity>,
+    failure_keys: [AdminPairingFailureKey; 2],
+    password: String,
+    encoded: String,
+    permit: OwnedSemaphorePermit,
+) -> Result<(bool, Instant), AppError> {
+    run_argon2_task(permit, "password verification task failed", move || {
+        let started_at = Instant::now();
+        for key in failure_keys {
+            security
+                .admin_pairing_failures
+                .record_failure(key, started_at);
+        }
+        verify_password_sync(&password, &encoded).map(|result| (result, started_at))
+    })
     .await
 }
 
@@ -1239,6 +1411,7 @@ mod tests {
             dummy_password_hash: String::new(),
             login_failures: FailureLimiter::default(),
             pairing_attempts: FailureLimiter::default(),
+            admin_pairing_failures: FailureLimiter::default(),
             trusted_proxy_cidrs: Vec::new(),
         })
     }
@@ -1343,6 +1516,32 @@ mod tests {
         let source = LoginFailureKey::Source("192.0.2.10".parse().unwrap());
         limiter.record_failure(source.clone(), now);
         assert_eq!(limiter.retry_after(&source, now), Some(1));
+    }
+
+    #[test]
+    fn admin_pairing_password_failures_back_off_by_session_and_source_and_clear_on_success() {
+        let limiter = FailureLimiter::default();
+        let first = Instant::now();
+        let second = first + Duration::from_secs(1);
+        let session = AdminPairingFailureKey::Session("admin-session".into());
+        let source = AdminPairingFailureKey::Source("192.0.2.10".parse().unwrap());
+
+        for key in [session.clone(), source.clone()] {
+            assert_eq!(limiter.record_failure(key, first), 1);
+        }
+        assert_eq!(limiter.retry_after(&session, first), Some(1));
+        assert_eq!(limiter.retry_after(&source, first), Some(1));
+
+        for key in [session.clone(), source.clone()] {
+            assert_eq!(limiter.record_failure(key, second), 2);
+        }
+        assert_eq!(limiter.retry_after(&session, second), Some(2));
+        assert_eq!(limiter.retry_after(&source, second), Some(2));
+
+        for key in [&session, &source] {
+            limiter.clear_if_latest(key, second);
+            assert_eq!(limiter.retry_after(key, second), None);
+        }
     }
 
     #[test]
@@ -1769,11 +1968,52 @@ mod tests {
             username: "admin".into(),
             role: "viewer".into(),
             kind: "fixed".into(),
+            auth_method: "pairing".into(),
+            display_name: "admin".into(),
+            provider_name: None,
+            oidc_policy_fingerprint: None,
             csrf_hash: vec![0; 32],
         };
         assert!(matches!(
             require_admin_session(&viewer),
             Err(AppError::Forbidden(_))
         ));
+    }
+
+    #[test]
+    fn oidc_status_and_identity_responses_use_the_public_contract() {
+        let status = serde_json::to_value(AuthStatusResponse {
+            setup_required: false,
+            authenticated: false,
+            oidc: Some(OidcStatusResponse {
+                provider_name: "Example SSO".into(),
+                available: false,
+            }),
+        })
+        .unwrap();
+        assert_eq!(
+            status["oidc"],
+            serde_json::json!({
+                "provider_name": "Example SSO",
+                "available": false,
+            })
+        );
+
+        let me = serde_json::to_value(me_for(&SessionContext {
+            id: "oidc-session".into(),
+            username: "external-admin".into(),
+            display_name: "External Administrator".into(),
+            role: "admin".into(),
+            kind: "standard".into(),
+            auth_method: "oidc".into(),
+            provider_name: Some("Example SSO".into()),
+            oidc_policy_fingerprint: Some(vec![7; 32]),
+            csrf_hash: vec![8; 32],
+        }))
+        .unwrap();
+        assert_eq!(me["display_name"], "External Administrator");
+        assert_eq!(me["auth_method"], "oidc");
+        assert_eq!(me["provider_name"], "Example SSO");
+        assert!(me.get("oidc_policy_fingerprint").is_none());
     }
 }

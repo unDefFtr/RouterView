@@ -8,7 +8,20 @@ use axum::{
 use tower_http::trace::TraceLayer;
 
 use crate::state::AppState;
-use crate::{api, auth, error};
+use crate::{api, auth, error, oidc};
+
+fn trace_layer() -> TraceLayer<
+    tower_http::classify::SharedClassifier<tower_http::classify::ServerErrorsAsFailures>,
+    impl Clone + Fn(&axum::http::Request<axum::body::Body>) -> tracing::Span,
+> {
+    TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<axum::body::Body>| {
+        tracing::info_span!(
+            "http_request",
+            method = %request.method(),
+            path = %request.uri().path(),
+        )
+    })
+}
 
 /// Create the application router with all routes mounted.
 pub fn create_router(state: Arc<AppState>) -> Router {
@@ -47,10 +60,12 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/auth/status", get(auth::status))
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/pair", post(auth::pair))
+        .route("/api/auth/oidc/start", get(oidc::start))
+        .route("/api/auth/oidc/callback", get(oidc::callback))
         .merge(protected)
         .fallback(error::not_found)
         .method_not_allowed_fallback(error::method_not_allowed)
-        .layer(TraceLayer::new_for_http())
+        .layer(trace_layer())
         .with_state(state)
 }
 
@@ -60,6 +75,6 @@ pub fn create_setup_router(state: Arc<AppState>) -> Router {
         .route("/api/auth/setup", post(auth::setup))
         .fallback(error::not_found)
         .method_not_allowed_fallback(error::method_not_allowed)
-        .layer(TraceLayer::new_for_http())
+        .layer(trace_layer())
         .with_state(state)
 }
