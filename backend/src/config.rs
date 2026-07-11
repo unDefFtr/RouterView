@@ -220,7 +220,7 @@ fn load_oidc_config_with(
             })
     };
 
-    let issuer_url = normalize_oidc_url(&required("OIDC_ISSUER_URL")?, "OIDC_ISSUER_URL")?;
+    let issuer_url = validate_oidc_issuer_url(&required("OIDC_ISSUER_URL")?, "OIDC_ISSUER_URL")?;
     let client_id = required("OIDC_CLIENT_ID")?;
     if client_id.len() > 512 {
         return Err(ConfigError::InvalidFormat(
@@ -350,7 +350,7 @@ fn validate_display_config(key: &str, value: &str, maximum: usize) -> Result<(),
     Ok(())
 }
 
-fn normalize_oidc_url(value: &str, key: &str) -> Result<String, ConfigError> {
+fn validate_oidc_issuer_url(value: &str, key: &str) -> Result<String, ConfigError> {
     let parsed = url::Url::parse(value)
         .map_err(|_| ConfigError::InvalidFormat(format!("{key} must be an absolute URL")))?;
     if parsed.host_str().is_none()
@@ -375,7 +375,8 @@ fn normalize_oidc_url(value: &str, key: &str) -> Result<String, ConfigError> {
             "{key} must use HTTPS except for loopback development"
         )));
     }
-    Ok(parsed.to_string())
+    // OIDC compares issuer identifiers exactly; URL serialization would add `/` to root issuers.
+    Ok(value.to_string())
 }
 
 fn normalize_public_origin(value: &str) -> Result<String, ConfigError> {
@@ -498,10 +499,7 @@ mod tests {
     fn oidc_test_env(secret_path: &Path) -> HashMap<String, String> {
         [
             ("OIDC_ENABLED", "true".to_string()),
-            (
-                "OIDC_ISSUER_URL",
-                "https://idp.example/realms/routerview".to_string(),
-            ),
+            ("OIDC_ISSUER_URL", "https://idp.example:8443".to_string()),
             ("OIDC_CLIENT_ID", "routerview".to_string()),
             (
                 "OIDC_CLIENT_SECRET_FILE",
@@ -631,7 +629,7 @@ mod tests {
         );
 
         let config = load_test_oidc(&values).unwrap().unwrap();
-        assert_eq!(config.issuer_url, "https://idp.example/realms/routerview");
+        assert_eq!(config.issuer_url, "https://idp.example:8443");
         assert_eq!(config.client_secret, "file-secret");
         assert_eq!(config.groups_claim, "groups");
         assert_eq!(config.additional_scopes, ["groups", "offline_access"]);
@@ -685,21 +683,25 @@ mod tests {
     #[test]
     fn oidc_issuer_preserves_path_and_requires_https_or_loopback() {
         assert_eq!(
-            normalize_oidc_url("https://idp.example/tenant/", "OIDC_ISSUER_URL").unwrap(),
+            validate_oidc_issuer_url("https://idp.example:8443", "OIDC_ISSUER_URL").unwrap(),
+            "https://idp.example:8443"
+        );
+        assert_eq!(
+            validate_oidc_issuer_url("https://idp.example/tenant/", "OIDC_ISSUER_URL").unwrap(),
             "https://idp.example/tenant/"
         );
         assert_eq!(
-            normalize_oidc_url("https://idp.example/tenant", "OIDC_ISSUER_URL").unwrap(),
+            validate_oidc_issuer_url("https://idp.example/tenant", "OIDC_ISSUER_URL").unwrap(),
             "https://idp.example/tenant"
         );
-        assert!(normalize_oidc_url("http://localhost:8080/issuer", "issuer").is_ok());
-        assert!(normalize_oidc_url("http://127.0.0.1:8080", "issuer").is_ok());
-        assert!(normalize_oidc_url("http://[::1]:8080", "issuer").is_ok());
-        assert!(normalize_oidc_url("http://192.0.2.1", "issuer").is_err());
-        assert!(normalize_oidc_url("idp.example/tenant", "issuer").is_err());
-        assert!(normalize_oidc_url("https://user@idp.example", "issuer").is_err());
-        assert!(normalize_oidc_url("https://idp.example?tenant=one", "issuer").is_err());
-        assert!(normalize_oidc_url("https://idp.example#tenant", "issuer").is_err());
+        assert!(validate_oidc_issuer_url("http://localhost:8080/issuer", "issuer").is_ok());
+        assert!(validate_oidc_issuer_url("http://127.0.0.1:8080", "issuer").is_ok());
+        assert!(validate_oidc_issuer_url("http://[::1]:8080", "issuer").is_ok());
+        assert!(validate_oidc_issuer_url("http://192.0.2.1", "issuer").is_err());
+        assert!(validate_oidc_issuer_url("idp.example/tenant", "issuer").is_err());
+        assert!(validate_oidc_issuer_url("https://user@idp.example", "issuer").is_err());
+        assert!(validate_oidc_issuer_url("https://idp.example?tenant=one", "issuer").is_err());
+        assert!(validate_oidc_issuer_url("https://idp.example#tenant", "issuer").is_err());
     }
 
     #[test]
