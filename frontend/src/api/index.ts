@@ -229,24 +229,37 @@ export async function fetchHealth(): Promise<HealthResponse> {
 
 export type UserRole = 'admin' | 'viewer';
 export type Capability = 'read' | 'configure' | 'manage_devices' | 'manage_sessions';
+export type AuthMethod = 'password' | 'oidc' | 'pairing';
+
+export interface OidcStatus {
+  provider_name: string;
+  available: boolean;
+}
 
 export interface AuthStatus {
   setup_required: boolean;
   authenticated: boolean;
+  oidc: OidcStatus | null;
 }
 
 export interface AuthUser {
   username: string;
+  display_name: string;
   role: UserRole;
   session_kind: string;
+  auth_method: AuthMethod;
+  provider_name: string | null;
   capabilities: Capability[];
 }
 
 export interface AuthSession {
   id: string;
   username: string;
+  display_name: string;
   role: UserRole;
   session_kind: string;
+  auth_method: AuthMethod;
+  provider_name: string | null;
   label: string | null;
   created_at: number;
   last_seen_at: number;
@@ -275,11 +288,28 @@ function parseCapability(value: unknown, path: string): Capability {
     : schemaError(path, 'known capability');
 }
 
+function parseAuthMethod(value: unknown, path: string): AuthMethod {
+  const authMethod = asString(value, path);
+  return ['password', 'oidc', 'pairing'].includes(authMethod)
+    ? authMethod as AuthMethod
+    : schemaError(path, 'password, oidc, or pairing');
+}
+
+function parseOidcStatus(value: unknown, path: string): OidcStatus | null {
+  if (value === null) return null;
+  const record = asRecord(value, path);
+  return {
+    provider_name: asString(record.provider_name, `${path}.provider_name`),
+    available: asBoolean(record.available, `${path}.available`),
+  };
+}
+
 function parseAuthStatus(value: unknown): AuthStatus {
   const record = asRecord(value);
   return {
     setup_required: asBoolean(record.setup_required, 'response.setup_required'),
     authenticated: asBoolean(record.authenticated, 'response.authenticated'),
+    oidc: parseOidcStatus(record.oidc, 'response.oidc'),
   };
 }
 
@@ -287,8 +317,11 @@ function parseAuthUser(value: unknown): AuthUser {
   const record = asRecord(value);
   return {
     username: asString(record.username, 'response.username'),
+    display_name: asString(record.display_name, 'response.display_name'),
     role: parseRole(record.role, 'response.role'),
     session_kind: asString(record.session_kind, 'response.session_kind'),
+    auth_method: parseAuthMethod(record.auth_method, 'response.auth_method'),
+    provider_name: asNullableString(record.provider_name, 'response.provider_name'),
     capabilities: arrayOf(record.capabilities, 'response.capabilities', parseCapability),
   };
 }
@@ -298,8 +331,11 @@ function parseSession(value: unknown, path = 'response'): AuthSession {
   return {
     id: asString(record.id, `${path}.id`),
     username: asString(record.username, `${path}.username`),
+    display_name: asString(record.display_name, `${path}.display_name`),
     role: parseRole(record.role, `${path}.role`),
     session_kind: asString(record.session_kind, `${path}.session_kind`),
+    auth_method: parseAuthMethod(record.auth_method, `${path}.auth_method`),
+    provider_name: asNullableString(record.provider_name, `${path}.provider_name`),
     label: asNullableString(record.label, `${path}.label`),
     created_at: asInteger(record.created_at, `${path}.created_at`),
     last_seen_at: asInteger(record.last_seen_at, `${path}.last_seen_at`),

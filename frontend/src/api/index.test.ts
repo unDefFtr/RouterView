@@ -5,9 +5,12 @@ import {
   ApiSchemaError,
   __resetApiStateForTests,
   createPairing,
+  fetchAuthStatus,
   fetchFullConfig,
   fetchHealth,
+  fetchMe,
   fetchOuiEntries,
+  fetchSessions,
   fetchTrafficHistory,
   updateConfig,
   updateDeviceOverride,
@@ -152,7 +155,7 @@ describe('central API client', () => {
   it('does not invalidate an authenticated administrator for a pairing reauthentication failure', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(errorResponse(401, 'invalid_password'))
-      .mockResolvedValueOnce(jsonResponse({ setup_required: false, authenticated: true }));
+      .mockResolvedValueOnce(jsonResponse({ setup_required: false, authenticated: true, oidc: null }));
     vi.stubGlobal('fetch', fetchMock);
     const listener = vi.fn();
     window.addEventListener(API_UNAUTHORIZED_EVENT, listener);
@@ -170,7 +173,7 @@ describe('central API client', () => {
   it('invalidates authentication when a pairing 401 belongs to an expired session', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(errorResponse(401, 'invalid_password'))
-      .mockResolvedValueOnce(jsonResponse({ setup_required: false, authenticated: false }));
+      .mockResolvedValueOnce(jsonResponse({ setup_required: false, authenticated: false, oidc: null }));
     vi.stubGlobal('fetch', fetchMock);
     const listener = vi.fn();
     window.addEventListener(API_UNAUTHORIZED_EVENT, listener);
@@ -199,6 +202,78 @@ describe('central API client', () => {
   it('rejects successful responses that do not match their runtime schema', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({ status: 'ok', version: 12 })));
     await expect(fetchHealth()).rejects.toBeInstanceOf(ApiSchemaError);
+  });
+});
+
+describe('authentication schemas', () => {
+  it('parses the public OIDC status without exposing provider configuration', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({
+      setup_required: false,
+      authenticated: false,
+      oidc: { provider_name: 'Example Identity', available: true },
+    })));
+
+    await expect(fetchAuthStatus()).resolves.toEqual({
+      setup_required: false,
+      authenticated: false,
+      oidc: { provider_name: 'Example Identity', available: true },
+    });
+  });
+
+  it('rejects malformed OIDC availability and authentication methods', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({
+        setup_required: false,
+        authenticated: false,
+        oidc: { provider_name: 'Example Identity', available: 'yes' },
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        username: 'admin',
+        display_name: 'Administrator',
+        role: 'admin',
+        session_kind: 'standard',
+        auth_method: 'saml',
+        provider_name: null,
+        capabilities: ['read'],
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(fetchAuthStatus()).rejects.toBeInstanceOf(ApiSchemaError);
+    await expect(fetchMe()).rejects.toBeInstanceOf(ApiSchemaError);
+  });
+
+  it('parses identity and authentication source for users and sessions', async () => {
+    const identity = {
+      username: 'alice@example.test',
+      display_name: 'Alice Example',
+      role: 'admin',
+      session_kind: 'standard',
+      auth_method: 'oidc',
+      provider_name: 'Example Identity',
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({
+        ...identity,
+        capabilities: ['read', 'manage_sessions'],
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        sessions: [{
+          id: 'session-1',
+          ...identity,
+          label: null,
+          created_at: 1,
+          last_seen_at: 2,
+          expires_at: 3,
+          active: true,
+        }],
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(fetchMe()).resolves.toEqual({
+      ...identity,
+      capabilities: ['read', 'manage_sessions'],
+    });
+    await expect(fetchSessions()).resolves.toEqual([expect.objectContaining(identity)]);
   });
 });
 

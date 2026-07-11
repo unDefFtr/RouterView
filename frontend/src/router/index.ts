@@ -58,6 +58,12 @@ const routes: RouteRecordRaw[] = [
     meta: { title: '登录', fullScreen: true, guestOnly: true },
   },
   {
+    path: '/login/oidc/complete',
+    name: 'oidc-complete',
+    component: () => import('@/views/OidcCompleteView.vue'),
+    meta: { title: '完成登录', fullScreen: true, oidcCompletion: true },
+  },
+  {
     path: '/pair',
     name: 'pair',
     component: () => import('@/views/PairView.vue'),
@@ -77,6 +83,8 @@ export const router = createRouter({
 });
 
 export async function authNavigationGuard(to: RouteLocationNormalized) {
+  if (to.name === 'oidc-complete' && to.meta.oidcCompletion === true) return true;
+
   const auth = useAuthStore();
   try {
     await auth.initialize();

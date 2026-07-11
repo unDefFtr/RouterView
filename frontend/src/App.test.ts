@@ -7,12 +7,14 @@ import { useAuthStore } from '@/stores/auth';
 
 const appMocks = vi.hoisted(() => ({
   route: {
-    name: 'dashboard',
+    name: 'dashboard' as string,
     fullPath: '/',
-    meta: { fullScreen: false, requiresAuth: true },
+    meta: { fullScreen: false, requiresAuth: true } as Record<string, unknown>,
   },
   replace: vi.fn(),
   loadOverrides: vi.fn(),
+  fetchAuthStatus: vi.fn(),
+  fetchMe: vi.fn(),
   websocketStore: null as null | {
     sessionExpired: boolean;
     connect: ReturnType<typeof vi.fn>;
@@ -35,8 +37,8 @@ vi.mock('@/stores/websocket', () => ({
 
 vi.mock('@/api', () => ({
   API_UNAUTHORIZED_EVENT: 'routerview:unauthorized',
-  fetchAuthStatus: vi.fn(),
-  fetchMe: vi.fn(),
+  fetchAuthStatus: appMocks.fetchAuthStatus,
+  fetchMe: appMocks.fetchMe,
   login: vi.fn(),
   logout: vi.fn(),
   pair: vi.fn(),
@@ -47,6 +49,14 @@ describe('App authenticated lifecycle', () => {
     setActivePinia(createPinia());
     appMocks.replace.mockReset();
     appMocks.loadOverrides.mockReset();
+    appMocks.fetchAuthStatus.mockReset();
+    appMocks.fetchMe.mockReset();
+    appMocks.fetchAuthStatus.mockResolvedValue({
+      setup_required: false, authenticated: false, oidc: null,
+    });
+    appMocks.route.name = 'dashboard';
+    appMocks.route.fullPath = '/';
+    appMocks.route.meta = { fullScreen: false, requiresAuth: true };
     appMocks.websocketStore = reactive({
       sessionExpired: false,
       connect: vi.fn(),
@@ -67,8 +77,11 @@ describe('App authenticated lifecycle', () => {
     const auth = useAuthStore();
     auth.user = {
       username: 'admin',
+      display_name: 'Local administrator',
       role: 'admin',
       session_kind: 'standard',
+      auth_method: 'password',
+      provider_name: null,
       capabilities: ['read', 'configure'],
     };
     auth.state = 'authenticated';
@@ -93,8 +106,11 @@ describe('App authenticated lifecycle', () => {
 
     auth.user = {
       username: 'admin',
+      display_name: 'Local administrator',
       role: 'admin',
       session_kind: 'standard',
+      auth_method: 'password',
+      provider_name: null,
       capabilities: ['read', 'configure'],
     };
     auth.state = 'authenticated';
@@ -106,5 +122,27 @@ describe('App authenticated lifecycle', () => {
 
     expect(appMocks.websocketStore?.connect).toHaveBeenCalledTimes(2);
     expect(appMocks.loadOverrides).toHaveBeenCalledTimes(2);
+  });
+
+  it('leaves OIDC completion initialization to the dedicated completion view', async () => {
+    appMocks.route.name = 'oidc-complete';
+    appMocks.route.fullPath = '/login/oidc/complete';
+    appMocks.route.meta = { fullScreen: true, oidcCompletion: true };
+    const pinia = createPinia();
+    setActivePinia(pinia);
+
+    mount(App, {
+      global: {
+        plugins: [pinia],
+        stubs: {
+          MainLayout: { template: '<main><slot /></main>' },
+          RouterView: true,
+        },
+      },
+    });
+    await flushPromises();
+
+    expect(appMocks.fetchAuthStatus).not.toHaveBeenCalled();
+    expect(useAuthStore().state).toBe('unknown');
   });
 });

@@ -35,9 +35,22 @@ describe('authentication navigation guard', () => {
   it('prevents a viewer from opening administrator routes', async () => {
     const auth = useAuthStore();
     auth.state = 'authenticated';
-    auth.user = { username: 'admin', role: 'viewer', session_kind: 'fixed', capabilities: ['read'] };
+    auth.user = {
+      username: 'admin', display_name: 'Wall display', role: 'viewer',
+      session_kind: 'fixed', auth_method: 'pairing', provider_name: null,
+      capabilities: ['read'],
+    };
     expect(await authNavigationGuard(route('settings', {
       requiresAuth: true, capability: 'configure',
     }))).toEqual({ name: 'dashboard' });
+  });
+
+  it('lets only the OIDC completion route initialize its own callback state', async () => {
+    const auth = useAuthStore();
+    expect(auth.state).toBe('unknown');
+
+    expect(await authNavigationGuard(route('oidc-complete', { oidcCompletion: true }))).toBe(true);
+    expect(api.fetchAuthStatus).not.toHaveBeenCalled();
+    expect(auth.state).toBe('unknown');
   });
 });

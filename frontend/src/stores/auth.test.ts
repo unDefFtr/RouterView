@@ -18,14 +18,20 @@ vi.mock('@/api', () => ({
 
 const admin: AuthUser = {
   username: 'admin',
+  display_name: 'Local administrator',
   role: 'admin' as const,
   session_kind: 'standard',
+  auth_method: 'password',
+  provider_name: null,
   capabilities: ['read', 'configure', 'manage_devices', 'manage_sessions'],
 };
 const viewer: AuthUser = {
   username: 'admin',
+  display_name: 'Hall display',
   role: 'viewer' as const,
   session_kind: 'fixed',
+  auth_method: 'pairing',
+  provider_name: null,
   capabilities: ['read'],
 };
 
@@ -40,7 +46,7 @@ afterEach(() => store.stopUnauthorizedListener());
 
 describe('auth store', () => {
   it('represents setup-required without requesting a protected identity', async () => {
-    api.fetchAuthStatus.mockResolvedValue({ setup_required: true, authenticated: false });
+    api.fetchAuthStatus.mockResolvedValue({ setup_required: true, authenticated: false, oidc: null });
     await store.initialize();
     expect(store.state).toBe('setup_required');
     expect(store.authenticated).toBe(false);
@@ -48,13 +54,34 @@ describe('auth store', () => {
   });
 
   it('loads an authenticated viewer and enforces its capabilities', async () => {
-    api.fetchAuthStatus.mockResolvedValue({ setup_required: false, authenticated: true });
+    api.fetchAuthStatus.mockResolvedValue({
+      setup_required: false,
+      authenticated: true,
+      oidc: { provider_name: 'Example Identity', available: true },
+    });
     api.fetchMe.mockResolvedValue(viewer);
     await store.initialize();
     expect(store.authenticated).toBe(true);
     expect(store.can('read')).toBe(true);
     expect(store.can('manage_devices')).toBe(false);
     expect(store.isAdmin).toBe(false);
+    expect(store.oidc).toEqual({ provider_name: 'Example Identity', available: true });
+  });
+
+  it('refreshes provider availability without changing the current session state', async () => {
+    store.state = 'authenticated';
+    store.user = admin;
+    api.fetchAuthStatus.mockResolvedValue({
+      setup_required: false,
+      authenticated: true,
+      oidc: { provider_name: 'Example Identity', available: false },
+    });
+
+    await store.refreshOidcStatus();
+
+    expect(store.state).toBe('authenticated');
+    expect(store.user).toEqual(admin);
+    expect(store.oidc).toEqual({ provider_name: 'Example Identity', available: false });
   });
 
   it('adopts login and pairing responses as the current session', async () => {

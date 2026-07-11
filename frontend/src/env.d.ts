@@ -10,6 +10,7 @@ declare module 'vue-router' {
     requiresAuth?: boolean;
     requiresWizard?: boolean;
     guestOnly?: boolean;
+    oidcCompletion?: boolean;
     capability?: Capability;
   }
 }

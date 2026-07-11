@@ -8,7 +8,7 @@ import {
   logout as apiLogout,
   pair as apiPair,
 } from '@/api';
-import type { AuthUser, Capability } from '@/api';
+import type { AuthStatus, AuthUser, Capability, OidcStatus } from '@/api';
 
 export type AuthState =
   | 'unknown'
@@ -20,6 +20,7 @@ export type AuthState =
 export const useAuthStore = defineStore('auth', () => {
   const state = ref<AuthState>('unknown');
   const user = ref<AuthUser | null>(null);
+  const oidc = ref<OidcStatus | null>(null);
   const lastInvalidation = ref<'http' | 'websocket' | null>(null);
   let initializePromise: Promise<void> | null = null;
   let listening = false;
@@ -49,6 +50,10 @@ export const useAuthStore = defineStore('auth', () => {
     if (state.value === 'authenticated') setAnonymous('http');
   }
 
+  function applyPublicStatus(status: AuthStatus): void {
+    oidc.value = status.oidc;
+  }
+
   function startUnauthorizedListener(): void {
     if (listening || typeof window === 'undefined') return;
     window.addEventListener(API_UNAUTHORIZED_EVENT, onUnauthorized);
@@ -66,6 +71,7 @@ export const useAuthStore = defineStore('auth', () => {
     state.value = 'checking';
     user.value = null;
     const status = await fetchAuthStatus();
+    applyPublicStatus(status);
     if (status.setup_required) {
       state.value = 'setup_required';
       return;
@@ -79,6 +85,12 @@ export const useAuthStore = defineStore('auth', () => {
     } catch {
       setAnonymous('http');
     }
+  }
+
+  async function refreshOidcStatus(): Promise<OidcStatus | null> {
+    const status = await fetchAuthStatus();
+    applyPublicStatus(status);
+    return status.oidc;
   }
 
   async function initialize(): Promise<void> {
@@ -114,6 +126,7 @@ export const useAuthStore = defineStore('auth', () => {
   return {
     state,
     user,
+    oidc,
     initialized,
     setupRequired,
     authenticated,
@@ -121,6 +134,7 @@ export const useAuthStore = defineStore('auth', () => {
     lastInvalidation,
     can,
     refresh,
+    refreshOidcStatus,
     initialize,
     login,
     pair,

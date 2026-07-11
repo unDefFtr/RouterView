@@ -21,9 +21,12 @@ vi.mock('@/api', () => apiMocks);
 const sessions = [
   {
     id: 'browser-1',
-    username: 'admin',
+    username: 'alice@example.test',
+    display_name: 'Alice Example',
     role: 'admin',
     session_kind: 'standard',
+    auth_method: 'oidc',
+    provider_name: 'Example Identity',
     label: null,
     created_at: 1_700_000_000,
     last_seen_at: 1_700_000_100,
@@ -33,8 +36,11 @@ const sessions = [
   {
     id: 'fixed-1',
     username: 'admin',
+    display_name: 'Hall display',
     role: 'viewer',
     session_kind: 'fixed',
+    auth_method: 'pairing',
+    provider_name: null,
     label: 'Hall display',
     created_at: 1_700_000_000,
     last_seen_at: 1_700_000_100,
@@ -60,7 +66,8 @@ describe('SessionsView', () => {
     const groups = wrapper.findAll('.session-group');
     expect(groups).toHaveLength(2);
     expect(groups[0].text()).toContain('浏览器会话');
-    expect(groups[0].text()).toContain('admin 浏览器会话');
+    expect(groups[0].text()).toContain('Alice Example 浏览器会话');
+    expect(groups[0].text()).toContain('Example Identity 单点登录');
     expect(groups[1].text()).toContain('固定设备');
     expect(groups[1].text()).toContain('Hall display');
 
@@ -69,5 +76,16 @@ describe('SessionsView', () => {
 
     expect(apiMocks.revokeSession).toHaveBeenCalledWith('browser-1');
     expect(apiMocks.fetchSessions).toHaveBeenCalledTimes(2);
+  });
+
+  it('labels administrator reauthentication as the local password', async () => {
+    const wrapper = mount(SessionsView, {
+      global: { stubs: { FeatherIcon: true } },
+    });
+    await flushPromises();
+
+    await wrapper.get('input[value="admin"]').setValue(true);
+
+    expect(wrapper.get('label[for="pair-password"]').text()).toBe('本地管理员密码');
   });
 });

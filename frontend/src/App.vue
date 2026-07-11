@@ -80,7 +80,9 @@ watch(
 onMounted(async () => {
   applicationMounted = true;
   auth.startUnauthorizedListener();
-  await auth.initialize().catch(() => undefined);
+  if (route.name !== 'oidc-complete' || route.meta.oidcCompletion !== true) {
+    await auth.initialize().catch(() => undefined);
+  }
   await startApplication();
 });
 

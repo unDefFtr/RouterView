@@ -36,7 +36,8 @@ describe('useDeviceOverrides', () => {
     const auth = useAuthStore();
     auth.state = 'authenticated';
     auth.user = {
-      username: 'admin', role: 'admin', session_kind: 'standard',
+      username: 'admin', display_name: 'Local administrator', role: 'admin',
+      session_kind: 'standard', auth_method: 'password', provider_name: null,
       capabilities: ['read', 'configure', 'manage_devices', 'manage_sessions'],
     };
     apiMocks.fetchDeviceOverrides.mockResolvedValue([]);

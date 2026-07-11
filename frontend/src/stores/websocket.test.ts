@@ -56,7 +56,9 @@ describe('websocket store', () => {
     setActivePinia(createPinia());
     MockWebSocket.instances.length = 0;
     apiMocks.fetchAuthStatus.mockReset();
-    apiMocks.fetchAuthStatus.mockResolvedValue({ setup_required: false, authenticated: true });
+    apiMocks.fetchAuthStatus.mockResolvedValue({
+      setup_required: false, authenticated: true, oidc: null,
+    });
     Object.defineProperty(navigator, 'onLine', { configurable: true, value: true });
     vi.stubGlobal('WebSocket', MockWebSocket);
   });
@@ -171,6 +173,7 @@ describe('websocket store', () => {
     apiMocks.fetchAuthStatus.mockResolvedValueOnce({
       setup_required: false,
       authenticated: false,
+      oidc: null,
     });
     const store = useWebSocketStore();
     store.connect('wss://routerview.test/ws');
