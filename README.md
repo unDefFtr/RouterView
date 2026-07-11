@@ -61,6 +61,50 @@ deployments leave `TRUSTED_PROXY_CIDRS` empty. A custom reverse proxy must be
 listed by its exact source network and must overwrite `X-Real-IP` with one
 bare client IP; never trust a LAN range or pass through a client-provided chain.
 
+### Optional OpenID Connect login
+
+RouterView can use one standard OpenID Connect provider in addition to the
+local administrator password. Register a confidential web client with this
+exact redirect URI, replacing the hostname with `ROUTERVIEW_DOMAIN`:
+
+```text
+https://routerview.local/api/auth/oidc/callback
+```
+
+Copy the provider's client secret into a private host file without putting it
+in `.env` or shell history, then make it readable by the non-root container:
+
+```bash
+install -m 0600 /dev/null secrets/routerview_oidc_client_secret
+${EDITOR:-vi} secrets/routerview_oidc_client_secret
+chmod 0444 secrets/routerview_oidc_client_secret
+```
+
+Uncomment the OIDC settings in `.env.compose.example` after copying it to
+`.env`. Set `COMPOSE_FILE=compose.yaml:compose.oidc.yaml`, the exact issuer and
+client ID, a display name, and distinct viewer/admin group values. The provider
+must return the configured group claim as an array of strings. RouterView
+always requests `openid profile email`; optional scopes may be comma- or
+space-separated in `OIDC_ADDITIONAL_SCOPES`.
+
+For a provider signed by a private CA, also set
+`COMPOSE_FILE=compose.yaml:compose.oidc.yaml:compose.oidc-ca.yaml` and point
+`OIDC_CA_SOURCE` to a read-only PEM CA bundle. RouterView does not provide a
+TLS-verification bypass.
+
+Use the same overlay combination for every Compose command in that deployment:
+
+```bash
+docker compose config --quiet
+docker compose up -d --no-build --wait --wait-timeout 180
+```
+
+OIDC discovery runs in the background. An unavailable identity provider
+disables new SSO logins but does not make RouterView unhealthy, interrupt local
+password login, or revoke existing RouterView sessions. See
+[Operations](docs/operations.md#openid-connect-operations) for provider
+requirements, outage handling, rotation, and emergency revocation.
+
 ## Development
 
 Toolchains are pinned in `rust-toolchain.toml` and `.nvmrc`.

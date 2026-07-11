@@ -142,6 +142,186 @@ Use the authenticated UI to set the RouterOS password. Do not add
 `ROUTER_PASSWORD` to `.env`; the backend must encrypt it with the mounted master
 key before storing it.
 
+## OpenID Connect operations
+
+OpenID Connect is optional and supplements the local administrator account. It
+does not replace local setup, password recovery, or fixed-device pairing. Keep
+the local administrator credential available offline before enabling SSO; it is
+the recovery path when the identity provider or its network path is unavailable.
+
+### Provider registration and role mapping
+
+Create one confidential OpenID Connect web client that supports Authorization
+Code Flow and PKCE S256. Pure OAuth 2.0 providers and provider-specific OAuth
+adapters are not supported. Register exactly this callback, substituting the
+configured `ROUTERVIEW_DOMAIN`:
+
+```text
+https://routerview.local/api/auth/oidc/callback
+```
+
+The backend derives this URI from `PUBLIC_ORIGIN`; it never derives it from the
+request `Host` or forwarding headers. Do not register wildcard callbacks or a
+second callback that uses plain HTTP.
+
+Use the provider's exact issuer URL. It must be an absolute HTTPS URL without
+userinfo, a query, or a fragment. Plain HTTP is accepted only for loopback
+development. The issuer returned by Discovery must exactly match the configured
+value, and the discovered authorization, token, UserInfo, and JWKS endpoints
+must also use HTTPS outside loopback development.
+
+RouterView always requests `openid profile email`. Put any provider-specific
+scope required to release group membership in `OIDC_ADDITIONAL_SCOPES`; values
+may be separated by commas or ASCII whitespace and are deduplicated. Configure
+`OIDC_GROUPS_CLAIM` for a top-level claim whose value is an array of strings.
+Set distinct `OIDC_VIEWER_GROUP` and `OIDC_ADMIN_GROUP` values:
+
+- a member of the admin group receives the `admin` role;
+- otherwise, a member of the viewer group receives the `viewer` role;
+- a subject in neither group is denied; and
+- a subject in both groups receives the `admin` role.
+
+Authorization is tied to the exact provider issuer and `sub`. Display name,
+preferred username, and email are presentation fields only and are never used
+as authorization identities.
+
+### Secret files and Compose activation
+
+The client secret must be UTF-8, no larger than 4096 bytes, and non-empty after
+trailing CR/LF removal. It is not accepted through an environment variable.
+Create the file without putting the secret in argv, `.env`, or shell history:
+
+```bash
+install -m 0600 /dev/null secrets/routerview_oidc_client_secret
+${EDITOR:-vi} secrets/routerview_oidc_client_secret
+chmod 0444 secrets/routerview_oidc_client_secret
+```
+
+As with the master key, Compose implements the secret with a read-only bind
+mount. Keep `secrets/` mode 0700; mode 0444 on the file lets UID 10001 read it
+inside the container without making the parent directory traversable to other
+host users. Store backup copies in a secret manager, not with database backups.
+
+Copy the OIDC block from `.env.compose.example` into `.env`, then set:
+
+```dotenv
+COMPOSE_FILE=compose.yaml:compose.oidc.yaml
+OIDC_ISSUER_URL=https://idp.example.com/application/o/routerview
+OIDC_CLIENT_ID=routerview
+OIDC_CLIENT_SECRET_SOURCE=./secrets/routerview_oidc_client_secret
+OIDC_PROVIDER_NAME=Company SSO
+OIDC_GROUPS_CLAIM=groups
+OIDC_VIEWER_GROUP=routerview-viewers
+OIDC_ADMIN_GROUP=routerview-admins
+OIDC_ADDITIONAL_SCOPES=
+```
+
+`COMPOSE_FILE` makes ordinary `docker compose` commands use the same base and
+OIDC overlay. Keep the exact same overlay combination for configuration checks,
+pulls, one-shot maintenance, startup, inspection, backup, and shutdown. Validate
+the effective model before recreating the backend:
+
+```bash
+docker compose config --quiet
+docker compose config --images
+docker compose up -d --no-build --wait --wait-timeout 180
+```
+
+For a provider whose certificate chains only to a private CA, place the CA
+certificate and any intermediates in a PEM bundle. Do not put a client private
+key or leaf-server private key in this file. Set the file mode to 0444 inside
+the private `secrets/` directory so UID 10001 can read the bind mount. Add the
+CA-only overlay and source:
+
+```dotenv
+COMPOSE_FILE=compose.yaml:compose.oidc.yaml:compose.oidc-ca.yaml
+OIDC_CA_SOURCE=./secrets/routerview_oidc_ca.pem
+```
+
+The third overlay mounts the PEM bundle read-only and sets the in-container
+`OIDC_CA_FILE`. There is no insecure TLS option. Keep using only the first two
+files when the issuer chains to a public root; the CA file is then neither
+required nor mounted.
+
+### Network, time, and outage behavior
+
+The backend uses the existing outbound `router_access` network for Discovery,
+JWKS, token, and optional UserInfo requests. If the host or container network
+has an egress policy, allow DNS plus HTTPS to every hostname advertised by the
+provider. Do not add a backend host port, host networking, a broad proxy trust
+range, or extra Linux capabilities. The OIDC client does not follow HTTP
+redirects or inherit proxy environment variables.
+
+Keep the Docker host clock synchronized with a reliable NTP source. Large clock
+skew causes valid provider tokens to fail issuer-time checks. After startup,
+verify the public status without exposing configuration details:
+
+```bash
+curl --fail --cacert routerview-local-ca.crt \
+  "https://${ROUTERVIEW_DOMAIN}/api/auth/status"
+```
+
+Discovery runs in the background with bounded retry backoff. If the provider,
+DNS, or outbound route fails, the login page marks SSO unavailable while local
+password login and existing RouterView sessions continue working. `/api/health`
+and `/api/ready` retain their existing process/router semantics and do not fail
+only because the identity provider is down. Do not redirect either health check
+to the provider.
+
+The backend exchanges the authorization code and stores no provider token in
+the browser. After login, authorization uses RouterView's local session cookie;
+an IdP outage therefore does not invalidate an established session. RouterView
+logout revokes only that local session and does not invoke provider logout.
+
+### Rotation, disabling, and emergency revocation
+
+Prefer a provider that permits two active client secrets during rotation. Add
+the replacement at the provider, write it to a new private host file, point
+`OIDC_CLIENT_SECRET_SOURCE` at that file, and recreate only the backend:
+
+```bash
+docker compose up -d --no-deps --no-build --force-recreate \
+  --wait --wait-timeout 180 backend
+```
+
+Verify a new OIDC login before revoking and deleting the old secret. If the
+provider cannot overlap secrets, schedule a maintenance window; local login and
+existing sessions remain available during the cutover. A client-secret change
+does not itself revoke existing RouterView sessions because provider tokens are
+not used after login.
+
+For a private-CA rotation, first build a PEM bundle containing every trust
+anchor needed during the overlap. Point `OIDC_CA_SOURCE` at the staged bundle,
+recreate the backend, and verify Discovery and a fresh login before rotating the
+provider certificate. Remove the old anchor in a second backend recreation only
+after the provider serves the new chain. Never work around a failed rotation by
+disabling TLS verification.
+
+Changing the issuer, client ID, group-claim name, or viewer/admin group mapping
+changes the OIDC authorization-policy fingerprint and invalidates existing OIDC
+sessions. A temporary provider outage does not. To disable SSO, set
+`COMPOSE_FILE=compose.yaml`, validate the base model, and recreate the backend;
+local password and pairing sessions remain available while OIDC sessions become
+invalid:
+
+```bash
+docker compose config --quiet
+docker compose up -d --no-deps --no-build --force-recreate \
+  --wait --wait-timeout 180 backend
+```
+
+Disabling a subject or removing a group at the provider prevents authorization
+at the next OIDC login, but it does not push revocation into an already-issued
+RouterView session. For immediate individual revocation, change the provider
+membership and revoke every matching session in RouterView's session page. For
+an incident affecting all SSO users, disable OIDC as above. Resetting the local
+administrator password remains the broad recovery action: it revokes all
+RouterView sessions and all unused pairing codes.
+
+An OIDC administrator may create a viewer fixed-device pairing. Creating an
+administrator pairing still requires the local administrator password; never
+enter an IdP password into that prompt.
+
 ## Trust the local CA
 
 Caddy persists its CA under the `caddy_data` volume. After first start, export
@@ -190,8 +370,9 @@ liveness fail. Use the authenticated settings UI and backend logs to diagnose
 that state; do not point the Compose health check at `/api/ready`.
 
 Logs must never contain RouterOS passwords, session tokens, CSRF tokens, setup
-tokens, encryption keys, or upstream response bodies. Export logs before
-restarting when investigating a crash loop.
+tokens, encryption keys, OIDC authorization codes, state, nonce, PKCE verifiers,
+provider tokens, sensitive claims, or upstream response bodies. Export logs
+before restarting when investigating a crash loop.
 
 ## Database backup and restore
 
@@ -391,9 +572,14 @@ Keep these items outside the Docker host:
 - a recent verified SQLite backup and its SHA-256 checksum;
 - the matching master key, stored separately from the database;
 - `.env` without plaintext credentials;
+- the OIDC issuer, client ID, callback, scopes, and role-group mapping;
+- the OIDC client secret in a secret manager, separate from database backups;
+- any private OIDC CA bundle and its verified fingerprint;
 - the deployed image digests and release checksums;
 - the Caddy root certificate fingerprint;
 - a record of local DNS and firewall configuration.
 
 Recovery is complete only after `keys verify`, `db check`, authenticated login,
-WebSocket delivery, RouterOS polling, and a new traffic sample all pass.
+WebSocket delivery, RouterOS polling, and a new traffic sample all pass. For an
+OIDC-enabled recovery, also verify Discovery, one viewer login, one administrator
+login, role enforcement, and the exact callback before revoking old credentials.
