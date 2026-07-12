@@ -424,6 +424,7 @@ struct IdTokenSpec<'a> {
     groups: Option<Value>,
     preferred_username: Option<String>,
     display_name: Option<String>,
+    address: Option<Value>,
     signing_key: &'a CoreEdDsaPrivateSigningKey,
     hash_access_token: Option<String>,
 }
@@ -443,6 +444,7 @@ impl<'a> IdTokenSpec<'a> {
             groups: Some(serde_json::json!(["routerview-viewers"])),
             preferred_username: Some("alice".into()),
             display_name: None,
+            address: None,
             signing_key,
             hash_access_token: Some("access-token".into()),
         }
@@ -453,6 +455,9 @@ fn signed_id_token_with(spec: IdTokenSpec<'_>) -> TestIdToken {
     let mut values = HashMap::new();
     if let Some(groups) = spec.groups {
         values.insert("groups".into(), groups);
+    }
+    if let Some(address) = spec.address {
+        values.insert("address".into(), address);
     }
     let mut standard_claims =
         StandardClaims::<CoreGenderClaim>::new(SubjectIdentifier::new(spec.subject));
@@ -736,6 +741,150 @@ async fn token_exchange_uses_client_secret_post_when_basic_is_unavailable() {
 }
 
 #[tokio::test]
+async fn accepts_casdoor_empty_address_array_in_id_token() {
+    let keys = signing_keys();
+    let server =
+        MockOidcServer::start(TokenAuthMethod::Basic, vec![keys.primary_jwks.clone()]).await;
+    let manager = discovered_manager(&server).await;
+
+    let source = "192.0.2.19".parse().unwrap();
+    let started = manager.begin(source, "/".into()).await.unwrap();
+    let flow = manager.consume_flow(&started.state, source).unwrap();
+    let mut spec = IdTokenSpec::valid(&server, &flow.nonce, &keys.primary);
+    spec.groups = Some(serde_json::json!(["routerview-admins"]));
+    spec.address = Some(serde_json::json!([]));
+    let id_token = signed_id_token_with(spec);
+    let encoded = id_token.to_string();
+    let payload = encoded.split('.').nth(1).expect("ID token payload segment");
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .expect("decode ID token payload");
+    let payload: Value = serde_json::from_slice(&payload).expect("parse ID token payload");
+    assert_eq!(payload.get("address"), Some(&serde_json::json!([])));
+    server.state.set_token_reply(token_reply(&id_token));
+
+    let identity = manager
+        .authenticate("casdoor-empty-address-code".into(), flow)
+        .await
+        .unwrap();
+    assert_eq!(identity.role, "admin");
+    assert_eq!(identity.username, "alice");
+    assert_eq!(identity.subject, "subject-123");
+    assert!(server.state.requests_for("/userinfo").is_empty());
+}
+
+#[tokio::test]
+async fn casdoor_address_compatibility_preserves_id_token_security_checks() {
+    #[derive(Clone, Copy, Debug)]
+    enum InvalidCase {
+        Issuer,
+        Audience,
+        Nonce,
+        Expiration,
+        Signature,
+        AccessTokenHash,
+    }
+
+    let keys = signing_keys();
+    let invalid_signature_key = generate_signing_key("primary-key");
+    let server =
+        MockOidcServer::start(TokenAuthMethod::Basic, vec![keys.primary_jwks.clone()]).await;
+    let manager = discovered_manager(&server).await;
+
+    for case in [
+        InvalidCase::Issuer,
+        InvalidCase::Audience,
+        InvalidCase::Nonce,
+        InvalidCase::Expiration,
+        InvalidCase::Signature,
+        InvalidCase::AccessTokenHash,
+    ] {
+        let source = "192.0.2.23".parse().unwrap();
+        let started = manager.begin(source, "/".into()).await.unwrap();
+        let flow = manager.consume_flow(&started.state, source).unwrap();
+        let mut spec = IdTokenSpec::valid(&server, &flow.nonce, &keys.primary);
+        spec.address = Some(serde_json::json!([]));
+        match case {
+            InvalidCase::Issuer => spec.issuer = "https://wrong-issuer.example".into(),
+            InvalidCase::Audience => spec.audience = "another-client".into(),
+            InvalidCase::Nonce => spec.nonce = Some("wrong-nonce".into()),
+            InvalidCase::Expiration => {
+                spec.expiration = chrono::Utc::now() - chrono::Duration::minutes(5)
+            }
+            InvalidCase::Signature => spec.signing_key = &invalid_signature_key,
+            InvalidCase::AccessTokenHash => spec.hash_access_token = Some("wrong-token".into()),
+        }
+        server
+            .state
+            .set_token_reply(token_reply(&signed_id_token_with(spec)));
+
+        let result = manager
+            .authenticate("invalid-compatible-token-code".into(), flow)
+            .await;
+        assert!(
+            matches!(result, Err(LoginError::AuthenticationFailed)),
+            "unexpected result for {case:?}"
+        );
+    }
+
+    assert_eq!(
+        server
+            .state
+            .requests_for("/.well-known/openid-configuration")
+            .len(),
+        1
+    );
+    assert_eq!(server.state.requests_for("/jwks").len(), 1);
+}
+
+#[tokio::test]
+async fn casdoor_address_compatibility_requires_a_string_array() {
+    let keys = signing_keys();
+    let server =
+        MockOidcServer::start(TokenAuthMethod::Basic, vec![keys.primary_jwks.clone()]).await;
+    let manager = discovered_manager(&server).await;
+
+    for address in [
+        serde_json::json!([7]),
+        serde_json::json!(["home", false]),
+        serde_json::json!("home"),
+    ] {
+        let source = "192.0.2.24".parse().unwrap();
+        let started = manager.begin(source, "/".into()).await.unwrap();
+        let flow = manager.consume_flow(&started.state, source).unwrap();
+        let mut spec = IdTokenSpec::valid(&server, &flow.nonce, &keys.primary);
+        spec.address = Some(address);
+        server
+            .state
+            .set_token_reply(token_reply(&signed_id_token_with(spec)));
+
+        assert!(matches!(
+            manager
+                .authenticate("invalid-compatible-address-code".into(), flow)
+                .await,
+            Err(LoginError::AuthenticationFailed)
+        ));
+    }
+}
+
+#[test]
+fn compatible_token_response_rejects_duplicate_security_fields() {
+    let responses: [&[u8]; 2] = [
+        br#"{"access_token":"first","access_token":"second","token_type":"Bearer","id_token":"a.b.c"}"#,
+        br#"{"access_token":"access-token","token_type":"Bearer","id_token":"a.b.c","id_token":"d.e.f"}"#,
+    ];
+
+    for body in responses {
+        let result = parse_compatible_token_response(CapturedHttpResponse {
+            status: StatusCode::OK,
+            content_type: Some("application/json".into()),
+            body: body.to_vec(),
+        });
+        assert!(matches!(result, Err(LoginError::AuthenticationFailed)));
+    }
+}
+
+#[tokio::test]
 async fn rejects_invalid_id_token_security_claims_and_signatures() {
     #[derive(Clone, Copy, Debug)]
     enum InvalidCase {
@@ -947,6 +1096,41 @@ async fn unknown_signing_key_refreshes_discovery_and_jwks_once() {
 
     let identity = manager
         .authenticate("rotated-key-code".into(), flow)
+        .await
+        .unwrap();
+    assert_eq!(identity.role, "admin");
+    assert_eq!(
+        server
+            .state
+            .requests_for("/.well-known/openid-configuration")
+            .len(),
+        2
+    );
+    assert_eq!(server.state.requests_for("/jwks").len(), 2);
+}
+
+#[tokio::test]
+async fn compatible_unknown_signing_key_refreshes_discovery_and_jwks_once() {
+    let keys = signing_keys();
+    let server = MockOidcServer::start(
+        TokenAuthMethod::Basic,
+        vec![keys.primary_jwks.clone(), keys.secondary_jwks.clone()],
+    )
+    .await;
+    let manager = discovered_manager(&server).await;
+
+    let source = "192.0.2.25".parse().unwrap();
+    let started = manager.begin(source, "/".into()).await.unwrap();
+    let flow = manager.consume_flow(&started.state, source).unwrap();
+    let mut spec = IdTokenSpec::valid(&server, &flow.nonce, &keys.secondary);
+    spec.groups = Some(serde_json::json!(["routerview-admins"]));
+    spec.address = Some(serde_json::json!([]));
+    server
+        .state
+        .set_token_reply(token_reply(&signed_id_token_with(spec)));
+
+    let identity = manager
+        .authenticate("rotated-compatible-key-code".into(), flow)
         .await
         .unwrap();
     assert_eq!(identity.role, "admin");

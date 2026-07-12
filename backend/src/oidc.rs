@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fmt,
     future::Future,
     net::{IpAddr, SocketAddr},
     pin::Pin,
@@ -16,17 +17,21 @@ use base64::Engine;
 use futures_util::StreamExt;
 use openidconnect::{
     core::{
-        CoreAuthenticationFlow, CoreClient, CoreGenderClaim, CoreJsonWebKeySet,
-        CoreProviderMetadata,
+        CoreAuthenticationFlow, CoreClient, CoreGenderClaim, CoreIdToken, CoreIdTokenVerifier,
+        CoreJsonWebKeySet, CoreJwsSigningAlgorithm, CoreProviderMetadata,
     },
-    AccessTokenHash, AdditionalClaims, AsyncHttpClient, AuthType, AuthorizationCode, ClientId,
-    ClientSecret, CsrfToken, EndUserName, HttpRequest, HttpResponse, IssuerUrl, Nonce,
-    OAuth2TokenResponse, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope,
+    AccessToken, AccessTokenHash, AdditionalClaims, AsyncHttpClient, AuthType, AuthorizationCode,
+    ClientId, ClientSecret, CsrfToken, EndUserName, HttpRequest, HttpResponse, IssuerUrl,
+    JsonWebKey, JsonWebTokenType, JwsSigningAlgorithm, Nonce, OAuth2TokenResponse,
+    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, SignatureVerificationError,
     SubjectIdentifier, UserInfoClaims,
 };
 use rand::{rngs::OsRng, RngCore};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::{
+    de::{Error as _, MapAccess, Visitor},
+    Deserialize, Deserializer, Serialize,
+};
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::{watch, RwLock, Semaphore};
 
@@ -119,9 +124,133 @@ impl<'client> AsyncHttpClient<'client> for BoundedHttpClient {
 }
 
 #[derive(Clone)]
+struct CapturingHttpClient {
+    inner: BoundedHttpClient,
+    response: Arc<Mutex<Option<CapturedHttpResponse>>>,
+}
+
+struct CapturedHttpResponse {
+    status: StatusCode,
+    content_type: Option<String>,
+    body: Vec<u8>,
+}
+
+struct UniqueObject(Map<String, Value>);
+
+impl<'de> Deserialize<'de> for UniqueObject {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct UniqueObjectVisitor;
+
+        impl<'de> Visitor<'de> for UniqueObjectVisitor {
+            type Value = UniqueObject;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a JSON object without duplicate fields")
+            }
+
+            fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut values = Map::new();
+                while let Some((key, value)) = access.next_entry::<String, Value>()? {
+                    if values.insert(key.clone(), value).is_some() {
+                        return Err(A::Error::custom(format!("duplicate field `{key}`")));
+                    }
+                }
+                Ok(UniqueObject(values))
+            }
+        }
+
+        deserializer.deserialize_map(UniqueObjectVisitor)
+    }
+}
+
+impl CapturingHttpClient {
+    fn new(inner: BoundedHttpClient) -> Self {
+        Self {
+            inner,
+            response: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn take_response(&self) -> Option<CapturedHttpResponse> {
+        self.response
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+    }
+}
+
+impl<'client> AsyncHttpClient<'client> for CapturingHttpClient {
+    type Error = BoundedHttpError;
+    type Future = Pin<Box<dyn Future<Output = Result<HttpResponse, Self::Error>> + Send + 'client>>;
+
+    fn call(&'client self, request: HttpRequest) -> Self::Future {
+        Box::pin(async move {
+            let response = self.inner.call(request).await?;
+            let content_type = response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(';').next())
+                .map(str::trim)
+                .map(str::to_owned);
+            *self
+                .response
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(CapturedHttpResponse {
+                status: response.status(),
+                content_type,
+                body: response.body().clone(),
+            });
+            Ok(response)
+        })
+    }
+}
+
+#[derive(Clone)]
 struct Provider {
     metadata: CoreProviderMetadata,
     auth_type: AuthType,
+}
+
+struct VerifiedIdentityToken {
+    provider: Provider,
+    access_token: AccessToken,
+    subject: String,
+    values: HashMap<String, Value>,
+    username: Option<String>,
+    display_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CompatibleTokenResponse {
+    access_token: String,
+    token_type: String,
+    id_token: String,
+}
+
+#[derive(Deserialize)]
+struct CompatibleJoseHeader {
+    alg: CoreJwsSigningAlgorithm,
+    #[serde(default)]
+    kid: Option<String>,
+    #[serde(default)]
+    typ: Option<JsonWebTokenType>,
+    #[serde(default)]
+    cty: Option<String>,
+    #[serde(default)]
+    crit: Option<Vec<String>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompatibleTokenError {
+    NoMatchingKey,
+    Invalid,
 }
 
 #[derive(Debug)]
@@ -443,65 +572,97 @@ impl OidcManager {
             .clone()
             .try_acquire_owned()
             .map_err(|_| LoginError::ProviderUnavailable)?;
-        let client = oidc_client(config, provider);
+        let client = oidc_client(config, provider.clone());
+        let capturing_http = CapturingHttpClient::new(http.clone());
         let token = client
             .exchange_code(AuthorizationCode::new(code))
             .set_pkce_verifier(PkceCodeVerifier::new(flow.pkce_verifier))
-            .request_async(http)
-            .await
-            .map_err(|_| LoginError::AuthenticationFailed)?;
-        let id_token = token
-            .extra_fields()
-            .id_token()
-            .ok_or(LoginError::AuthenticationFailed)?;
-        let nonce = Nonce::new(flow.nonce);
-        let first_validation_succeeded = {
-            let verifier = client.id_token_verifier();
-            id_token.claims(&verifier, &nonce).is_ok()
-        };
-        let active_client = if first_validation_succeeded {
-            client
-        } else {
-            oidc_client(config, self.refresh_provider().await?)
-        };
-        let verifier = active_client.id_token_verifier();
-        let claims = id_token
-            .claims(&verifier, &nonce)
-            .map_err(|_| LoginError::AuthenticationFailed)?;
-
-        if let Some(expected_hash) = claims.access_token_hash() {
-            let signing_algorithm = id_token
-                .signing_alg()
-                .map_err(|_| LoginError::AuthenticationFailed)?;
-            let signing_key = id_token
-                .signing_key(&verifier)
-                .map_err(|_| LoginError::AuthenticationFailed)?;
-            let actual_hash =
-                AccessTokenHash::from_token(token.access_token(), signing_algorithm, signing_key)
+            .request_async(&capturing_http)
+            .await;
+        let nonce = Nonce::new(flow.nonce.clone());
+        let verified = match token {
+            Ok(token) => {
+                let _ = capturing_http.take_response();
+                let id_token = token
+                    .extra_fields()
+                    .id_token()
+                    .ok_or(LoginError::AuthenticationFailed)?;
+                let first_validation_succeeded = {
+                    let verifier = client.id_token_verifier();
+                    id_token.claims(&verifier, &nonce).is_ok()
+                };
+                let active_provider = if first_validation_succeeded {
+                    provider
+                } else {
+                    self.refresh_provider().await?
+                };
+                let active_client = oidc_client(config, active_provider.clone());
+                let verifier = active_client.id_token_verifier();
+                let claims = id_token
+                    .claims(&verifier, &nonce)
                     .map_err(|_| LoginError::AuthenticationFailed)?;
-            if actual_hash != *expected_hash {
-                return Err(LoginError::AuthenticationFailed);
-            }
-        }
 
-        let subject = claims.subject().as_str().to_string();
+                if let Some(expected_hash) = claims.access_token_hash() {
+                    let signing_algorithm = id_token
+                        .signing_alg()
+                        .map_err(|_| LoginError::AuthenticationFailed)?;
+                    let signing_key = id_token
+                        .signing_key(&verifier)
+                        .map_err(|_| LoginError::AuthenticationFailed)?;
+                    let actual_hash = AccessTokenHash::from_token(
+                        token.access_token(),
+                        signing_algorithm,
+                        signing_key,
+                    )
+                    .map_err(|_| LoginError::AuthenticationFailed)?;
+                    if actual_hash != *expected_hash {
+                        return Err(LoginError::AuthenticationFailed);
+                    }
+                }
+
+                let subject = claims.subject().as_str().to_string();
+                let values = id_token_values(id_token)?;
+                let username = valid_identity_text(
+                    claims.preferred_username().map(|value| value.as_str()),
+                    256,
+                )
+                .or_else(|| valid_identity_text(claims.email().map(|value| value.as_str()), 256));
+                let display_name = claims.name().and_then(localized_value);
+                VerifiedIdentityToken {
+                    provider: active_provider,
+                    access_token: token.access_token().to_owned(),
+                    subject,
+                    values,
+                    username,
+                    display_name,
+                }
+            }
+            Err(_) => {
+                let response = capturing_http
+                    .take_response()
+                    .ok_or(LoginError::AuthenticationFailed)?;
+                self.verify_compatible_token_response(config, provider, response, &flow.nonce)
+                    .await?
+            }
+        };
+        let VerifiedIdentityToken {
+            provider: active_provider,
+            access_token,
+            subject,
+            values: id_values,
+            mut username,
+            mut display_name,
+        } = verified;
         if subject.is_empty() || subject.len() > 512 || subject.chars().any(char::is_control) {
             return Err(LoginError::AuthenticationFailed);
         }
-        let id_values = id_token_values(id_token)?;
-        let mut username =
-            valid_identity_text(claims.preferred_username().map(|value| value.as_str()), 256)
-                .or_else(|| valid_identity_text(claims.email().map(|value| value.as_str()), 256));
-        let mut display_name = claims.name().and_then(localized_value);
+        let active_client = oidc_client(config, active_provider);
 
         let groups = match group_claim(&id_values, &config.groups_claim)? {
             Some(groups) => groups,
             None => {
                 let request = active_client
-                    .user_info(
-                        token.access_token().to_owned(),
-                        Some(SubjectIdentifier::new(subject.clone())),
-                    )
+                    .user_info(access_token, Some(SubjectIdentifier::new(subject.clone())))
                     .map_err(|_| LoginError::AuthenticationFailed)?;
                 let user_info: UserInfoClaims<DynamicClaims, CoreGenderClaim> = request
                     .request_async(http)
@@ -539,6 +700,213 @@ impl OidcManager {
                 .ok_or(LoginError::ProviderUnavailable)?,
         })
     }
+
+    async fn verify_compatible_token_response(
+        &self,
+        config: &OidcConfig,
+        provider: Provider,
+        response: CapturedHttpResponse,
+        expected_nonce: &str,
+    ) -> Result<VerifiedIdentityToken, LoginError> {
+        let token = parse_compatible_token_response(response)?;
+        match verify_compatible_id_token(config, provider.clone(), &token, expected_nonce) {
+            Ok(verified) => Ok(verified),
+            Err(CompatibleTokenError::NoMatchingKey) => {
+                let refreshed = self.refresh_provider().await?;
+                verify_compatible_id_token(config, refreshed, &token, expected_nonce)
+                    .map_err(|_| LoginError::AuthenticationFailed)
+            }
+            Err(CompatibleTokenError::Invalid) => Err(LoginError::AuthenticationFailed),
+        }
+    }
+}
+
+fn parse_compatible_token_response(
+    response: CapturedHttpResponse,
+) -> Result<CompatibleTokenResponse, LoginError> {
+    if response.status != StatusCode::OK
+        || !response
+            .content_type
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("application/json"))
+    {
+        return Err(LoginError::AuthenticationFailed);
+    }
+    let UniqueObject(values) =
+        serde_json::from_slice(&response.body).map_err(|_| LoginError::AuthenticationFailed)?;
+    if values.contains_key("error") {
+        return Err(LoginError::AuthenticationFailed);
+    }
+    let token: CompatibleTokenResponse = serde_json::from_value(Value::Object(values))
+        .map_err(|_| LoginError::AuthenticationFailed)?;
+    if token.access_token.is_empty()
+        || token.id_token.is_empty()
+        || token.access_token.len() > MAX_HTTP_RESPONSE_BYTES
+        || token.id_token.len() > MAX_HTTP_RESPONSE_BYTES
+        || !token.token_type.eq_ignore_ascii_case("bearer")
+    {
+        return Err(LoginError::AuthenticationFailed);
+    }
+    Ok(token)
+}
+
+fn verify_compatible_id_token(
+    config: &OidcConfig,
+    provider: Provider,
+    token: &CompatibleTokenResponse,
+    expected_nonce: &str,
+) -> Result<VerifiedIdentityToken, CompatibleTokenError> {
+    let mut pieces = token.id_token.split('.');
+    let encoded_header = pieces.next().ok_or(CompatibleTokenError::Invalid)?;
+    let encoded_payload = pieces.next().ok_or(CompatibleTokenError::Invalid)?;
+    let encoded_signature = pieces.next().ok_or(CompatibleTokenError::Invalid)?;
+    if pieces.next().is_some()
+        || encoded_header.is_empty()
+        || encoded_payload.is_empty()
+        || encoded_signature.is_empty()
+    {
+        return Err(CompatibleTokenError::Invalid);
+    }
+
+    let header_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded_header)
+        .map_err(|_| CompatibleTokenError::Invalid)?;
+    let UniqueObject(header_values) =
+        serde_json::from_slice(&header_bytes).map_err(|_| CompatibleTokenError::Invalid)?;
+    if header_values.contains_key("cty") || header_values.contains_key("crit") {
+        return Err(CompatibleTokenError::Invalid);
+    }
+    let header: CompatibleJoseHeader = serde_json::from_value(Value::Object(header_values))
+        .map_err(|_| CompatibleTokenError::Invalid)?;
+    if header.cty.is_some() || header.crit.is_some() || header.alg.uses_shared_secret() {
+        return Err(CompatibleTokenError::Invalid);
+    }
+    if let Some(token_type) = &header.typ {
+        let normalized = token_type
+            .normalize()
+            .map_err(|_| CompatibleTokenError::Invalid)?;
+        if normalized.as_str() != "application/jwt" && normalized.as_str() != "application/jose" {
+            return Err(CompatibleTokenError::Invalid);
+        }
+    }
+    let key_id = header.kid.as_deref().filter(|value| {
+        !value.is_empty() && value.len() <= 512 && !value.chars().any(char::is_control)
+    });
+    if key_id.is_none()
+        || !provider
+            .metadata
+            .id_token_signing_alg_values_supported()
+            .contains(&header.alg)
+    {
+        return Err(CompatibleTokenError::Invalid);
+    }
+
+    let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded_payload)
+        .map_err(|_| CompatibleTokenError::Invalid)?;
+    let UniqueObject(mut payload_values) =
+        serde_json::from_slice(&payload_bytes).map_err(|_| CompatibleTokenError::Invalid)?;
+    let compatible_address = payload_values
+        .get("address")
+        .and_then(Value::as_array)
+        .is_some_and(|values| {
+            values.len() <= 32
+                && values.iter().all(|value| {
+                    value.as_str().is_some_and(|address| {
+                        address.len() <= 512 && !address.chars().any(char::is_control)
+                    })
+                })
+        });
+    if !compatible_address {
+        return Err(CompatibleTokenError::Invalid);
+    }
+    let original_payload_values = payload_values.clone();
+
+    // Parsing the token after changing only Casdoor's non-standard address array proves that no
+    // other standard claim shape is being accepted through this compatibility path. Signature
+    // verification below always uses the untouched, provider-signed input.
+    payload_values.insert("address".into(), Value::Object(Map::new()));
+    let normalized_payload =
+        serde_json::to_vec(&payload_values).map_err(|_| CompatibleTokenError::Invalid)?;
+    let normalized_token = format!(
+        "{encoded_header}.{}.{encoded_signature}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(normalized_payload)
+    )
+    .parse::<CoreIdToken>()
+    .map_err(|_| CompatibleTokenError::Invalid)?;
+
+    let client = oidc_client(config, provider.clone());
+    let verifier = client.id_token_verifier();
+    let signing_algorithm = normalized_token
+        .signing_alg()
+        .map_err(|_| CompatibleTokenError::Invalid)?;
+    if signing_algorithm != &header.alg {
+        return Err(CompatibleTokenError::Invalid);
+    }
+    let signing_key = normalized_token
+        .signing_key(&verifier)
+        .map_err(|error| match error {
+            SignatureVerificationError::NoMatchingKey => CompatibleTokenError::NoMatchingKey,
+            _ => CompatibleTokenError::Invalid,
+        })?;
+    let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded_signature)
+        .map_err(|_| CompatibleTokenError::Invalid)?;
+    let signing_input = format!("{encoded_header}.{encoded_payload}");
+    signing_key
+        .verify_signature(signing_algorithm, signing_input.as_bytes(), &signature)
+        .map_err(|_| CompatibleTokenError::Invalid)?;
+
+    // The original JWS has already been verified above. This verifier is used only to retain the
+    // library's typed expiration, nonce, and standard-claim checks on the address-normalized copy.
+    let claims_verifier = CoreIdTokenVerifier::new_insecure_without_verification();
+    let expected_nonce = Nonce::new(expected_nonce.to_owned());
+    let claims = normalized_token
+        .claims(&claims_verifier, &expected_nonce)
+        .map_err(|_| CompatibleTokenError::Invalid)?;
+    if !constant_time_eq(
+        claims.issuer().as_str().as_bytes(),
+        config.issuer_url.as_bytes(),
+    ) {
+        return Err(CompatibleTokenError::Invalid);
+    }
+    let audiences = claims.audiences();
+    if audiences.is_empty()
+        || audiences
+            .iter()
+            .any(|audience| audience.as_str() != config.client_id)
+    {
+        return Err(CompatibleTokenError::Invalid);
+    }
+    if claims
+        .authorized_party()
+        .is_some_and(|party| party.as_str() != config.client_id)
+    {
+        return Err(CompatibleTokenError::Invalid);
+    }
+    if let Some(expected_hash) = claims.access_token_hash() {
+        let access_token = AccessToken::new(token.access_token.clone());
+        let actual_hash =
+            AccessTokenHash::from_token(&access_token, signing_algorithm, signing_key)
+                .map_err(|_| CompatibleTokenError::Invalid)?;
+        if actual_hash != *expected_hash {
+            return Err(CompatibleTokenError::Invalid);
+        }
+    }
+
+    let subject = claims.subject().as_str().to_owned();
+    let username =
+        valid_identity_text(claims.preferred_username().map(|value| value.as_str()), 256)
+            .or_else(|| valid_identity_text(claims.email().map(|value| value.as_str()), 256));
+    let display_name = claims.name().and_then(localized_value);
+    Ok(VerifiedIdentityToken {
+        provider,
+        access_token: AccessToken::new(token.access_token.clone()),
+        subject,
+        values: original_payload_values.into_iter().collect(),
+        username,
+        display_name,
+    })
 }
 
 async fn discover_provider(config: &OidcConfig, http: &BoundedHttpClient) -> Result<Provider, ()> {
@@ -693,7 +1061,9 @@ fn id_token_values<T: Serialize>(id_token: &T) -> Result<HashMap<String, Value>,
     let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload)
         .map_err(|_| LoginError::AuthenticationFailed)?;
-    serde_json::from_slice(&decoded).map_err(|_| LoginError::AuthenticationFailed)
+    let UniqueObject(values) =
+        serde_json::from_slice(&decoded).map_err(|_| LoginError::AuthenticationFailed)?;
+    Ok(values.into_iter().collect())
 }
 
 fn group_claim(
@@ -1250,6 +1620,10 @@ mod tests {
             group_claim(&values, "groups").unwrap(),
             Some(vec!["readers".into()])
         );
+        let duplicate_payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"groups":["readers"],"groups":["operators"]}"#);
+        let duplicate_token = format!("header.{duplicate_payload}.signature");
+        assert!(id_token_values(&duplicate_token).is_err());
         assert!(id_token_values(&"not-a-jwt").is_err());
     }
 
