@@ -230,10 +230,10 @@ jobs:
             THIRD-PARTY-LICENSES.md
             SHA256SUMS
 
-  images:
-    name: Publish ${{ matrix.name }} image
+  image-platforms:
+    name: Build ${{ matrix.name }} image (${{ matrix.architecture }})
     needs: artifacts
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
@@ -243,14 +243,40 @@ jobs:
           - name: backend
             target: backend-runtime
             image: routerview-backend
+            architecture: amd64
+            runner: ubuntu-24.04
+            runner_architecture: x86_64
+          - name: backend
+            target: backend-runtime
+            image: routerview-backend
+            architecture: arm64
+            runner: ubuntu-24.04-arm
+            runner_architecture: aarch64
           - name: caddy
             target: caddy-runtime
             image: routerview-caddy
+            architecture: amd64
+            runner: ubuntu-24.04
+            runner_architecture: x86_64
+          - name: caddy
+            target: caddy-runtime
+            image: routerview-caddy
+            architecture: arm64
+            runner: ubuntu-24.04-arm
+            runner_architecture: aarch64
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - name: Verify native runner architecture
+        env:
+          EXPECTED_ARCHITECTURE: ${{ matrix.runner_architecture }}
+        run: test "$(uname -m)" = "$EXPECTED_ARCHITECTURE"
+      - id: image
+        name: Resolve canonical image name
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+        run: echo "name=${IMAGE,,}" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
@@ -260,24 +286,174 @@ jobs:
       - id: metadata
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
-          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          images: ${{ steps.image.outputs.name }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
-      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+      - id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: Dockerfile
           target: ${{ matrix.target }}
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.metadata.outputs.tags }}
+          platforms: linux/${{ matrix.architecture }}
           labels: ${{ steps.metadata.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.name }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+          outputs: type=image,name=${{ steps.image.outputs.name }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.name }}-${{ matrix.architecture }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}-${{ matrix.architecture }}
           provenance: mode=max
           sbom: true
+      - name: Export image digest
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          digest="${IMAGE_DIGEST#sha256:}"
+          test "$digest" != "$IMAGE_DIGEST"
+          test "${#digest}" -eq 64
+          case "$digest" in
+            *[!0-9a-f]*)
+              echo "Build returned an invalid image digest" >&2
+              exit 1
+              ;;
+          esac
+          mkdir -p "${RUNNER_TEMP}/digests"
+          touch "${RUNNER_TEMP}/digests/${digest}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: routerview-${{ github.ref_name }}-${{ matrix.name }}-${{ matrix.architecture }}-digest
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+          path: ${{ runner.temp }}/digests/*
+
+  images:
+    name: Publish ${{ matrix.name }} image
+    needs: image-platforms
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - name: backend
+            image: routerview-backend
+          - name: caddy
+            image: routerview-caddy
+    steps:
+      - id: image
+        name: Resolve canonical image name
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+        run: echo "name=${IMAGE,,}" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: routerview-${{ github.ref_name }}-${{ matrix.name }}-*-digest
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: metadata
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+      - name: Create multi-platform manifest
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          METADATA_JSON: ${{ steps.metadata.outputs.json }}
+        run: |
+          shopt -s nullglob
+          digests=(*)
+          test "${#digests[@]}" -eq 2
+
+          sources=()
+          for digest in "${digests[@]}"; do
+            test -f "$digest"
+            test "${#digest}" -eq 64
+            case "$digest" in
+              *[!0-9a-f]*)
+                echo "Digest artifact has an invalid name" >&2
+                exit 1
+                ;;
+            esac
+            sources+=("${IMAGE}@sha256:${digest}")
+          done
+
+          mapfile -t tags < <(jq --raw-output '.tags[]' <<<"$METADATA_JSON")
+          test "${#tags[@]}" -gt 0
+          tag_args=()
+          for tag in "${tags[@]}"; do
+            case "$tag" in
+              "${IMAGE}:"*) ;;
+              *)
+                echo "Metadata returned a tag for an unexpected image" >&2
+                exit 1
+                ;;
+            esac
+            tag_args+=(--tag "$tag")
+          done
+
+          docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
+      - name: Verify multi-platform manifest
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          METADATA_JSON: ${{ steps.metadata.outputs.json }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          test -n "$VERSION"
+          mapfile -t tags < <(jq --raw-output '.tags[]' <<<"$METADATA_JSON")
+          test "${#tags[@]}" -gt 0
+          expected_index_hash=""
+          version_index=""
+          for tag in "${tags[@]}"; do
+            index="$(docker buildx imagetools inspect --raw "$tag")"
+            index_hash="$(printf '%s' "$index" | sha256sum | cut -d ' ' -f 1)"
+            test -n "$index_hash"
+            if [[ -z "$expected_index_hash" ]]; then
+              expected_index_hash="$index_hash"
+            else
+              test "$index_hash" = "$expected_index_hash"
+            fi
+            if [[ "$tag" = "${IMAGE}:${VERSION}" ]]; then
+              version_index="$index"
+            fi
+          done
+          test -n "$version_index"
+
+          jq --exit-status '
+            . as $index
+            | [$index.manifests[]
+                | select(.platform.os == "linux")
+                | {
+                    platform: "\(.platform.os)/\(.platform.architecture)",
+                    digest
+                  }] as $runtimes
+            | [$index.manifests[]
+                | select(
+                    .annotations["vnd.docker.reference.type"]
+                      == "attestation-manifest"
+                  )
+                | {
+                    platform: "\(.platform.os)/\(.platform.architecture)",
+                    subject: .annotations["vnd.docker.reference.digest"]
+                  }] as $attestations
+            | (([$runtimes[].platform] | sort)
+                == ["linux/amd64", "linux/arm64"])
+              and (($attestations | length) >= 2)
+              and all($attestations[]; .platform == "unknown/unknown")
+              and (([$attestations[].subject] | unique | sort)
+                == ([$runtimes[].digest] | unique | sort))
+          ' <<<"$version_index" >/dev/null
 
   release:
     name: Publish GitHub release
