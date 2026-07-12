@@ -10,6 +10,7 @@ the public Internet.
 The container starts the service by invoking `routerview-backend` without a
 subcommand. The following maintenance commands are implemented:
 
+- `routerview-backend admin setup-token`
 - `routerview-backend admin setup [USERNAME]`
 - `routerview-backend admin reset-password [USERNAME]`
 - `routerview-backend db check`
@@ -20,8 +21,12 @@ subcommand. The following maintenance commands are implemented:
 - `routerview-backend keys verify`
 - `routerview-backend keys rotate --new-key-file PATH`
 
-`db check` and `db backup` are read-only, online-safe operations. The daemon
-holds an exclusive lifetime lock for all writers. Run `admin`, `db migrate`,
+`admin setup-token` is an online control command: it asks the running daemon's
+loopback-only listener to issue a token and does not open SQLite directly.
+Among `admin` commands, it is the only one that may be run with
+`docker compose exec` against a running daemon. `db check` and `db backup` are
+also read-only, online-safe operations. The daemon holds an exclusive lifetime
+lock for all writers. Run `admin setup`, `admin reset-password`, `db migrate`,
 `db restore`, and `keys` commands only after stopping the backend. Never use
 `docker compose exec` for those offline commands.
 
@@ -113,24 +118,52 @@ use only its directly connected source network and configure it to overwrite
 `X-Real-IP` with exactly one IP address. Do not trust an entire LAN or a
 generic private-address range.
 
-Initialize the first administrator before starting the daemon. The one-shot
-container mounts the same database and master-key secret as the service:
+Start the complete deployment before creating the first administrator:
 
 ```bash
-docker compose run --rm --no-deps backend admin setup admin
 docker compose up -d --no-build --wait --wait-timeout 180
 docker compose ps
+docker compose exec backend routerview-backend admin setup-token
 ```
 
-Do not replace this with `docker compose exec`: a running daemon owns the
-database lock, so a second writer correctly refuses to start. If the daemon is
-started before an administrator exists, it creates a 15-minute setup token and
-loopback-only setup listener as a recovery mechanism. The token file is mode
-0600 on the backend's private tmpfs, and Caddy always returns 404 for
-`/api/auth/setup`; it is not a browser-facing endpoint.
+The last command prints a cryptographically random, 15-minute one-time token to
+standard output. It is available only while no administrator exists. Each new
+issuance invalidates the previous token; successful administrator creation also
+consumes it. The daemon stores only the token hash in SQLite and publishes the
+token to its mode-0600 file on the private tmpfs for compatibility. Do not put
+the token in command arguments, environment variables, URLs, logs, tickets, or
+chat. Enter it only in the HTTPS setup form.
 
-A forgotten administrator password is recovered with an offline one-shot
-container. Resetting it revokes all existing sessions and unused pairing codes:
+Caddy forwards the public setup form submission to the main API, but the token
+issuance endpoint remains bound to backend loopback and is not exposed through
+Caddy or the main application router.
+
+Trust Caddy's local CA as described below, then open
+`https://<ROUTERVIEW_DOMAIN>/setup-required`. Enter the token, choose the local
+administrator username and password, and submit the form. RouterView creates a
+normal administrator session and opens the initialization wizard. Complete its
+three steps:
+
+1. Set the RouterOS host, port, HTTPS or explicitly permitted HTTP, username,
+   password, and self-signed-certificate policy, then test the connection.
+2. Set polling and probe intervals, raw and aggregate retention periods, and
+   the interface theme.
+3. Review and save the configuration. RouterView applies it immediately and
+   opens the Dashboard without a service restart.
+
+If no browser is available, retain the offline `admin setup` fallback. Stop the
+daemon first so the one-shot container can acquire the writer lock:
+
+```bash
+docker compose stop caddy backend
+docker compose run --rm --no-deps backend admin setup admin
+docker compose up -d --no-build --wait --wait-timeout 180
+```
+
+Do not use `docker compose exec` for this fallback. The same offline-writer rule
+applies to password recovery. A forgotten administrator password is reset with
+the following one-shot command, which revokes all existing sessions and unused
+pairing codes:
 
 ```bash
 docker compose stop caddy backend
@@ -138,9 +171,34 @@ docker compose run --rm --no-deps backend admin reset-password admin
 docker compose up -d --no-build --wait --wait-timeout 180
 ```
 
-Use the authenticated UI to set the RouterOS password. Do not add
-`ROUTER_PASSWORD` to `.env`; the backend must encrypt it with the mounted master
-key before storing it.
+Use the WebUI to set the RouterOS password. Do not add `ROUTER_PASSWORD` to
+`.env`; the backend must encrypt it with the mounted master key before storing
+it.
+
+### Configuration ownership and compatibility
+
+Keep deployment and trust-boundary settings outside the WebUI: domain and host
+port bindings, `PUBLIC_ORIGIN`, exact proxy and management CIDRs, the global
+plain-HTTP policy, master-key/database/backup paths, service ports, logging,
+image versions, Compose networks, and container hardening. Changing these
+settings requires normal deployment review and, where applicable, container
+recreation.
+
+The first-run wizard owns the RouterOS endpoint and credentials, HTTPS/TLS
+compatibility choices, polling and probe intervals, raw and aggregate retention
+periods, and theme. Latency-quality thresholds and probe targets remain in the
+ordinary authenticated settings pages rather than the first-run wizard.
+
+The backend continues to accept the legacy RouterOS, polling, probe, and
+retention environment variables for upgrades and automation. Effective
+precedence is SQLite override, then environment fallback, then built-in default.
+An upgrade does not copy environment fallbacks into SQLite automatically; the
+wizard or settings page creates an override only when an administrator saves it.
+
+OIDC configuration is intentionally not migrated to the WebUI. Its issuer,
+client identifier, secret and CA files, scopes, and group mapping are evaluated
+as deployment-time security policy and continue to use the Compose overlays and
+environment settings documented below.
 
 ## OpenID Connect operations
 

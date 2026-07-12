@@ -37,9 +37,9 @@ ROUTERVIEW_CADDY_IMAGE=ghcr.io/undefftr/routerview-caddy:0.2.1
 docker compose config --quiet
 docker compose config --images
 docker compose pull
-docker compose run --rm --no-deps backend admin setup admin
 docker compose up -d --no-build --wait --wait-timeout 180
 docker compose ps
+docker compose exec backend routerview-backend admin setup-token
 ```
 
 The GHCR packages are public and do not require `docker login`. Keep backend and
@@ -51,8 +51,17 @@ then uses the images selected by the explicit pull or build step.
 
 The backend has no published port. Do not add one, and do not expose Caddy to
 the public Internet. Trust Caddy's local root certificate on each client before
-entering credentials. Initial administrator setup, CA installation, backup,
-migration, restore, key rotation, and rollback procedures are documented in
+entering credentials. The final command prints a 15-minute one-time token. Open
+`https://<ROUTERVIEW_DOMAIN>/setup-required`, create the local administrator,
+and complete the three-step wizard for the RouterOS connection, collection and
+retention intervals, and theme. RouterView signs in the new administrator and
+opens the Dashboard when the wizard is saved.
+
+Issuing another token invalidates the previous one, and successful setup
+consumes it. Keep the token out of command arguments, environment variables,
+URLs, logs, and chat history; enter it only in the setup form. Initial
+administrator fallback, CA installation, backup, migration, restore, key
+rotation, and rollback procedures are documented in
 [Operations](docs/operations.md).
 
 The Compose topology pins Caddy to a private address and trusts only that `/32`
@@ -116,7 +125,6 @@ openssl rand -out secrets/routerview-dev-master-key 32
 chmod 0600 secrets/routerview-dev-master-key
 export ROUTERVIEW_MASTER_KEY_FILE="$PWD/secrets/routerview-dev-master-key"
 export PUBLIC_ORIGIN=http://localhost:5173
-cargo run --package routerview-backend -- admin setup admin
 cargo run --package routerview-backend
 
 # Terminal 2
@@ -125,14 +133,20 @@ corepack enable
 corepack prepare pnpm@10.24.0 --activate
 pnpm install --frozen-lockfile
 pnpm dev
+
+# Terminal 3, after the backend is running
+cargo run --package routerview-backend -- admin setup-token
 ```
 
 The backend binds port 3001 on all interfaces; keep that port firewalled from
 untrusted networks. Vite listens on `http://localhost:5173` and proxies API and
 WebSocket requests to the backend. `PUBLIC_ORIGIN` must exactly match the URL
 used in the browser for authenticated mutations and WebSocket connections. The
-administrator CLI is an offline writer: stop the backend before using
-`admin reset-password` against the same database.
+setup-token command contacts the running daemon's loopback control endpoint and
+does not open SQLite directly. Enter its output at
+`http://localhost:5173/setup-required`, then complete the initialization wizard.
+The other administrator CLI commands are offline writers: stop the backend
+before using `admin setup` or `admin reset-password` against the same database.
 
 ## Verification
 
