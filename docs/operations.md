@@ -65,12 +65,12 @@ Compose model with older containers is unsupported.
 
 ### Published GHCR images
 
-The v0.2.0 images are public and support `linux/amd64` and `linux/arm64`. Set
+The v0.2.1 images are public and support `linux/amd64` and `linux/arm64`. Set
 both image variables in `.env` to the same exact version:
 
 ```dotenv
-ROUTERVIEW_BACKEND_IMAGE=ghcr.io/undefftr/routerview-backend:0.2.0
-ROUTERVIEW_CADDY_IMAGE=ghcr.io/undefftr/routerview-caddy:0.2.0
+ROUTERVIEW_BACKEND_IMAGE=ghcr.io/undefftr/routerview-backend:0.2.1
+ROUTERVIEW_CADDY_IMAGE=ghcr.io/undefftr/routerview-caddy:0.2.1
 ```
 
 Validate the resolved image names and pull them before running any one-shot

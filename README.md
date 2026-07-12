@@ -13,10 +13,10 @@ CA, serves the frontend, and proxies `/api/*` and `/ws` to the backend.
 Prerequisites: Docker Engine with Compose v2, a local DNS record for the chosen
 name, and a host that can reach the router management network.
 
-Use the Compose file from the same release as both images. For v0.2.0:
+Use the Compose file from the same release as both images. For v0.2.1:
 
 ```bash
-git clone --depth 1 --branch v0.2.0 \
+git clone --depth 1 --branch v0.2.1 \
   https://github.com/unDefFtr/RouterView.git routerview
 cd routerview
 cp .env.compose.example .env
@@ -29,8 +29,8 @@ Edit `.env`, especially `ROUTERVIEW_DOMAIN` and `ROUTER_MANAGEMENT_CIDRS`, and
 set both published images to the same exact version:
 
 ```dotenv
-ROUTERVIEW_BACKEND_IMAGE=ghcr.io/undefftr/routerview-backend:0.2.0
-ROUTERVIEW_CADDY_IMAGE=ghcr.io/undefftr/routerview-caddy:0.2.0
+ROUTERVIEW_BACKEND_IMAGE=ghcr.io/undefftr/routerview-backend:0.2.1
+ROUTERVIEW_CADDY_IMAGE=ghcr.io/undefftr/routerview-caddy:0.2.1
 ```
 
 ```bash
