@@ -12,6 +12,7 @@ import {
   fetchOuiEntries,
   fetchSessions,
   fetchTrafficHistory,
+  setupAdmin,
   updateConfig,
   updateDeviceOverride,
 } from './index';
@@ -28,6 +29,7 @@ const configFixture = (revision: number, legacy = false) => ({
   }),
   password_set: true,
   accept_invalid_certs: false,
+  allow_insecure_router_http: false,
   poll_interval_secs: 5,
   probe_interval_secs: 60,
   db_raw_retention_days: 7,
@@ -206,6 +208,40 @@ describe('central API client', () => {
 });
 
 describe('authentication schemas', () => {
+  it('creates the first administrator without broadcasting an invalid setup token as session expiry', async () => {
+    const user = {
+      username: 'admin',
+      display_name: 'Local administrator',
+      role: 'admin',
+      session_kind: 'standard',
+      auth_method: 'password',
+      provider_name: null,
+      capabilities: ['read', 'configure', 'manage_devices', 'manage_sessions'],
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(errorResponse(401, 'invalid_setup_token'))
+      .mockResolvedValueOnce(jsonResponse(user, 201));
+    vi.stubGlobal('fetch', fetchMock);
+    const listener = vi.fn();
+    window.addEventListener(API_UNAUTHORIZED_EVENT, listener);
+
+    await expect(setupAdmin('invalid', 'admin', 'correct-horse-battery'))
+      .rejects.toMatchObject({ status: 401, detail: { code: 'invalid_setup_token' } });
+    await expect(setupAdmin('a'.repeat(43), 'admin', 'correct-horse-battery'))
+      .resolves.toEqual(user);
+
+    expect(listener).not.toHaveBeenCalled();
+    const [url, options] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(url).toBe('/api/auth/setup');
+    expect(options.method).toBe('POST');
+    expect(JSON.parse(options.body as string)).toEqual({
+      token: 'a'.repeat(43),
+      username: 'admin',
+      password: 'correct-horse-battery',
+    });
+    window.removeEventListener(API_UNAUTHORIZED_EVENT, listener);
+  });
+
   it('parses the public OIDC status without exposing provider configuration', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({
       setup_required: false,

@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::backends::{RouterBackend, RouterConnectionConfig, RouterType};
+use crate::config_store::MergedConfig;
 use crate::error::{ApiJson, AppError};
 use crate::poller::engine::PollReadinessState;
 use crate::state::AppState;
@@ -67,36 +68,41 @@ pub async fn config_info(
     let wizard_completed = values
         .get("wizard_completed")
         .is_some_and(|value| value == "true");
-    let password_set = cfg.has_connection_config();
-    let password_hint = if password_set { "********" } else { "" };
     Ok((
         StatusCode::OK,
-        Json(json!({
-            "router_type": cfg.router_type,
-            "revision": cfg.revision,
-            "router_host": cfg.router_host,
-            "router_port": cfg.router_port,
-            "router_scheme": cfg.router_scheme,
-            "router_username": cfg.router_username,
-            "password_set": password_set,
-            "router_configured": password_set,
-            "routeros_host": cfg.router_host,
-            "routeros_port": cfg.router_port,
-            "routeros_scheme": cfg.router_scheme,
-            "routeros_username": cfg.router_username,
-            "routeros_password": password_hint,
-            "routeros_configured": password_set,
-            "accept_invalid_certs": cfg.accept_invalid_certs,
-            "poll_interval_secs": cfg.poll_interval_secs,
-            "probe_interval_secs": cfg.probe_interval_secs,
-            "db_raw_retention_days": cfg.db_raw_retention_days,
-            "db_total_retention_days": cfg.db_total_retention_days,
-            "latency_good_ms": cfg.latency_good_ms,
-            "latency_poor_ms": cfg.latency_poor_ms,
-            "theme": cfg.theme,
-            "wizard_completed": wizard_completed,
-        })),
+        Json(config_info_body(&cfg, wizard_completed)),
     ))
+}
+
+fn config_info_body(cfg: &MergedConfig, wizard_completed: bool) -> Value {
+    let password_set = cfg.has_connection_config();
+    let password_hint = if password_set { "********" } else { "" };
+    json!({
+        "router_type": cfg.router_type,
+        "revision": cfg.revision,
+        "router_host": cfg.router_host,
+        "router_port": cfg.router_port,
+        "router_scheme": cfg.router_scheme,
+        "router_username": cfg.router_username,
+        "password_set": password_set,
+        "router_configured": password_set,
+        "routeros_host": cfg.router_host,
+        "routeros_port": cfg.router_port,
+        "routeros_scheme": cfg.router_scheme,
+        "routeros_username": cfg.router_username,
+        "routeros_password": password_hint,
+        "routeros_configured": password_set,
+        "accept_invalid_certs": cfg.accept_invalid_certs,
+        "allow_insecure_router_http": cfg.allow_insecure_router_http,
+        "poll_interval_secs": cfg.poll_interval_secs,
+        "probe_interval_secs": cfg.probe_interval_secs,
+        "db_raw_retention_days": cfg.db_raw_retention_days,
+        "db_total_retention_days": cfg.db_total_retention_days,
+        "latency_good_ms": cfg.latency_good_ms,
+        "latency_poor_ms": cfg.latency_poor_ms,
+        "theme": cfg.theme,
+        "wizard_completed": wizard_completed,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -504,5 +510,37 @@ mod tests {
             "server_port": 1
         }));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn insecure_http_policy_is_exposed_but_cannot_be_updated() {
+        let cfg = MergedConfig {
+            revision: 3,
+            router_type: RouterType::RouterOs,
+            router_host: "192.168.88.1".into(),
+            router_port: 443,
+            router_scheme: "https".into(),
+            router_username: "admin".into(),
+            router_password: "secret".into(),
+            accept_invalid_certs: false,
+            poll_interval_secs: 3,
+            probe_interval_secs: 60,
+            server_port: 3001,
+            db_raw_retention_days: 7,
+            db_total_retention_days: 90,
+            theme: "system".into(),
+            latency_good_ms: 30,
+            latency_poor_ms: 100,
+            router_management_cidrs: vec!["192.168.88.0/24".parse().unwrap()],
+            allow_insecure_router_http: true,
+        };
+
+        let response = config_info_body(&cfg, false);
+        assert_eq!(response["allow_insecure_router_http"], true);
+        assert!(serde_json::from_value::<ConfigUpdateRequest>(json!({
+            "expected_revision": 3,
+            "allow_insecure_router_http": false
+        }))
+        .is_err());
     }
 }

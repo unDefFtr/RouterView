@@ -398,9 +398,12 @@ onUnmounted(() => {
                   :disabled="savingConnection"
                 >
                   <option value="https">HTTPS (推荐)</option>
-                  <option value="http">HTTP</option>
+                  <option value="http" :disabled="!config.allow_insecure_router_http">HTTP</option>
                 </select>
               </div>
+              <span v-if="!config.allow_insecure_router_http" class="field-hint">
+                部署策略已禁用明文 RouterOS HTTP。
+              </span>
             </div>
 
             <div class="field">

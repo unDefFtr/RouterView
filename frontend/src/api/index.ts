@@ -374,6 +374,18 @@ export async function login(username: string, password: string): Promise<AuthUse
   });
 }
 
+export async function setupAdmin(
+  token: string,
+  username: string,
+  password: string,
+): Promise<AuthUser> {
+  return apiRequest('/auth/setup', parseAuthUser, {
+    method: 'POST',
+    body: { token, username, password },
+    invalidateSessionOnUnauthorized: false,
+  });
+}
+
 export async function logout(): Promise<void> {
   return apiRequest('/auth/logout', parseVoid, { method: 'POST' });
 }
@@ -778,6 +790,7 @@ export interface FullConfig {
   password_set: boolean;
   router_configured: boolean;
   accept_invalid_certs: boolean;
+  allow_insecure_router_http: boolean;
   poll_interval_secs: number;
   probe_interval_secs: number;
   db_raw_retention_days: number;
@@ -844,6 +857,10 @@ function parseFullConfig(value: unknown): FullConfig {
       : asBoolean(record.password_set, 'response.password_set'),
     router_configured: readAlias(record, 'router_configured', 'routeros_configured', asBoolean),
     accept_invalid_certs: asBoolean(record.accept_invalid_certs, 'response.accept_invalid_certs'),
+    allow_insecure_router_http: asBoolean(
+      record.allow_insecure_router_http,
+      'response.allow_insecure_router_http',
+    ),
     poll_interval_secs: asInteger(record.poll_interval_secs, 'response.poll_interval_secs'),
     probe_interval_secs: asInteger(record.probe_interval_secs, 'response.probe_interval_secs'),
     db_raw_retention_days: asInteger(record.db_raw_retention_days, 'response.db_raw_retention_days'),

@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fs::OpenOptions,
     hash::Hash,
-    io::Write,
+    io::{Read, Write},
     net::{IpAddr, SocketAddr},
     path::Path as FsPath,
     sync::{Arc, Mutex},
@@ -57,6 +57,7 @@ const AUTH_FAILURE_CAPACITY: usize = 1_024;
 const AUTH_FAILURE_TTL: Duration = Duration::from_secs(15 * 60);
 const AUTH_BACKOFF_MAX_SECS: u64 = 60;
 const CLIENT_IP_HEADER: &str = "x-real-ip";
+const SETUP_TOKEN_FILE_MAX_BYTES: u64 = 128;
 
 /// Process-wide authentication work limits and source-aware timing state.
 pub struct AuthSecurity {
@@ -64,6 +65,7 @@ pub struct AuthSecurity {
     pairing_slots: Arc<Semaphore>,
     dummy_password_hash: String,
     login_failures: FailureLimiter<LoginFailureKey>,
+    setup_attempts: FailureLimiter<IpAddr>,
     pairing_attempts: FailureLimiter<PairingFailureKey>,
     admin_pairing_failures: FailureLimiter<AdminPairingFailureKey>,
     trusted_proxy_cidrs: Vec<IpNet>,
@@ -76,6 +78,7 @@ impl AuthSecurity {
             pairing_slots: Arc::new(Semaphore::new(PAIRING_CONCURRENCY)),
             dummy_password_hash: hash_password_sync(&random_token())?,
             login_failures: FailureLimiter::default(),
+            setup_attempts: FailureLimiter::default(),
             pairing_attempts: FailureLimiter::default(),
             admin_pairing_failures: FailureLimiter::default(),
             trusted_proxy_cidrs,
@@ -350,6 +353,13 @@ pub struct SetupRequest {
     token: String,
     username: String,
     password: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetupTokenResponse {
+    pub token: String,
+    pub expires_at: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -777,8 +787,48 @@ pub async fn pair(
 
 pub async fn setup(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(connection): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     ApiJson(body): ApiJson<SetupRequest>,
-) -> Result<StatusCode, AppError> {
+) -> Result<Response, AppError> {
+    validate_origin(&headers, &state.public_origin)?;
+    if state.traffic_db.admin()?.is_some() {
+        return Err(AppError::Conflict(
+            "initial setup has already been completed".into(),
+        ));
+    }
+    normalize_username(&body.username)?;
+    validate_password(&body.password)?;
+    let source = state.auth_security.client_ip(connection.ip(), &headers)?;
+    let attempt_started_at = Instant::now();
+    if let Some(retry_after_secs) = state
+        .auth_security
+        .setup_attempts
+        .retry_after(&source, attempt_started_at)
+    {
+        return Err(AppError::RateLimited { retry_after_secs });
+    }
+    state
+        .auth_security
+        .setup_attempts
+        .record_failure(source, attempt_started_at);
+
+    setup_inner(state, body, Some((source, attempt_started_at))).await
+}
+
+/// Compatibility handler for the original loopback-only setup endpoint.
+pub async fn setup_legacy(
+    State(state): State<Arc<AppState>>,
+    ApiJson(body): ApiJson<SetupRequest>,
+) -> Result<Response, AppError> {
+    setup_inner(state, body, None).await
+}
+
+async fn setup_inner(
+    state: Arc<AppState>,
+    body: SetupRequest,
+    successful_attempt: Option<(IpAddr, Instant)>,
+) -> Result<Response, AppError> {
     if state.traffic_db.admin()?.is_some() {
         return Err(AppError::Conflict(
             "initial setup has already been completed".into(),
@@ -786,38 +836,146 @@ pub async fn setup(
     }
     let username = normalize_username(&body.username)?;
     validate_password(&body.password)?;
-    let setup_token_hash = validate_setup_token(&state.traffic_db, &body.token, unix_time())?;
+    let setup_token_hash = match validate_setup_token(&state.traffic_db, &body.token, unix_time()) {
+        Ok(token_hash) => token_hash,
+        Err(AppError::Unauthorized) if state.traffic_db.admin()?.is_some() => {
+            return Err(AppError::Conflict(
+                "initial setup has already been completed".into(),
+            ));
+        }
+        Err(error) => return Err(error),
+    };
     let permit = state.auth_security.acquire_argon2().await?;
     let password_hash = hash_password(body.password, permit).await?;
-    let consumed = state.traffic_db.consume_setup_and_create_admin(
-        &setup_token_hash,
-        unix_time(),
-        &username,
-        &password_hash,
-    )?;
+    let (session, token, csrf) =
+        new_session(&username, "admin", "standard", None, STANDARD_ABSOLUTE_SECS);
+    let mut response = session_response(&session, &token, &csrf)?;
+    *response.status_mut() = StatusCode::CREATED;
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    let consumed = {
+        let _guard = state
+            .setup_token_lock
+            .lock()
+            .map_err(|_| AppError::Internal("setup token lock is unavailable".into()))?;
+        let consumed = state
+            .traffic_db
+            .consume_setup_and_create_admin_and_session(
+                &setup_token_hash,
+                unix_time(),
+                &username,
+                &password_hash,
+                &session,
+            )?;
+        if consumed {
+            if let Err(error) =
+                remove_setup_token_file_if_matches(&state.setup_token_path, &setup_token_hash)
+            {
+                tracing::error!(%error, "administrator created but setup token cleanup failed");
+            }
+        }
+        consumed
+    };
     if !consumed {
-        return Err(AppError::Unauthorized);
+        return if state.traffic_db.admin()?.is_some() {
+            Err(AppError::Conflict(
+                "initial setup has already been completed".into(),
+            ))
+        } else {
+            Err(AppError::Unauthorized)
+        };
     }
-    if let Err(error) = remove_setup_token_file(&state.setup_token_path) {
-        tracing::error!(%error, "administrator created but setup token cleanup failed");
+    if let Some((source, attempt_started_at)) = successful_attempt {
+        state
+            .auth_security
+            .setup_attempts
+            .clear_if_latest(&source, attempt_started_at);
     }
-    Ok(StatusCode::CREATED)
+    state.setup_shutdown_tx.send_replace(true);
+    Ok(response)
 }
 
-pub fn issue_setup_token(db: &TrafficDb, path: &FsPath) -> Result<bool, AppError> {
-    if db.admin()?.is_some() {
-        remove_setup_token_file(path)?;
-        return Ok(false);
+pub async fn issue_setup_token_http(
+    State(state): State<Arc<AppState>>,
+) -> Result<(StatusCode, HeaderMap, Json<SetupTokenResponse>), AppError> {
+    let issued = {
+        let _guard = state
+            .setup_token_lock
+            .lock()
+            .map_err(|_| AppError::Internal("setup token lock is unavailable".into()))?;
+        issue_setup_token(&state.traffic_db, &state.setup_token_path)?
     }
+    .ok_or_else(|| AppError::Conflict("initial setup has already been completed".into()))?;
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok((StatusCode::CREATED, headers, Json(issued)))
+}
+
+pub fn issue_setup_token(
+    db: &TrafficDb,
+    path: &FsPath,
+) -> Result<Option<SetupTokenResponse>, AppError> {
     let token = random_token();
-    db.store_setup_token(&hash_token(&token), unix_time() + SETUP_SECS)?;
+    let token_hash = hash_token(&token);
+    let expires_at = unix_time() + SETUP_SECS;
+    if !db.store_setup_token_if_no_admin(&token_hash, expires_at)? {
+        remove_setup_token_file(path)?;
+        return Ok(None);
+    }
     if let Err(error) = write_setup_token_file(path, &token) {
-        if let Err(cleanup_error) = db.store_setup_token(&[], 0) {
+        if let Err(cleanup_error) = db.invalidate_setup_token_if_matches(&token_hash, unix_time()) {
             tracing::error!(%cleanup_error, "failed to invalidate setup token after file write failure");
         }
-        let _ = remove_setup_token_file(path);
+        let _ = remove_setup_token_file_if_matches(path, &token_hash);
         return Err(error);
     }
+    Ok(Some(SetupTokenResponse { token, expires_at }))
+}
+
+pub fn cleanup_expired_setup_token(state: &AppState, now: i64) -> Result<bool, AppError> {
+    let _guard = state
+        .setup_token_lock
+        .lock()
+        .map_err(|_| AppError::Internal("setup token lock is unavailable".into()))?;
+    cleanup_expired_setup_token_inner(&state.traffic_db, &state.setup_token_path, now)
+}
+
+pub fn cleanup_current_setup_token(state: &AppState, now: i64) -> Result<bool, AppError> {
+    let _guard = state
+        .setup_token_lock
+        .lock()
+        .map_err(|_| AppError::Internal("setup token lock is unavailable".into()))?;
+    cleanup_current_setup_token_inner(&state.traffic_db, &state.setup_token_path, now)
+}
+
+fn cleanup_current_setup_token_inner(
+    db: &TrafficDb,
+    path: &FsPath,
+    now: i64,
+) -> Result<bool, AppError> {
+    let Some(token_hash) = db.current_setup_token_hash()? else {
+        return Ok(false);
+    };
+    if !db.invalidate_setup_token_if_matches(&token_hash, now)? {
+        return Ok(false);
+    }
+    remove_setup_token_file_if_matches(path, &token_hash)?;
+    Ok(true)
+}
+
+fn cleanup_expired_setup_token_inner(
+    db: &TrafficDb,
+    path: &FsPath,
+    now: i64,
+) -> Result<bool, AppError> {
+    let Some(token_hash) = db.expired_setup_token_hash(now)? else {
+        return Ok(false);
+    };
+    if !db.invalidate_setup_token_if_matches(&token_hash, now)? {
+        return Ok(false);
+    }
+    remove_setup_token_file_if_matches(path, &token_hash)?;
     Ok(true)
 }
 
@@ -864,6 +1022,39 @@ pub fn remove_setup_token_file(path: &FsPath) -> Result<(), AppError> {
             "failed to remove setup token file: {error}"
         ))),
     }
+}
+
+fn remove_setup_token_file_if_matches(
+    path: &FsPath,
+    expected_hash: &[u8],
+) -> Result<bool, AppError> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(AppError::Internal(format!(
+                "failed to inspect setup token file: {error}"
+            )))
+        }
+    };
+    let mut token = Vec::with_capacity(64);
+    Read::by_ref(&mut file)
+        .take(SETUP_TOKEN_FILE_MAX_BYTES + 1)
+        .read_to_end(&mut token)
+        .map_err(|error| {
+            AppError::Internal(format!("failed to inspect setup token file: {error}"))
+        })?;
+    if token.len() as u64 > SETUP_TOKEN_FILE_MAX_BYTES {
+        return Ok(false);
+    }
+    let token = std::str::from_utf8(&token)
+        .map_err(|_| AppError::Internal("setup token file does not contain valid UTF-8".into()))?;
+    let token = token.trim_end_matches(['\r', '\n']);
+    if !constant_time_eq(&hash_token(token), expected_hash) {
+        return Ok(false);
+    }
+    remove_setup_token_file(path)?;
+    Ok(true)
 }
 
 pub fn create_admin_from_cli(
@@ -1410,6 +1601,7 @@ mod tests {
             pairing_slots: Arc::new(Semaphore::new(PAIRING_CONCURRENCY)),
             dummy_password_hash: String::new(),
             login_failures: FailureLimiter::default(),
+            setup_attempts: FailureLimiter::default(),
             pairing_attempts: FailureLimiter::default(),
             admin_pairing_failures: FailureLimiter::default(),
             trusted_proxy_cidrs: Vec::new(),
@@ -1476,6 +1668,32 @@ mod tests {
             ),
         );
         assert!(validate_csrf(&repeated_cookie, &expected_hash).is_err());
+    }
+
+    #[test]
+    fn setup_origin_must_match_exactly() {
+        let mut headers = HeaderMap::new();
+        assert!(validate_origin(&headers, "https://routerview.test").is_err());
+
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://routerview.test"),
+        );
+        assert!(validate_origin(&headers, "https://routerview.test").is_ok());
+        assert!(validate_origin(&headers, "https://routerview.test/").is_err());
+        assert!(validate_origin(&headers, "https://other.test").is_err());
+    }
+
+    #[test]
+    fn setup_backoff_is_source_specific() {
+        let limiter = FailureLimiter::default();
+        let now = Instant::now();
+        let first: IpAddr = "192.0.2.10".parse().unwrap();
+        let second: IpAddr = "192.0.2.11".parse().unwrap();
+
+        limiter.record_failure(first, now);
+        assert_eq!(limiter.retry_after(&first, now), Some(1));
+        assert_eq!(limiter.retry_after(&second, now), None);
     }
 
     #[test]
@@ -1889,16 +2107,129 @@ mod tests {
             validate_setup_token(&database, &token, now).unwrap(),
             token_hash
         );
-        assert!(database
-            .consume_setup_and_create_admin(&token_hash, now, "admin", "hash")
-            .unwrap());
+        let (session, _, _) =
+            new_session("admin", "admin", "standard", None, STANDARD_ABSOLUTE_SECS);
+        assert!(
+            database
+                .consume_setup_and_create_admin_and_session(
+                    &token_hash,
+                    now,
+                    "admin",
+                    "hash",
+                    &session,
+                )
+                .unwrap()
+        );
+        assert_eq!(database.admin().unwrap().unwrap().username, "admin");
+        assert_eq!(
+            database
+                .session_by_token_hash(&session.token_hash)
+                .unwrap()
+                .unwrap()
+                .id,
+            session.id
+        );
         assert!(matches!(
             validate_setup_token(&database, &token, now),
             Err(AppError::Unauthorized)
         ));
+        let (second_session, _, _) =
+            new_session("admin", "admin", "standard", None, STANDARD_ABSOLUTE_SECS);
         assert!(!database
-            .consume_setup_and_create_admin(&token_hash, now, "admin", "other-hash")
+            .consume_setup_and_create_admin_and_session(
+                &token_hash,
+                now,
+                "admin",
+                "other-hash",
+                &second_session,
+            )
             .unwrap());
+        assert!(database
+            .session_by_token_hash(&second_session.token_hash)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn setup_token_rotation_invalidates_old_token_and_preserves_new_file() {
+        let directory = std::env::temp_dir().join(format!(
+            "routerview-setup-token-rotation-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("setup-token");
+        let database = TrafficDb::open(FsPath::new(":memory:")).unwrap();
+        let first = issue_setup_token(&database, &path).unwrap().unwrap();
+        let first_hash = hash_token(&first.token);
+        let second = issue_setup_token(&database, &path).unwrap().unwrap();
+        let now = unix_time();
+
+        assert!(matches!(
+            validate_setup_token(&database, &first.token, now),
+            Err(AppError::Unauthorized)
+        ));
+        assert!(validate_setup_token(&database, &second.token, now).is_ok());
+        assert!(!database
+            .invalidate_setup_token_if_matches(&first_hash, now)
+            .unwrap());
+        assert!(!remove_setup_token_file_if_matches(&path, &first_hash).unwrap());
+        let published = std::fs::read_to_string(&path).unwrap();
+        assert!(constant_time_eq(
+            &hash_token(published.trim_end()),
+            &hash_token(&second.token),
+        ));
+
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn expired_setup_token_cleanup_is_hash_conditional() {
+        let directory = std::env::temp_dir().join(format!(
+            "routerview-setup-token-expiry-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("setup-token");
+        let database = TrafficDb::open(FsPath::new(":memory:")).unwrap();
+        let issued = issue_setup_token(&database, &path).unwrap().unwrap();
+        let token_hash = hash_token(&issued.token);
+        let now = unix_time();
+        database.store_setup_token(&token_hash, now).unwrap();
+
+        assert!(cleanup_expired_setup_token_inner(&database, &path, now).unwrap());
+        assert!(!path.exists());
+        assert!(matches!(
+            validate_setup_token(&database, &issued.token, now),
+            Err(AppError::Unauthorized)
+        ));
+        assert!(!cleanup_expired_setup_token_inner(&database, &path, now).unwrap());
+
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn shutdown_cleanup_invalidates_current_setup_token() {
+        let directory = std::env::temp_dir().join(format!(
+            "routerview-setup-token-shutdown-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("setup-token");
+        let database = TrafficDb::open(FsPath::new(":memory:")).unwrap();
+        let issued = issue_setup_token(&database, &path).unwrap().unwrap();
+        let now = unix_time();
+
+        assert!(cleanup_current_setup_token_inner(&database, &path, now).unwrap());
+        assert!(!path.exists());
+        assert!(matches!(
+            validate_setup_token(&database, &issued.token, now),
+            Err(AppError::Unauthorized)
+        ));
+
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(unix)]

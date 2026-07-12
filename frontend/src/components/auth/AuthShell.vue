@@ -33,10 +33,15 @@ defineProps<{
 <style scoped>
 .auth-page {
   width: 100%;
-  min-height: 100dvh;
+  height: 100dvh;
+  min-height: 0;
   display: grid;
-  place-items: center;
+  align-items: safe center;
+  justify-items: center;
+  overflow-x: hidden;
   overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
   padding: max(24px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
   background: var(--color-bg-primary);
 }

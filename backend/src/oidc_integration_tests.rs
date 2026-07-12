@@ -550,6 +550,7 @@ async fn test_app_state(oidc: Arc<OidcManager>) -> Arc<AppState> {
     )
     .await;
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (setup_shutdown_tx, _) = tokio::sync::watch::channel(false);
 
     Arc::new(AppState {
         config,
@@ -569,6 +570,8 @@ async fn test_app_state(oidc: Arc<OidcManager>) -> Arc<AppState> {
         auth_security: Arc::new(AuthSecurity::new(Vec::new()).unwrap()),
         oidc,
         setup_token_path: PathBuf::from("/tmp/routerview-unused-setup-token"),
+        setup_token_lock: std::sync::Mutex::new(()),
+        setup_shutdown_tx,
         poller_control: poll_engine.control(),
         shutdown_tx,
         traffic_query_limit: Arc::new(tokio::sync::Semaphore::new(2)),

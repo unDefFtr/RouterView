@@ -543,6 +543,7 @@ impl TrafficDb {
         tx.commit()
     }
 
+    #[cfg(test)]
     pub fn store_setup_token(
         &self,
         token_hash: &[u8],
@@ -558,6 +559,31 @@ impl TrafficDb {
             params![token_hash, expires_at],
         )?;
         Ok(())
+    }
+
+    pub fn store_setup_token_if_no_admin(
+        &self,
+        token_hash: &[u8],
+        expires_at: i64,
+    ) -> Result<bool, rusqlite::Error> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let admin_exists: bool =
+            tx.query_row("SELECT EXISTS(SELECT 1 FROM admins)", [], |row| row.get(0))?;
+        if admin_exists {
+            tx.rollback()?;
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO setup_tokens(id, token_hash, expires_at, used_at)
+             VALUES (1, ?1, ?2, NULL)",
+            params![token_hash, expires_at],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn setup_token_is_valid(
@@ -580,18 +606,70 @@ impl TrafficDb {
         )
     }
 
-    pub fn consume_setup_and_create_admin(
+    pub fn expired_setup_token_hash(&self, now: i64) -> Result<Option<Vec<u8>>, rusqlite::Error> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        conn.query_row(
+            "SELECT token_hash FROM setup_tokens
+             WHERE id = 1 AND used_at IS NULL AND expires_at <= ?1",
+            params![now],
+            |row| row.get(0),
+        )
+        .optional()
+    }
+
+    pub fn current_setup_token_hash(&self) -> Result<Option<Vec<u8>>, rusqlite::Error> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        conn.query_row(
+            "SELECT token_hash FROM setup_tokens WHERE id = 1 AND used_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+    }
+
+    pub fn invalidate_setup_token_if_matches(
+        &self,
+        token_hash: &[u8],
+        now: i64,
+    ) -> Result<bool, rusqlite::Error> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        Ok(conn.execute(
+            "UPDATE setup_tokens SET token_hash = X'', expires_at = 0, used_at = ?1
+             WHERE id = 1 AND token_hash = ?2 AND used_at IS NULL",
+            params![now, token_hash],
+        )? == 1)
+    }
+
+    pub fn consume_setup_and_create_admin_and_session(
         &self,
         token_hash: &[u8],
         now: i64,
         username: &str,
         password_hash: &str,
+        session: &AuthSessionRecord,
     ) -> Result<bool, rusqlite::Error> {
+        if session.username != username
+            || session.role != "admin"
+            || session.kind != "standard"
+            || session.auth_method != "password"
+        {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+
         let mut conn = self
             .conn
             .lock()
             .map_err(|_| rusqlite::Error::InvalidQuery)?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = tx.execute(
             "UPDATE setup_tokens SET used_at = ?1
              WHERE id = 1 AND token_hash = ?2 AND used_at IS NULL AND expires_at > ?1
@@ -606,6 +684,7 @@ impl TrafficDb {
             "INSERT INTO admins(id, username, password_hash) VALUES (1, ?1, ?2)",
             params![username, password_hash],
         )?;
+        insert_session_inner(&tx, session)?;
         tx.commit()?;
         Ok(true)
     }
@@ -1256,6 +1335,92 @@ mod security_tests {
             role: role.into(),
             label: format!("{role} display"),
             expires_at,
+        }
+    }
+
+    #[test]
+    fn concurrent_setup_creates_exactly_one_admin_session() {
+        let db = std::sync::Arc::new(memory_db());
+        let token_hash = vec![9; 32];
+        db.store_setup_token(&token_hash, 1_000).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for index in 0..2 {
+            let db = db.clone();
+            let token_hash = token_hash.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                let session =
+                    standard_session(&format!("setup-session-{index}"), 20 + index, 1_000);
+                barrier.wait();
+                db.consume_setup_and_create_admin_and_session(
+                    &token_hash,
+                    100,
+                    "admin",
+                    "password-hash",
+                    &session,
+                )
+                .unwrap()
+            }));
+        }
+
+        let successes = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|success| *success)
+            .count();
+        assert_eq!(successes, 1);
+        assert_eq!(db.admin().unwrap().unwrap().username, "admin");
+        assert_eq!(db.list_sessions().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn setup_token_issue_and_admin_creation_are_serialized() {
+        for iteration in 0..16 {
+            let db = std::sync::Arc::new(memory_db());
+            let original_hash = vec![9; 32];
+            let replacement_hash = vec![10; 32];
+            db.store_setup_token(&original_hash, 1_000).unwrap();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+            let issue_db = db.clone();
+            let issue_barrier = barrier.clone();
+            let issue_hash = replacement_hash.clone();
+            let issuer = std::thread::spawn(move || {
+                issue_barrier.wait();
+                issue_db
+                    .store_setup_token_if_no_admin(&issue_hash, 1_000)
+                    .unwrap()
+            });
+
+            let setup_db = db.clone();
+            let setup_barrier = barrier.clone();
+            let setup_hash = original_hash.clone();
+            let setup = std::thread::spawn(move || {
+                let session = standard_session(
+                    &format!("setup-issue-race-{iteration}"),
+                    40 + iteration,
+                    1_000,
+                );
+                setup_barrier.wait();
+                setup_db
+                    .consume_setup_and_create_admin_and_session(
+                        &setup_hash,
+                        100,
+                        "admin",
+                        "password-hash",
+                        &session,
+                    )
+                    .unwrap()
+            });
+
+            let issued = issuer.join().unwrap();
+            let configured = setup.join().unwrap();
+            assert_ne!(issued, configured);
+            assert!(
+                !(db.admin().unwrap().is_some()
+                    && db.current_setup_token_hash().unwrap().is_some())
+            );
         }
     }
 

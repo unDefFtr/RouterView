@@ -44,10 +44,6 @@ http://{$ROUTERVIEW_DOMAIN:routerview.local} {
 	header @immutable Cache-Control "public, max-age=31536000, immutable"
 
 	route {
-		handle /api/auth/setup {
-			respond 404
-		}
-
 		handle /api/* {
 			reverse_proxy backend:3001 {
 				header_up X-Real-IP {http.request.remote.host}

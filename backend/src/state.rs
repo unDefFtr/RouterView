@@ -5,7 +5,7 @@ use crate::oidc::OidcManager;
 use crate::poller::engine::PollEngineControl;
 use crate::secrets::SecretCipher;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, watch, RwLock, Semaphore};
 
 use crate::ws::limits::WsConnectionLimiter;
@@ -40,6 +40,10 @@ pub struct AppState {
     pub oidc: Arc<OidcManager>,
     /// Location of the one-time setup token delivered through the filesystem.
     pub setup_token_path: PathBuf,
+    /// Serializes setup token publication and expiry cleanup.
+    pub setup_token_lock: Mutex<()>,
+    /// Stops the loopback setup listener after initial setup succeeds.
+    pub setup_shutdown_tx: watch::Sender<bool>,
     /// Poller readiness and shutdown control owned by the process supervisor.
     pub poller_control: PollEngineControl,
     /// Process-wide shutdown notification used by upgraded WebSocket sessions.

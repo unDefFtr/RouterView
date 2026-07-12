@@ -25,6 +25,7 @@ vi.mock('@/api', () => ({
   login: mocks.login,
   logout: mocks.logout,
   pair: mocks.pair,
+  setupAdmin: vi.fn(),
 }));
 
 function mountView() {

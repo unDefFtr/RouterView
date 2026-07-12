@@ -44,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if key_cli::run_if_requested()? {
         return Ok(());
     }
-    if run_admin_cli()? {
+    if run_admin_cli().await? {
         return Ok(());
     }
     if run_database_cli()? {
@@ -113,6 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await;
     let poller_control = poll_engine.control();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (setup_shutdown_tx, setup_shutdown_rx) = watch::channel(false);
 
     oidc.spawn_discovery(shutdown_tx.subscribe());
 
@@ -137,6 +138,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?),
         oidc,
         setup_token_path: std::path::PathBuf::from(&env_config.setup_token_file),
+        setup_token_lock: std::sync::Mutex::new(()),
+        setup_shutdown_tx: setup_shutdown_tx.clone(),
         poller_control: poller_control.clone(),
         shutdown_tx: shutdown_tx.clone(),
         traffic_query_limit: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -156,13 +159,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if app_state.traffic_db.admin()?.is_none() {
         let setup_addr = format!("127.0.0.1:{}", env_config.setup_port);
         let setup_listener = tokio::net::TcpListener::bind(&setup_addr).await?;
-        if auth::issue_setup_token(&app_state.traffic_db, &app_state.setup_token_path)? {
+        if auth::issue_setup_token(&app_state.traffic_db, &app_state.setup_token_path)?.is_some() {
             let setup_app = router::create_setup_router(app_state.clone());
             tracing::warn!(
                 "Initial setup required. Loopback setup token was written to {} (valid 15 minutes)",
                 app_state.setup_token_path.display()
             );
-            tracing::info!("Setup listener available at http://{setup_addr}/api/auth/setup");
+            tracing::info!(
+                "Setup token control available at http://{setup_addr}/api/auth/setup-token"
+            );
             setup_server = Some((setup_listener, setup_app));
         }
     } else {
@@ -186,7 +191,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let (setup_shutdown_tx, setup_shutdown_rx) = watch::channel(false);
     let mut setup_handle = setup_server.map(|(listener, setup_app)| {
         let process_shutdown = shutdown_tx.subscribe();
         let setup_shutdown = setup_shutdown_rx;
@@ -200,31 +204,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let mut setup_token_handle = if setup_handle.is_some() {
-        let setup_token_path = app_state.setup_token_path.clone();
-        let process_shutdown = shutdown_tx.subscribe();
-        let setup_shutdown = setup_shutdown_tx.clone();
+        let setup_state = app_state.clone();
+        let mut process_shutdown = shutdown_tx.subscribe();
+        let mut setup_shutdown = setup_shutdown_tx.subscribe();
         Some(tokio::spawn(async move {
-            let expires_at =
-                tokio::time::Instant::now() + Duration::from_secs(auth::SETUP_TOKEN_TTL_SECS);
-            let mut process_shutdown = process_shutdown;
+            let mut cleanup_interval = tokio::time::interval(Duration::from_secs(5));
+            cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                if !setup_token_path.exists() || *process_shutdown.borrow() {
+                if *process_shutdown.borrow() || *setup_shutdown.borrow() {
                     break;
                 }
                 tokio::select! {
-                    _ = tokio::time::sleep_until(expires_at) => break,
+                    _ = cleanup_interval.tick() => {
+                        if let Err(error) = auth::cleanup_expired_setup_token(
+                            &setup_state,
+                            chrono::Utc::now().timestamp(),
+                        ) {
+                            tracing::error!(%error, "failed to expire setup token");
+                        }
+                    }
                     changed = process_shutdown.changed() => {
                         if changed.is_err() || *process_shutdown.borrow() {
                             break;
                         }
                     }
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    changed = setup_shutdown.changed() => {
+                        if changed.is_err() || *setup_shutdown.borrow() {
+                            break;
+                        }
+                    }
                 }
             }
-            if let Err(error) = auth::remove_setup_token_file(&setup_token_path) {
-                tracing::error!("failed to remove setup token file: {error}");
-            }
-            setup_shutdown.send_replace(true);
         }))
     } else {
         None
@@ -378,6 +388,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    if let Err(error) =
+        auth::cleanup_current_setup_token(&app_state, chrono::Utc::now().timestamp())
+    {
+        tracing::error!(%error, "failed to clean up setup token during shutdown");
+    }
 
     server_result?;
     if let Some(error) = supervision_error {
@@ -481,15 +496,55 @@ async fn shutdown_signal() {
     }
 }
 
-fn run_admin_cli() -> Result<bool, Box<dyn std::error::Error>> {
+async fn run_admin_cli() -> Result<bool, Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) != Some("admin") {
         return Ok(false);
     }
 
     let command = args.get(2).map(String::as_str).unwrap_or("");
+    if command == "setup-token" {
+        if args.get(3).is_some() {
+            return Err("usage: routerview-backend admin setup-token".into());
+        }
+        let setup_port = setup_token_port_from_environment()?;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|_| "failed to initialize the setup token client")?;
+        let response = client
+            .post(format!(
+                "http://127.0.0.1:{setup_port}/api/auth/setup-token"
+            ))
+            .send()
+            .await
+            .map_err(|_| "failed to contact the running RouterView setup listener")?;
+        if response.status() != reqwest::StatusCode::CREATED {
+            return Err(format!(
+                "setup token request failed with HTTP status {}",
+                response.status()
+            )
+            .into());
+        }
+        let issued = response
+            .json::<auth::SetupTokenResponse>()
+            .await
+            .map_err(|_| "setup listener returned an invalid response")?;
+        let now = chrono::Utc::now().timestamp();
+        if !setup_token_response_is_valid(&issued, now) {
+            return Err("setup listener returned an invalid response".into());
+        }
+        println!("{}", issued.token);
+        return Ok(true);
+    }
     if !matches!(command, "setup" | "reset-password") {
-        return Err("usage: routerview-backend admin <setup|reset-password> [username]".into());
+        return Err(
+            "usage: routerview-backend admin <setup|reset-password> [username]\n       routerview-backend admin setup-token"
+                .into(),
+        );
     }
     let username = args.get(3).map(String::as_str).unwrap_or("admin");
     let password = rpassword::prompt_password("Administrator password: ")?;
@@ -512,6 +567,36 @@ fn run_admin_cli() -> Result<bool, Box<dyn std::error::Error>> {
     }
     println!("Administrator credentials updated successfully.");
     Ok(true)
+}
+
+fn setup_token_port_from_environment() -> Result<u16, Box<dyn std::error::Error>> {
+    setup_token_port_from_environment_with(
+        || {
+            let _ = dotenvy::dotenv();
+        },
+        |name| std::env::var(name),
+    )
+}
+
+fn setup_token_port_from_environment_with(
+    load_dotenv: impl FnOnce(),
+    read_env: impl FnOnce(&str) -> Result<String, std::env::VarError>,
+) -> Result<u16, Box<dyn std::error::Error>> {
+    load_dotenv();
+    read_env("SETUP_PORT")
+        .unwrap_or_else(|_| "3002".to_string())
+        .parse::<u16>()
+        .map_err(|_| "SETUP_PORT must be a valid TCP port".into())
+}
+
+fn setup_token_response_is_valid(issued: &auth::SetupTokenResponse, now: i64) -> bool {
+    issued.token.len() == 43
+        && issued
+            .token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        && issued.expires_at > now
+        && issued.expires_at <= now + auth::SETUP_TOKEN_TTL_SECS as i64 + 30
 }
 
 fn run_database_cli() -> Result<bool, Box<dyn std::error::Error>> {
@@ -673,6 +758,48 @@ fn env_or(key: &str, default: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_token_cli_loads_dotenv_before_reading_setup_port() {
+        let dotenv_loaded = std::cell::Cell::new(false);
+        let port = setup_token_port_from_environment_with(
+            || dotenv_loaded.set(true),
+            |name| {
+                assert_eq!(name, "SETUP_PORT");
+                assert!(dotenv_loaded.get());
+                Ok("4317".to_string())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(port, 4317);
+    }
+
+    #[test]
+    fn setup_token_cli_validates_structured_response_before_printing() {
+        let now = 1_000;
+        let valid = auth::SetupTokenResponse {
+            token: "A".repeat(43),
+            expires_at: now + auth::SETUP_TOKEN_TTL_SECS as i64,
+        };
+        assert!(setup_token_response_is_valid(&valid, now));
+
+        let malformed = auth::SetupTokenResponse {
+            token: format!("{}!", "A".repeat(42)),
+            expires_at: valid.expires_at,
+        };
+        assert!(!setup_token_response_is_valid(&malformed, now));
+        let stale = auth::SetupTokenResponse {
+            token: "B".repeat(43),
+            expires_at: now,
+        };
+        assert!(!setup_token_response_is_valid(&stale, now));
+        let implausible = auth::SetupTokenResponse {
+            token: "C".repeat(43),
+            expires_at: now + auth::SETUP_TOKEN_TTL_SECS as i64 + 31,
+        };
+        assert!(!setup_token_response_is_valid(&implausible, now));
+    }
 
     #[tokio::test]
     async fn setup_server_failure_and_panic_request_process_shutdown() {

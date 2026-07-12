@@ -42,6 +42,7 @@ vi.mock('@/api', () => ({
   login: vi.fn(),
   logout: vi.fn(),
   pair: vi.fn(),
+  setupAdmin: vi.fn(),
 }));
 
 describe('App authenticated lifecycle', () => {

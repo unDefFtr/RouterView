@@ -6,23 +6,39 @@ import { useAuthStore } from '@/stores/auth';
 
 const api = vi.hoisted(() => ({
   fetchFullConfig: vi.fn(), fetchAuthStatus: vi.fn(), fetchMe: vi.fn(),
-  login: vi.fn(), logout: vi.fn(), pair: vi.fn(),
+  login: vi.fn(), logout: vi.fn(), pair: vi.fn(), setupAdmin: vi.fn(),
 }));
 
 vi.mock('@/api', () => ({ API_UNAUTHORIZED_EVENT: 'routerview:unauthorized', ...api }));
 
-function route(name: string, meta: Record<string, unknown> = {}): RouteLocationNormalized {
-  return { name, meta, fullPath: `/${name}` } as unknown as RouteLocationNormalized;
+function route(
+  name: string,
+  meta: Record<string, unknown> = {},
+  query: Record<string, unknown> = {},
+): RouteLocationNormalized {
+  return { name, meta, query, fullPath: `/${name}` } as unknown as RouteLocationNormalized;
 }
 
 beforeEach(() => setActivePinia(createPinia()));
 
 describe('authentication navigation guard', () => {
-  it('sends setup-required installations only to the setup instructions', async () => {
+  it('sends setup-required installations only to the setup form', async () => {
     const auth = useAuthStore();
     auth.state = 'setup_required';
     expect(await authNavigationGuard(route('dashboard', { requiresAuth: true })))
       .toEqual({ name: 'setup-required' });
+  });
+
+  it('does not let an authenticated installation return to the setup form', async () => {
+    const auth = useAuthStore();
+    auth.state = 'authenticated';
+    auth.user = {
+      username: 'admin', display_name: 'Local administrator', role: 'admin',
+      session_kind: 'standard', auth_method: 'password', provider_name: null,
+      capabilities: ['read', 'configure', 'manage_devices', 'manage_sessions'],
+    };
+
+    expect(await authNavigationGuard(route('setup-required'))).toEqual({ name: 'dashboard' });
   });
 
   it('preserves the protected destination for anonymous users', async () => {
@@ -52,5 +68,21 @@ describe('authentication navigation guard', () => {
     expect(await authNavigationGuard(route('oidc-complete', { oidcCompletion: true }))).toBe(true);
     expect(api.fetchAuthStatus).not.toHaveBeenCalled();
     expect(auth.state).toBe('unknown');
+  });
+
+  it('checks setup state before showing an OIDC callback error', async () => {
+    api.fetchAuthStatus.mockResolvedValue({
+      setup_required: true,
+      authenticated: false,
+      oidc: null,
+    });
+
+    expect(await authNavigationGuard(route(
+      'oidc-complete',
+      { oidcCompletion: true },
+      { error: 'access_denied' },
+    ))).toEqual({ name: 'setup-required' });
+    expect(api.fetchAuthStatus).toHaveBeenCalledOnce();
+    expect(api.fetchMe).not.toHaveBeenCalled();
   });
 });

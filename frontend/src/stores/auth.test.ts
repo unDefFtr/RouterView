@@ -9,6 +9,7 @@ const api = vi.hoisted(() => ({
   login: vi.fn(),
   logout: vi.fn(),
   pair: vi.fn(),
+  setupAdmin: vi.fn(),
 }));
 
 vi.mock('@/api', () => ({
@@ -94,6 +95,32 @@ describe('auth store', () => {
     await store.pair(' pairing-code ');
     expect(api.pair).toHaveBeenCalledWith('pairing-code');
     expect(store.user?.role).toBe('viewer');
+  });
+
+  it('adopts the setup response and normalizes token and username inputs', async () => {
+    api.setupAdmin.mockResolvedValue(admin);
+
+    await store.setup(`  ${'a'.repeat(43)}  `, ' Admin ', 'correct-horse-battery');
+
+    expect(api.setupAdmin).toHaveBeenCalledWith(
+      'a'.repeat(43),
+      'admin',
+      'correct-horse-battery',
+    );
+    expect(store.user).toEqual(admin);
+    expect(store.authenticated).toBe(true);
+  });
+
+  it('does not Unicode case-fold setup usernames', async () => {
+    api.setupAdmin.mockResolvedValue(admin);
+
+    await store.setup('a'.repeat(43), ' Kaa ', 'correct-horse-battery');
+
+    expect(api.setupAdmin).toHaveBeenCalledWith(
+      'a'.repeat(43),
+      'Kaa',
+      'correct-horse-battery',
+    );
   });
 
   it('invalidates an active session when the central client reports a 401', () => {

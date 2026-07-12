@@ -25,6 +25,30 @@ const apiMocks = vi.hoisted(() => {
 
 vi.mock('@/api', () => apiMocks);
 
+function configFixture(overrides: Record<string, unknown> = {}) {
+  return {
+    router_type: 'routeros',
+    revision: 4,
+    router_host: '192.168.88.1',
+    router_port: 443,
+    router_scheme: 'https',
+    router_username: 'admin',
+    password_set: true,
+    router_configured: true,
+    accept_invalid_certs: false,
+    allow_insecure_router_http: false,
+    poll_interval_secs: 5,
+    probe_interval_secs: 60,
+    db_raw_retention_days: 7,
+    db_total_retention_days: 90,
+    latency_good_ms: 30,
+    latency_poor_ms: 100,
+    theme: 'system',
+    wizard_completed: true,
+    ...overrides,
+  };
+}
+
 describe('SettingsView', () => {
   beforeEach(() => {
     setActivePinia(createPinia());
@@ -33,25 +57,7 @@ describe('SettingsView', () => {
     apiMocks.updateConfig.mockReset();
     apiMocks.testConnection.mockReset();
     apiMocks.fetchHealth.mockResolvedValue({ status: 'ok', version: '0.2.0' });
-    apiMocks.fetchFullConfig.mockResolvedValue({
-      router_type: 'routeros',
-      revision: 4,
-      router_host: '192.168.88.1',
-      router_port: 443,
-      router_scheme: 'https',
-      router_username: 'admin',
-      password_set: true,
-      router_configured: true,
-      accept_invalid_certs: false,
-      poll_interval_secs: 5,
-      probe_interval_secs: 60,
-      db_raw_retention_days: 7,
-      db_total_retention_days: 90,
-      latency_good_ms: 30,
-      latency_poor_ms: 100,
-      theme: 'system',
-      wizard_completed: true,
-    });
+    apiMocks.fetchFullConfig.mockResolvedValue(configFixture());
   });
 
   afterEach(() => vi.useRealTimers());
@@ -80,6 +86,34 @@ describe('SettingsView', () => {
     await nextTick();
 
     expect(statuses[0].text()).toContain('已连接');
+  });
+
+  it('disables plain HTTP when deployment policy forbids it and enables it when allowed', async () => {
+    const wrapper = mount(SettingsView, {
+      global: {
+        plugins: [createPinia()],
+        stubs: { FeatherIcon: true, ProbeTargetEditor: true },
+      },
+    });
+    await flushPromises();
+
+    expect(wrapper.get('#settings-router-scheme option[value="http"]').attributes('disabled'))
+      .toBeDefined();
+    expect(wrapper.text()).toContain('部署策略已禁用明文 RouterOS HTTP');
+    wrapper.unmount();
+
+    apiMocks.fetchFullConfig.mockResolvedValue(configFixture({ allow_insecure_router_http: true }));
+    const allowedWrapper = mount(SettingsView, {
+      global: {
+        plugins: [createPinia()],
+        stubs: { FeatherIcon: true, ProbeTargetEditor: true },
+      },
+    });
+    await flushPromises();
+
+    expect(allowedWrapper.get('#settings-router-scheme option[value="http"]')
+      .attributes('disabled')).toBeUndefined();
+    expect(allowedWrapper.text()).not.toContain('部署策略已禁用明文 RouterOS HTTP');
   });
 
   it('tests and atomically saves a complete canonical connection draft', async () => {

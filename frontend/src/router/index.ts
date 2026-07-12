@@ -83,7 +83,8 @@ export const router = createRouter({
 });
 
 export async function authNavigationGuard(to: RouteLocationNormalized) {
-  if (to.name === 'oidc-complete' && to.meta.oidcCompletion === true) return true;
+  const isOidcCompletion = to.name === 'oidc-complete' && to.meta.oidcCompletion === true;
+  if (isOidcCompletion && to.query.error === undefined) return true;
 
   const auth = useAuthStore();
   try {
@@ -95,6 +96,7 @@ export async function authNavigationGuard(to: RouteLocationNormalized) {
   if (auth.setupRequired) {
     return to.name === 'setup-required' ? true : { name: 'setup-required' };
   }
+  if (isOidcCompletion) return true;
   if (to.name === 'setup-required') {
     return auth.authenticated ? { name: 'dashboard' } : { name: 'login' };
   }

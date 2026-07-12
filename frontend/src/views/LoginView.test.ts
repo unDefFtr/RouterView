@@ -21,6 +21,7 @@ const mocks = vi.hoisted(() => {
     login: vi.fn(),
     logout: vi.fn(),
     pair: vi.fn(),
+    setupAdmin: vi.fn(),
   };
 });
 

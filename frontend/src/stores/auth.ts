@@ -7,8 +7,10 @@ import {
   login as apiLogin,
   logout as apiLogout,
   pair as apiPair,
+  setupAdmin as apiSetupAdmin,
 } from '@/api';
 import type { AuthStatus, AuthUser, Capability, OidcStatus } from '@/api';
+import { normalizeSetupUsername } from '@/utils/setupUsername';
 
 export type AuthState =
   | 'unknown'
@@ -107,6 +109,10 @@ export const useAuthStore = defineStore('auth', () => {
     setAuthenticated(await apiLogin(username.trim(), password));
   }
 
+  async function setup(token: string, username: string, password: string): Promise<void> {
+    setAuthenticated(await apiSetupAdmin(token.trim(), normalizeSetupUsername(username), password));
+  }
+
   async function pair(code: string): Promise<void> {
     setAuthenticated(await apiPair(code.trim()));
   }
@@ -136,6 +142,7 @@ export const useAuthStore = defineStore('auth', () => {
     refresh,
     refreshOidcStatus,
     initialize,
+    setup,
     login,
     pair,
     logout,
